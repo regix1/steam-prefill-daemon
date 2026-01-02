@@ -1,3 +1,5 @@
+#nullable enable
+
 using SteamKit2;
 using SteamKit2.Authentication;
 
