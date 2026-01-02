@@ -1,4 +1,6 @@
-﻿namespace SteamPrefill
+﻿using SteamPrefill.Api;
+
+namespace SteamPrefill
 {
     public sealed class SteamManager : IDisposable
     {
@@ -14,12 +16,12 @@
 
         private readonly PrefillSummaryResult _prefillSummaryResult = new PrefillSummaryResult();
 
-        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs)
+        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null)
         {
             _ansiConsole = ansiConsole;
             _downloadArgs = downloadArgs;
 
-            _steam3 = new Steam3Session(_ansiConsole);
+            _steam3 = new Steam3Session(_ansiConsole, authProvider);
             _cdnPool = new CdnPool(_ansiConsole, _steam3);
             _appInfoHandler = new AppInfoHandler(_ansiConsole, _steam3, _steam3.LicenseManager);
             _downloadHandler = new DownloadHandler(_ansiConsole, _cdnPool);
