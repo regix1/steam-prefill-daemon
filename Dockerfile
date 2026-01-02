@@ -1,5 +1,5 @@
 FROM ubuntu:20.04
-LABEL maintainers="tpilius@gmail.com;kirbo@kirbo-designs.com"
+LABEL maintainers="tpilius@gmail.com;kirbo@kirbo-designs.com;regix1"
 
 RUN \
         apt update \
