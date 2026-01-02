@@ -7,7 +7,7 @@
         /// <summary>
         /// When set to true, always run the download, regardless of if the app has been previously downloaded.
         /// </summary>
-        public bool Force { get; init; }
+        public bool Force { get; set; }
 
         /// <summary>
         /// Determines which unit to display the download speed in.
@@ -38,7 +38,7 @@
         /// <summary>
         /// Determines which Operating System specific depots should be included in the download.
         /// </summary>
-        public List<OperatingSystem> OperatingSystems { get; init; } = new List<OperatingSystem> { OperatingSystem.Windows };
+        public List<OperatingSystem> OperatingSystems { get; set; } = new List<OperatingSystem> { OperatingSystem.Windows };
 
         public Architecture Architecture { get; init; } = Architecture.x64;
         public Language Language { get; init; } = Language.English;

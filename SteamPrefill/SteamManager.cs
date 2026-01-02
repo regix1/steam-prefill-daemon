@@ -55,6 +55,21 @@ namespace SteamPrefill
             _steam3.Disconnect();
         }
 
+        /// <summary>
+        /// Updates download options that can change between prefill runs
+        /// </summary>
+        public void UpdateDownloadOptions(bool? force = null, List<OperatingSystem>? operatingSystems = null)
+        {
+            if (force.HasValue)
+            {
+                _downloadArgs.Force = force.Value;
+            }
+            if (operatingSystems != null && operatingSystems.Count > 0)
+            {
+                _downloadArgs.OperatingSystems = operatingSystems;
+            }
+        }
+
         public void Dispose()
         {
             _downloadHandler.Dispose();
@@ -224,6 +239,52 @@ namespace SteamPrefill
             }
 
             return JsonSerializer.Deserialize(File.ReadAllText(AppConfig.UserSelectedAppsPath), SerializationContext.Default.ListUInt32);
+        }
+
+
+        /// <summary>
+        /// Gets status information for selected apps including download sizes.
+        /// </summary>
+        public async Task<List<AppStatus>> GetSelectedAppsStatusAsync(List<uint> appIds)
+        {
+            await _appInfoHandler.RetrieveAppMetadataAsync(appIds);
+            await _cdnPool.PopulateAvailableServersAsync();
+
+            var appStatuses = new ConcurrentBag<AppStatus>();
+            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds);
+
+            await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
+            {
+                try
+                {
+                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, app.Depots);
+                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
+
+                    var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots);
+                    var downloadSize = allChunksForApp.Sum(e => e.CompressedLength);
+
+                    appStatuses.Add(new AppStatus
+                    {
+                        AppId = app.AppId,
+                        Name = app.Name,
+                        DownloadSize = downloadSize,
+                        IsUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots)
+                    });
+                }
+                catch (Exception)
+                {
+                    // If we can't get info for an app, add it with zero size
+                    appStatuses.Add(new AppStatus
+                    {
+                        AppId = app.AppId,
+                        Name = app.Name,
+                        DownloadSize = 0,
+                        IsUpToDate = false
+                    });
+                }
+            });
+
+            return appStatuses.OrderBy(a => a.Name).ToList();
         }
 
         #endregion

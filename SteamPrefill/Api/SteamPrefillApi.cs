@@ -16,6 +16,9 @@ public sealed class SteamPrefillApi : IDisposable
     private readonly PrefillApiSession? _session;
 
     private SteamManager? _steamManager;
+
+    // In-memory cache for selected apps in daemon mode - avoids file I/O issues in containers
+    private List<uint>? _selectedAppsCache;
     private bool _isInitialized;
     private bool _isDisposed;
 
@@ -121,7 +124,64 @@ public sealed class SteamPrefillApi : IDisposable
         ThrowIfNotInitialized();
         ThrowIfDisposed();
 
-        return _steamManager!.LoadPreviouslySelectedApps();
+        // Prefer in-memory cache for daemon mode reliability
+        if (_selectedAppsCache != null && _selectedAppsCache.Count > 0)
+        {
+            _progress.OnLog(LogLevel.Info, $"GetSelectedApps: Returning {_selectedAppsCache.Count} cached apps");
+            return _selectedAppsCache;
+        }
+
+        // Fall back to file-based storage for CLI mode
+        var fileApps = _steamManager!.LoadPreviouslySelectedApps();
+        _progress.OnLog(LogLevel.Info, $"GetSelectedApps: Loaded {fileApps.Count} apps from file");
+        return fileApps;
+    }
+
+
+    /// <summary>
+    /// Gets detailed status information for selected apps including download sizes.
+    /// Requires login to be completed.
+    /// </summary>
+    public async Task<SelectedAppsStatus> GetSelectedAppsStatusAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfNotInitialized();
+        ThrowIfDisposed();
+
+        var appIds = GetSelectedApps();
+        
+        if (appIds.Count == 0)
+        {
+            return new SelectedAppsStatus
+            {
+                Apps = new List<AppStatus>(),
+                TotalDownloadSize = 0,
+                Message = "No apps selected"
+            };
+        }
+
+        try
+        {
+            var appStatuses = await _steamManager!.GetSelectedAppsStatusAsync(appIds);
+            var totalSize = appStatuses.Sum(a => a.DownloadSize);
+            var totalSizeFormatted = ByteSize.FromBytes(totalSize);
+
+            return new SelectedAppsStatus
+            {
+                Apps = appStatuses,
+                TotalDownloadSize = totalSize,
+                Message = $"{appStatuses.Count} apps selected, {totalSizeFormatted.ToDecimalString()} total"
+            };
+        }
+        catch (Exception ex)
+        {
+            _progress.OnError("Failed to get selected apps status", ex);
+            return new SelectedAppsStatus
+            {
+                Apps = new List<AppStatus>(),
+                TotalDownloadSize = 0,
+                Message = $"Error: {ex.Message}"
+            };
+        }
     }
 
     /// <summary>
@@ -132,13 +192,18 @@ public sealed class SteamPrefillApi : IDisposable
         ThrowIfNotInitialized();
         ThrowIfDisposed();
 
-        var tuiApps = appIds.Select(id => new TuiAppInfo(id.ToString(), "")
+        var appIdList = appIds.ToList();
+        
+        // Cache in memory for daemon mode reliability
+        _selectedAppsCache = appIdList;
+
+        var tuiApps = appIdList.Select(id => new TuiAppInfo(id.ToString(), "")
         {
             IsSelected = true
         }).ToList();
 
         _steamManager!.SetAppsAsSelected(tuiApps);
-        _progress.OnLog(LogLevel.Info, $"Set {tuiApps.Count} apps for prefill");
+        _progress.OnLog(LogLevel.Info, $"Set {tuiApps.Count} apps for prefill (cached in memory)");
     }
 
     /// <summary>
@@ -152,6 +217,11 @@ public sealed class SteamPrefillApi : IDisposable
         ThrowIfDisposed();
 
         options ??= new PrefillOptions();
+
+        // Update download options before starting
+        _steamManager!.UpdateDownloadOptions(
+            force: options.Force,
+            operatingSystems: options.OperatingSystems);
 
         _progress.OnOperationStarted("Prefill operation");
         var timer = System.Diagnostics.Stopwatch.StartNew();
@@ -213,6 +283,97 @@ public sealed class SteamPrefillApi : IDisposable
             _isInitialized = false;
             _progress.OnLog(LogLevel.Info, "Disconnected from Steam");
         }
+    }
+
+
+    /// <summary>
+    /// Clears the temporary cache directory to free up disk space.
+    /// This is a static method that doesn't require initialization.
+    /// </summary>
+    /// <returns>Cache clear result with file count and total size cleared</returns>
+    public static ClearCacheResult ClearCache()
+    {
+        var rootTempDir = new DirectoryInfo(AppConfig.TempDir).Parent;
+        
+        if (rootTempDir == null || !rootTempDir.Exists)
+        {
+            return new ClearCacheResult
+            {
+                Success = true,
+                FileCount = 0,
+                BytesCleared = 0,
+                Message = "Cache directory is already empty"
+            };
+        }
+
+        var tempFiles = rootTempDir.EnumerateFiles("*.*", SearchOption.AllDirectories).ToList();
+        var totalBytes = tempFiles.Sum(e => e.Length);
+        var fileCount = tempFiles.Count;
+
+        if (fileCount == 0)
+        {
+            return new ClearCacheResult
+            {
+                Success = true,
+                FileCount = 0,
+                BytesCleared = 0,
+                Message = "Cache directory is already empty"
+            };
+        }
+
+        try
+        {
+            Directory.Delete(rootTempDir.FullName, true);
+            var clearedSize = ByteSize.FromBytes(totalBytes);
+            return new ClearCacheResult
+            {
+                Success = true,
+                FileCount = fileCount,
+                BytesCleared = totalBytes,
+                Message = $"Cleared {fileCount} files ({clearedSize.ToDecimalString()})"
+            };
+        }
+        catch (Exception ex)
+        {
+            return new ClearCacheResult
+            {
+                Success = false,
+                FileCount = 0,
+                BytesCleared = 0,
+                Message = $"Failed to clear cache: {ex.Message}"
+            };
+        }
+    }
+
+    /// <summary>
+    /// Gets information about the current cache without clearing it.
+    /// </summary>
+    public static ClearCacheResult GetCacheInfo()
+    {
+        var rootTempDir = new DirectoryInfo(AppConfig.TempDir).Parent;
+        
+        if (rootTempDir == null || !rootTempDir.Exists)
+        {
+            return new ClearCacheResult
+            {
+                Success = true,
+                FileCount = 0,
+                BytesCleared = 0,
+                Message = "Cache directory is empty"
+            };
+        }
+
+        var tempFiles = rootTempDir.EnumerateFiles("*.*", SearchOption.AllDirectories).ToList();
+        var totalBytes = tempFiles.Sum(e => e.Length);
+        var cacheSize = ByteSize.FromBytes(totalBytes);
+
+        return new ClearCacheResult
+        {
+            Success = true,
+            FileCount = tempFiles.Count,
+            BytesCleared = totalBytes,
+            Message = $"Cache contains {tempFiles.Count} files ({cacheSize.ToDecimalString()})"
+        };
     }
 
     public void Dispose()
@@ -286,6 +447,40 @@ public class PrefillResult
     public int AppsFailed { get; init; }
     public long TotalBytesTransferred { get; init; }
     public TimeSpan TotalTime { get; init; }
+}
+
+
+/// <summary>
+/// Result of a cache clear operation
+/// </summary>
+public class ClearCacheResult
+{
+    public bool Success { get; init; }
+    public int FileCount { get; init; }
+    public long BytesCleared { get; init; }
+    public string? Message { get; init; }
+}
+
+
+/// <summary>
+/// Status information for a single app
+/// </summary>
+public class AppStatus
+{
+    public uint AppId { get; init; }
+    public string Name { get; init; } = "";
+    public long DownloadSize { get; init; }
+    public bool IsUpToDate { get; init; }
+}
+
+/// <summary>
+/// Status information for all selected apps
+/// </summary>
+public class SelectedAppsStatus
+{
+    public List<AppStatus> Apps { get; init; } = new();
+    public long TotalDownloadSize { get; init; }
+    public string? Message { get; init; }
 }
 
 /// <summary>

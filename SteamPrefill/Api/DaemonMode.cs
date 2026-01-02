@@ -38,7 +38,7 @@ public static class DaemonMode
         Console.WriteLine("└──────────────────────────────────────────────────────────────┘");
         Console.WriteLine();
 
-        var progress = new SecureConsoleProgress();
+        var progress = new FileBasedProgress(responsesDir);
 
         using var secureInterface = new SecureFileCommandInterface(
             commandsDir,
@@ -69,22 +69,38 @@ public static class DaemonMode
     }
 
     /// <summary>
-    /// Secure console progress reporter that avoids logging sensitive data
+    /// File-based progress reporter that writes progress to a JSON file for external monitoring.
+    /// Also logs to console with sanitization.
     /// </summary>
-    private sealed class SecureConsoleProgress : IPrefillProgress
+    private sealed class FileBasedProgress : IPrefillProgress
     {
+        private readonly string _responsesDir;
+        private readonly string _progressFile;
+        private readonly object _lock = new();
+        private DateTime _lastWrite = DateTime.MinValue;
+        private static readonly TimeSpan WriteThrottle = TimeSpan.FromMilliseconds(250);
+
         // Patterns that might contain sensitive data - never log these
         private static readonly string[] SensitivePatterns = new[]
         {
             "password", "credential", "secret", "token", "auth", "2fa", "code"
         };
 
+        public FileBasedProgress(string responsesDir)
+        {
+            _responsesDir = responsesDir;
+            _progressFile = Path.Combine(responsesDir, "prefill_progress.json");
+        }
+
         public void OnLog(LogLevel level, string message)
         {
+            // Filter out Spectre.Console type names
+            if (message.StartsWith("Spectre.Console."))
+                return;
+
             // Check for potentially sensitive content
             if (ContainsSensitiveContent(message))
             {
-                // Log sanitized version
                 message = "[REDACTED - Sensitive content]";
             }
 
@@ -104,7 +120,6 @@ public static class DaemonMode
             var lower = message.ToLowerInvariant();
             foreach (var pattern in SensitivePatterns)
             {
-                // Only flag if it looks like actual credential content, not just mentions
                 if (lower.Contains($"{pattern}=") ||
                     lower.Contains($"{pattern}:") ||
                     lower.Contains($"\"{pattern}\""))
@@ -122,33 +137,161 @@ public static class DaemonMode
             => OnLog(LogLevel.Info, $"Completed: {operationName} ({elapsed.TotalSeconds:F2}s)");
 
         public void OnAppStarted(AppDownloadInfo app)
-            => OnLog(LogLevel.Info, $"Downloading: {app.Name} ({app.AppId})");
+        {
+            OnLog(LogLevel.Info, $"Downloading: {app.Name} ({app.AppId})");
+            WriteProgress(new PrefillProgressUpdate
+            {
+                State = "downloading",
+                CurrentAppId = app.AppId,
+                CurrentAppName = app.Name,
+                TotalBytes = app.TotalBytes,
+                BytesDownloaded = 0,
+                PercentComplete = 0,
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
 
         public void OnDownloadProgress(DownloadProgressInfo progress)
         {
-            // Don't spam console with progress updates
+            // Throttle writes to avoid excessive I/O
+            var now = DateTime.UtcNow;
+            if (now - _lastWrite < WriteThrottle)
+                return;
+
+            WriteProgress(new PrefillProgressUpdate
+            {
+                State = "downloading",
+                CurrentAppId = progress.AppId,
+                CurrentAppName = progress.AppName,
+                TotalBytes = progress.TotalBytes,
+                BytesDownloaded = progress.BytesDownloaded,
+                PercentComplete = progress.PercentComplete,
+                BytesPerSecond = progress.BytesPerSecond,
+                Elapsed = progress.Elapsed,
+                UpdatedAt = DateTime.UtcNow
+            });
         }
 
         public void OnAppCompleted(AppDownloadInfo app, AppDownloadResult result)
-            => OnLog(LogLevel.Info, $"Completed: {app.Name} - {result}");
+        {
+            OnLog(LogLevel.Info, $"Completed: {app.Name} - {result}");
+            WriteProgress(new PrefillProgressUpdate
+            {
+                State = "app_completed",
+                CurrentAppId = app.AppId,
+                CurrentAppName = app.Name,
+                Result = result.ToString(),
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
 
         public void OnPrefillCompleted(PrefillSummary summary)
-            => OnLog(LogLevel.Info, $"Prefill complete: {summary.UpdatedApps} updated, {summary.AlreadyUpToDate} up-to-date, {summary.FailedApps} failed");
+        {
+            OnLog(LogLevel.Info, $"Prefill complete: {summary.UpdatedApps} updated, {summary.AlreadyUpToDate} up-to-date, {summary.FailedApps} failed");
+            WriteProgress(new PrefillProgressUpdate
+            {
+                State = "completed",
+                TotalApps = summary.TotalApps,
+                UpdatedApps = summary.UpdatedApps,
+                AlreadyUpToDate = summary.AlreadyUpToDate,
+                FailedApps = summary.FailedApps,
+                TotalBytesTransferred = summary.TotalBytesTransferred,
+                TotalTime = summary.TotalTime,
+                UpdatedAt = DateTime.UtcNow
+            });
+
+            // Delete progress file after completion
+            try { File.Delete(_progressFile); } catch { }
+        }
 
         public void OnError(string message, Exception? exception = null)
         {
-            // Sanitize error messages too
             if (ContainsSensitiveContent(message))
             {
                 message = "[REDACTED - Sensitive content in error]";
             }
 
             OnLog(LogLevel.Error, message);
-            if (exception != null)
+            WriteProgress(new PrefillProgressUpdate
             {
-                // Don't log exception details that might contain credentials
-                Console.WriteLine($"Exception type: {exception.GetType().Name}");
+                State = "error",
+                ErrorMessage = message,
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
+
+        private void WriteProgress(PrefillProgressUpdate update)
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    var json = System.Text.Json.JsonSerializer.Serialize(update, DaemonSerializationContext.Default.PrefillProgressUpdate);
+                    File.WriteAllText(_progressFile, json);
+                    _lastWrite = DateTime.UtcNow;
+                }
+                catch
+                {
+                    // Ignore write errors
+                }
             }
         }
     }
+}
+
+/// <summary>
+/// Progress update written to file for external monitoring
+/// </summary>
+public class PrefillProgressUpdate
+{
+    [System.Text.Json.Serialization.JsonPropertyName("state")]
+    public string State { get; set; } = "idle";
+
+    [System.Text.Json.Serialization.JsonPropertyName("currentAppId")]
+    public uint CurrentAppId { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("currentAppName")]
+    public string? CurrentAppName { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("totalBytes")]
+    public long TotalBytes { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("bytesDownloaded")]
+    public long BytesDownloaded { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("percentComplete")]
+    public double PercentComplete { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("bytesPerSecond")]
+    public double BytesPerSecond { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("elapsed")]
+    public TimeSpan Elapsed { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("result")]
+    public string? Result { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("errorMessage")]
+    public string? ErrorMessage { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("totalApps")]
+    public int TotalApps { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("updatedApps")]
+    public int UpdatedApps { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("alreadyUpToDate")]
+    public int AlreadyUpToDate { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("failedApps")]
+    public int FailedApps { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("totalBytesTransferred")]
+    public long TotalBytesTransferred { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("totalTime")]
+    public TimeSpan TotalTime { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("updatedAt")]
+    public DateTime UpdatedAt { get; set; }
 }

@@ -256,6 +256,7 @@ public sealed class SecureFileCommandInterface : IDisposable
                     break;
 
                 case "set-selected-apps":
+                    _progress.OnLog(LogLevel.Info, $"Received set-selected-apps command, params: {command.Parameters?.Count ?? 0}");
                     HandleSetSelectedApps(command);
                     response.Success = true;
                     response.Message = "Apps selected";
@@ -281,6 +282,28 @@ public sealed class SecureFileCommandInterface : IDisposable
                     HandleShutdown();
                     response.Success = true;
                     response.Message = "Shutdown complete";
+                    break;
+
+                case "clear-cache":
+                    var clearResult = SteamPrefillApi.ClearCache();
+                    response.Success = clearResult.Success;
+                    response.Data = clearResult;
+                    response.Message = clearResult.Message;
+                    break;
+
+                case "get-cache-info":
+                    var cacheInfo = SteamPrefillApi.GetCacheInfo();
+                    response.Success = cacheInfo.Success;
+                    response.Data = cacheInfo;
+                    response.Message = cacheInfo.Message;
+                    break;
+
+                case "get-selected-apps-status":
+                    EnsureLoggedIn();
+                    var appsStatus = await _api!.GetSelectedAppsStatusAsync(_cts.Token);
+                    response.Success = true;
+                    response.Data = appsStatus;
+                    response.Message = appsStatus.Message;
                     break;
 
                 default:
@@ -348,19 +371,36 @@ public sealed class SecureFileCommandInterface : IDisposable
         EnsureLoggedIn();
 
         var appIdsJson = command.Parameters?.GetValueOrDefault("appIds");
+        _progress.OnLog(LogLevel.Info, $"HandleSetSelectedApps: appIdsJson = {appIdsJson ?? "(null)"}");
+
         if (string.IsNullOrEmpty(appIdsJson))
             throw new ArgumentException("appIds parameter required");
 
         var appIds = JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListUInt32);
-        if (appIds != null)
+        _progress.OnLog(LogLevel.Info, $"HandleSetSelectedApps: Deserialized {appIds?.Count ?? 0} app IDs");
+
+        if (appIds != null && appIds.Count > 0)
         {
             _api!.SetSelectedApps(appIds);
+            _progress.OnLog(LogLevel.Info, $"HandleSetSelectedApps: Successfully set {appIds.Count} apps");
+        }
+        else
+        {
+            _progress.OnLog(LogLevel.Warning, "HandleSetSelectedApps: No app IDs to set");
         }
     }
 
     private async Task<PrefillResult> HandlePrefillAsync(CommandRequest command)
     {
         EnsureLoggedIn();
+
+        // Log selected apps before prefill
+        var selectedApps = _api!.GetSelectedApps();
+        _progress.OnLog(LogLevel.Info, $"HandlePrefillAsync: {selectedApps.Count} apps selected for prefill");
+        if (selectedApps.Count > 0)
+        {
+            _progress.OnLog(LogLevel.Info, $"HandlePrefillAsync: App IDs = [{string.Join(", ", selectedApps.Take(10))}{(selectedApps.Count > 10 ? "..." : "")}]");
+        }
 
         var options = new PrefillOptions();
 
@@ -376,7 +416,27 @@ public sealed class SecureFileCommandInterface : IDisposable
                 options.PrefillTopGames = top;
             if (bool.TryParse(command.Parameters.GetValueOrDefault("force"), out var force))
                 options.Force = force;
+            
+            // Parse operating systems (comma-separated: "windows,linux,macos")
+            var osParam = command.Parameters.GetValueOrDefault("os");
+            if (!string.IsNullOrEmpty(osParam))
+            {
+                var osList = new List<OperatingSystem>();
+                foreach (var os in osParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (OperatingSystem.TryFromValue(os.ToLowerInvariant(), out var operatingSystem))
+                    {
+                        osList.Add(operatingSystem);
+                    }
+                }
+                if (osList.Count > 0)
+                {
+                    options.OperatingSystems = osList;
+                }
+            }
         }
+
+        _progress.OnLog(LogLevel.Info, $"HandlePrefillAsync: Options - all={options.DownloadAllOwnedGames}, recent={options.PrefillRecentGames}, force={options.Force}, os={string.Join(",", options.OperatingSystems.Select(o => o.Value))}");
 
         return await _api!.PrefillAsync(options, _cts.Token);
     }
