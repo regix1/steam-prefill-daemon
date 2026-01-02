@@ -1,4 +1,5 @@
 ﻿using System.IdentityModel.Tokens.Jwt;
+using SteamPrefill.Api;
 
 namespace SteamPrefill.Settings
 {
@@ -24,6 +25,12 @@ namespace SteamPrefill.Settings
         [ProtoMember(5)]
         public string AccessToken { get; set; }
 
+        /// <summary>
+        /// Optional auth provider for API/daemon mode (bypasses console prompts)
+        /// </summary>
+        [ProtoIgnore]
+        public ISteamAuthProvider? AuthProvider { get; set; }
+
         [SuppressMessage("Security", "CA5394:Random is an insecure RNG", Justification = "Security doesn't matter here, as all that is needed is a unique id.")]
         private UserAccountStore()
         {
@@ -44,8 +51,34 @@ namespace SteamPrefill.Settings
                 return CurrentUsername;
             }
 
+            // Use auth provider if available (API/daemon mode)
+            if (AuthProvider != null)
+            {
+                CurrentUsername = await AuthProvider.GetUsernameAsync();
+                return CurrentUsername;
+            }
+
             CurrentUsername = await PromptForUsernameAsync(ansiConsole).WaitAsync(TimeSpan.FromSeconds(30));
             return CurrentUsername;
+        }
+
+        /// <summary>
+        /// Gets password using auth provider if available, otherwise uses console prompt
+        /// </summary>
+        public async Task<string?> GetPasswordAsync(IAnsiConsole ansiConsole, string? promptText = null)
+        {
+            // Use auth provider if available (API/daemon mode)
+            if (AuthProvider != null)
+            {
+                if (AccessTokenIsValid())
+                {
+                    return await AuthProvider.GetCachedPasswordAsync();
+                }
+                return await AuthProvider.GetPasswordAsync();
+            }
+
+            // Fall back to console prompt
+            return await ansiConsole.ReadPasswordAsync(promptText);
         }
 
         public bool AccessTokenIsValid()

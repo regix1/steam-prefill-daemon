@@ -51,3 +51,4 @@ global using Architecture = SteamPrefill.Models.Enums.Architecture;
 global using OperatingSystem = SteamPrefill.Models.Enums.OperatingSystem;
 global using AuthenticationException = System.Security.Authentication.AuthenticationException;
 global using SteamPrefill.Extensions;
+global using SteamPrefill.Api;

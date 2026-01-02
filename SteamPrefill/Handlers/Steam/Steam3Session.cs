@@ -1,3 +1,6 @@
+using SteamKit2.Authentication;
+using SteamPrefill.Api;
+
 namespace SteamPrefill.Handlers.Steam
 {
     public sealed class Steam3Session : IDisposable
@@ -50,14 +53,16 @@ namespace SteamPrefill.Handlers.Steam
 
         private readonly UserAccountStore _userAccountStore;
         public readonly LicenseManager LicenseManager;
+        private readonly ISteamAuthProvider? _authProvider;
 
         public SteamID _steamId;
 
         #endregion
 
-        public Steam3Session(IAnsiConsole ansiConsole)
+        public Steam3Session(IAnsiConsole ansiConsole, ISteamAuthProvider? authProvider = null)
         {
             _ansiConsole = ansiConsole;
+            _authProvider = authProvider;
 
             _steamClient = new SteamClient(SteamConfiguration.Create(e => e.WithCellID(CellId)
                                                                .WithConnectionTimeout(TimeSpan.FromSeconds(10))));
@@ -94,6 +99,7 @@ namespace SteamPrefill.Handlers.Steam
             Client.RequestTimeout = TimeSpan.FromSeconds(60);
 
             _userAccountStore = UserAccountStore.LoadFromFile();
+            _userAccountStore.AuthProvider = authProvider; // Set auth provider for API/daemon mode
             LicenseManager = new LicenseManager(SteamAppsApi);
 
             // Setting up optional SteamKit2 debug output.  Not enabled by default because it writes out way too much output that isn't useful outside of debugging.
@@ -147,13 +153,18 @@ namespace SteamPrefill.Handlers.Steam
 
             _ansiConsole.LogMarkupLine("Requesting new access token...");
 
+            // Use secure authenticator if auth provider is available, otherwise use console
+            IAuthenticator authenticator = _authProvider != null
+                ? new SecureSteamAuthenticator(_authProvider)
+                : new UserConsoleAuthenticator();
+
             // Begin authenticating via credentials
             var authSession = await _steamClient.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
             {
                 Username = _logonDetails.Username,
                 Password = _logonDetails.Password,
                 IsPersistentSession = true,
-                Authenticator = new UserConsoleAuthenticator()
+                Authenticator = authenticator
             });
 
             // Starting polling Steam for authentication response
@@ -174,7 +185,7 @@ namespace SteamPrefill.Handlers.Steam
             {
                 Username = username,
                 ShouldRememberPassword = true,
-                Password = _userAccountStore.AccessTokenIsValid() ? null : await _ansiConsole.ReadPasswordAsync(),
+                Password = _userAccountStore.AccessTokenIsValid() ? null : await _userAccountStore.GetPasswordAsync(_ansiConsole),
                 LoginID = _userAccountStore.SessionId
             };
         }
@@ -272,14 +283,14 @@ namespace SteamPrefill.Handlers.Steam
                     throw new AuthenticationException("Invalid username/password");
                 }
 
-                _logonDetails.Password = _ansiConsole.ReadPasswordAsync($"{Red("Invalid password!  Please re-enter your password!")}").GetAwaiter().GetResult();
+                _logonDetails.Password = _userAccountStore.GetPasswordAsync(_ansiConsole, $"{Red("Invalid password!  Please re-enter your password!")}").GetAwaiter().GetResult();
                 return false;
             }
             // User previously authenticated, but changed their password such that the previous access token is no longer valid.
             if (loggedOn.Result == EResult.AccessDenied)
             {
                 _ansiConsole.LogMarkupLine(Red("Steam password was changed!  Current login token is no longer valid.  Re-authentication is required..."));
-                _logonDetails.Password = _ansiConsole.ReadPasswordAsync($"{Red("Please enter your password!")}").GetAwaiter().GetResult();
+                _logonDetails.Password = _userAccountStore.GetPasswordAsync(_ansiConsole, $"{Red("Please enter your password!")}").GetAwaiter().GetResult();
                 _userAccountStore.AccessToken = null;
                 return false;
             }

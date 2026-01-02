@@ -10,3 +10,10 @@ lockfile
 /docs/__pycache__
 /docs/RenderAnsiToSvg/__pycache__
 /SteamPrefill/app.log
+.vscode/
+/commands/
+/responses/
+/test_responses/
+.serena/
+settings.local.json
+*.log
