@@ -1,3 +1,5 @@
+#nullable enable
+
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -80,7 +82,7 @@ public sealed class SecureCredentialExchange : IDisposable
                 Email = email,
                 ServerPublicKey = Convert.ToBase64String(exchange._serverPublicKey!),
                 ExpiresAt = exchange._expiresAt,
-                Timestamp = DateTime.UtcNow
+                CreatedAt = DateTime.UtcNow
             };
 
             var fileName = $"auth_challenge_{exchange._challengeId}.json";
@@ -185,7 +187,7 @@ public sealed class SecureCredentialExchange : IDisposable
             // Decrypt with AES-GCM
             var nonce = Convert.FromBase64String(response.Nonce);
             var ciphertext = Convert.FromBase64String(response.EncryptedCredential);
-            var tag = Convert.FromBase64String(response.AuthTag);
+            var tag = Convert.FromBase64String(response.Tag);
 
             var plaintext = new byte[ciphertext.Length];
             using var aesGcm = new AesGcm(aesKey, 16);
@@ -273,7 +275,7 @@ public sealed class SecureCredentialExchange : IDisposable
             ClientPublicKey = Convert.ToBase64String(clientPublicKey),
             EncryptedCredential = Convert.ToBase64String(ciphertext),
             Nonce = Convert.ToBase64String(nonce),
-            AuthTag = Convert.ToBase64String(tag)
+            Tag = Convert.ToBase64String(tag)
         };
     }
 
@@ -302,8 +304,8 @@ public class CredentialChallenge
     public string CredentialType { get; init; } = string.Empty; // "username", "password", "2fa", "steamguard"
     public string? Email { get; init; }
     public string ServerPublicKey { get; init; } = string.Empty;
+    public DateTime CreatedAt { get; init; }
     public DateTime ExpiresAt { get; init; }
-    public DateTime Timestamp { get; init; }
 }
 
 /// <summary>
@@ -315,5 +317,5 @@ public class EncryptedCredentialResponse
     public string ClientPublicKey { get; init; } = string.Empty;
     public string EncryptedCredential { get; init; } = string.Empty;
     public string Nonce { get; init; } = string.Empty;
-    public string AuthTag { get; init; } = string.Empty;
+    public string Tag { get; init; } = string.Empty;
 }

@@ -1,3 +1,5 @@
+#nullable enable
+
 using SteamPrefill.Models;
 using SteamPrefill.Models.Enums;
 

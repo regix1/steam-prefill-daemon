@@ -17,10 +17,19 @@ ENV \
         LANG=en_US.UTF-8 \
         LANGUAGE=en_US:en \
         LC_ALL=en_US.UTF-8 \
-        TERM=xterm-256color
+        TERM=xterm-256color \
+        HOME=/app
 
-WORKDIR /usr/bin
-COPY  /publish/SteamPrefill /
-RUN chmod +x /SteamPrefill
+# Create app directory structure
+WORKDIR /app
 
-ENTRYPOINT [ "/SteamPrefill" ]
+# Create directories for daemon mode and config persistence
+RUN mkdir -p /commands /responses /app/Config /app/.cache
+
+COPY /publish/SteamPrefill /app/SteamPrefill
+RUN chmod +x /app/SteamPrefill
+
+# Volumes for persistence and daemon communication
+VOLUME ["/commands", "/responses", "/app/Config", "/app/.cache"]
+
+ENTRYPOINT [ "/app/SteamPrefill" ]
