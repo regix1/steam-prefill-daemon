@@ -13,7 +13,7 @@ on:
 env:
   PROJECT_NAME: SteamPrefill
   REGISTRY: ghcr.io
-  IMAGE_NAME: regix1/steam-lancache-prefill
+  IMAGE_NAME: regix1/steam-prefill-daemon
 
 jobs:
   build:
