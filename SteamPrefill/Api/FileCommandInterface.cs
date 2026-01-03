@@ -349,14 +349,58 @@ public sealed class SecureFileCommandInterface : IDisposable
         // Create API with secure auth provider
         _api = new SteamPrefillApi(_authProvider, _progress);
 
-        // This will trigger the secure credential exchange
-        await _api.InitializeAsync(_cts.Token);
+        try
+        {
+            // This will trigger the secure credential exchange
+            await _api.InitializeAsync(_cts.Token);
 
-        _isLoggedIn = true;
-        _progress.OnLog(LogLevel.Info, "Login successful - commands now available");
+            _isLoggedIn = true;
+            _progress.OnLog(LogLevel.Info, "Login successful - commands now available");
 
-        // Update status file
-        await WriteStatusAsync("logged-in", "Authenticated and ready for commands");
+            // Update status file
+            await WriteStatusAsync("logged-in", "Authenticated and ready for commands");
+        }
+        catch (OperationCanceledException)
+        {
+            // Login was cancelled (e.g., by cancel-login command)
+            _progress.OnLog(LogLevel.Info, "Login cancelled during authentication");
+
+            // Clean up the API instance
+            try
+            {
+                _api.Shutdown();
+                _api.Dispose();
+            }
+            catch { /* ignore cleanup errors */ }
+            _api = null;
+            _isLoggedIn = false;
+
+            // Update status file
+            await WriteStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+
+            // Re-throw so the caller knows login failed
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Login failed for other reasons
+            _progress.OnError($"Login failed: {ex.Message}", ex);
+
+            // Clean up the API instance
+            try
+            {
+                _api?.Shutdown();
+                _api?.Dispose();
+            }
+            catch { /* ignore cleanup errors */ }
+            _api = null;
+            _isLoggedIn = false;
+
+            // Update status file
+            await WriteStatusAsync("awaiting-login", $"Login failed: {ex.Message}");
+
+            throw;
+        }
     }
 
     private void HandleLogout()
@@ -399,6 +443,10 @@ public sealed class SecureFileCommandInterface : IDisposable
     /// <summary>
     /// Handle cancel-login command directly without acquiring the command lock.
     /// This is necessary because cancel-login needs to interrupt a login that holds the lock.
+    ///
+    /// IMPORTANT: We only cancel the pending credential request here. We do NOT touch _api or _isLoggedIn
+    /// because the original login process (which holds the lock) will handle its own cleanup
+    /// when it catches the OperationCanceledException from the cancelled credential wait.
     /// </summary>
     private async Task HandleCancelLoginDirectAsync(string filePath)
     {
@@ -419,23 +467,9 @@ public sealed class SecureFileCommandInterface : IDisposable
             _progress.OnLog(LogLevel.Warning, $"Failed to parse cancel-login command: {ex.Message}");
         }
 
-        // Cancel any pending credential requests - this releases the blocked login
+        // Cancel any pending credential requests - this causes the blocked login to throw OperationCanceledException
+        // The login process will then clean up _api and set _isLoggedIn = false as it unwinds
         _authProvider.CancelPendingRequest();
-
-        // Clean up any partially initialized API
-        if (_api != null)
-        {
-            try
-            {
-                _api.Shutdown();
-                _api.Dispose();
-            }
-            catch { /* ignore cleanup errors */ }
-            _api = null;
-        }
-
-        // Reset login state
-        _isLoggedIn = false;
 
         // Write response
         var response = new CommandResponse
@@ -459,10 +493,7 @@ public sealed class SecureFileCommandInterface : IDisposable
         // Delete command file
         try { File.Delete(filePath); } catch { /* ignore */ }
 
-        // Update status
-        await WriteStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
-
-        _progress.OnLog(LogLevel.Info, "Login cancelled via direct handler, ready for new attempt");
+        _progress.OnLog(LogLevel.Info, "Cancel-login signal sent, waiting for login process to complete cleanup");
     }
 
     private async Task<List<OwnedGame>> HandleGetOwnedGamesAsync()
