@@ -66,7 +66,7 @@ public sealed class SteamPrefillApi : IDisposable
             {
                 Force = false,
                 TransferSpeedUnit = TransferSpeedUnit.Bits,
-                OperatingSystems = new List<OperatingSystem> { OperatingSystem.Windows }
+                OperatingSystems = new List<OperatingSystem> { PrefillOptions.GetCurrentOperatingSystem() }
             };
 
             _steamManager = new SteamManager(consoleAdapter, downloadArgs, _authProvider);
@@ -430,9 +430,18 @@ public class PrefillOptions
     public bool Force { get; set; }
 
     /// <summary>
-    /// Target operating systems for downloads
+    /// Target operating systems for downloads. Defaults to the current OS.
     /// </summary>
-    public List<OperatingSystem> OperatingSystems { get; set; } = new() { OperatingSystem.Windows };
+    public List<OperatingSystem> OperatingSystems { get; set; } = new() { GetCurrentOperatingSystem() };
+
+    public static OperatingSystem GetCurrentOperatingSystem()
+    {
+        if (System.OperatingSystem.IsLinux())
+            return OperatingSystem.Linux;
+        if (System.OperatingSystem.IsMacOS())
+            return OperatingSystem.MacOS;
+        return OperatingSystem.Windows;
+    }
 }
 
 /// <summary>
