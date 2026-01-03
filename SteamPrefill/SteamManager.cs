@@ -130,12 +130,18 @@ namespace SteamPrefill
 
             // AppIds can potentially be added twice when building out the full list of ids
             var distinctAppIds = appIdsToDownload.Distinct().ToList();
+            
+            // Report progress for metadata retrieval (can be slow for large libraries)
+            _progress.OnLog(LogLevel.Info, $"Loading metadata for {distinctAppIds.Count} apps...");
             await _appInfoHandler.RetrieveAppMetadataAsync(distinctAppIds);
+            _progress.OnLog(LogLevel.Info, $"Metadata loaded for {distinctAppIds.Count} apps");
 
             // Whitespace divider
             _ansiConsole.WriteLine();
 
             var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(distinctAppIds);
+            _progress.OnLog(LogLevel.Info, $"Starting prefill of {availableGames.Count} games");
+            
             foreach (var app in availableGames)
             {
                 cancellationToken.ThrowIfCancellationRequested();
@@ -171,6 +177,9 @@ namespace SteamPrefill
             if (filteredDepots.Empty())
             {
                 _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
+                _progress.OnAppCompleted(
+                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                    AppDownloadResult.NoDepotsToDownload);
                 return;
             }
 
@@ -180,6 +189,9 @@ namespace SteamPrefill
             if (_downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
+                _progress.OnAppCompleted(
+                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                    AppDownloadResult.AlreadyUpToDate);
                 return;
             }
 
@@ -196,11 +208,21 @@ namespace SteamPrefill
             var totalBytes = ByteSize.FromBytes(chunkDownloadQueue.Sum(e => e.CompressedLength));
             _prefillSummaryResult.TotalBytesTransferred += totalBytes;
 
+            // Notify that app download is starting
+            var appDownloadInfo = new AppDownloadInfo
+            {
+                AppId = appInfo.AppId,
+                Name = appInfo.Name,
+                TotalBytes = (long)totalBytes.Bytes
+            };
+            _progress.OnAppStarted(appDownloadInfo);
+
             _ansiConsole.LogMarkupVerbose($"Downloading {Magenta(totalBytes.ToDecimalString())} from {LightYellow(chunkDownloadQueue.Count)} chunks");
 
             if (AppConfig.SkipDownloads)
             {
                 _ansiConsole.MarkupLine("");
+                _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Skipped);
                 return;
             }
 
@@ -210,6 +232,7 @@ namespace SteamPrefill
             {
                 _depotHandler.MarkDownloadAsSuccessful(filteredDepots);
                 _prefillSummaryResult.Updated++;
+                _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
 
                 // Logging some metrics about the download
                 _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
@@ -218,6 +241,7 @@ namespace SteamPrefill
             else
             {
                 _prefillSummaryResult.FailedApps++;
+                _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Failed);
             }
             downloadTimer.Stop();
         }

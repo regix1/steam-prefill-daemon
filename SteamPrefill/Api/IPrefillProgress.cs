@@ -81,7 +81,8 @@ public enum AppDownloadResult
     Success,
     AlreadyUpToDate,
     Failed,
-    Skipped
+    Skipped,
+    NoDepotsToDownload
 }
 
 public class PrefillSummary
