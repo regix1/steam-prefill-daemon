@@ -91,7 +91,8 @@ namespace SteamPrefill
         /// <param name="prefillPopularGames">If set to a value > 0, the most popular N games will be downloaded</param>
         /// <param name="prefillRecentlyPurchasedGames">If set to true, games purchased in the last 2 weeks will be downloaded</param>
         public async Task DownloadMultipleAppsAsync(bool downloadAllOwnedGames, bool prefillRecentGames,
-                                                    int? prefillPopularGames, bool prefillRecentlyPurchasedGames)
+                                                    int? prefillPopularGames, bool prefillRecentlyPurchasedGames,
+                                                    CancellationToken cancellationToken = default)
         {
             // Building out the list of AppIds to download
             var appIdsToDownload = LoadPreviouslySelectedApps();
@@ -137,9 +138,10 @@ namespace SteamPrefill
             var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(distinctAppIds);
             foreach (var app in availableGames)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    await DownloadSingleAppAsync(app);
+                    await DownloadSingleAppAsync(app, cancellationToken);
                 }
                 catch (Exception e) when (e is LancacheNotFoundException || e is InfiniteLoopException)
                 {
@@ -162,7 +164,7 @@ namespace SteamPrefill
             _prefillSummaryResult.RenderSummaryTable(_ansiConsole);
         }
 
-        private async Task DownloadSingleAppAsync(AppInfo appInfo)
+        private async Task DownloadSingleAppAsync(AppInfo appInfo, CancellationToken cancellationToken = default)
         {
             // Filter depots based on specified language/OS/cpu architecture/etc
             var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, appInfo.Depots);
@@ -203,7 +205,7 @@ namespace SteamPrefill
             }
 
             var downloadSuccessful = await _downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, _downloadArgs,
-                appId: appInfo.AppId, appName: appInfo.Name);
+                appId: appInfo.AppId, appName: appInfo.Name, cancellationToken: cancellationToken);
             if (downloadSuccessful)
             {
                 _depotHandler.MarkDownloadAsSuccessful(filteredDepots);

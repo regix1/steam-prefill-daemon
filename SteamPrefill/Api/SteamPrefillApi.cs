@@ -232,7 +232,8 @@ public sealed class SteamPrefillApi : IDisposable
                 downloadAllOwnedGames: options.DownloadAllOwnedGames,
                 prefillRecentGames: options.PrefillRecentGames,
                 prefillPopularGames: options.PrefillTopGames,
-                prefillRecentlyPurchasedGames: options.PrefillRecentlyPurchased);
+                prefillRecentlyPurchasedGames: options.PrefillRecentlyPurchased,
+                cancellationToken: cancellationToken);
 
             _progress.OnOperationCompleted("Prefill operation", timer.Elapsed);
 
@@ -240,6 +241,16 @@ public sealed class SteamPrefillApi : IDisposable
             return new PrefillResult
             {
                 Success = true,
+                TotalTime = timer.Elapsed
+            };
+        }
+        catch (OperationCanceledException)
+        {
+            _progress.OnLog(LogLevel.Info, "Prefill operation cancelled");
+            return new PrefillResult
+            {
+                Success = false,
+                ErrorMessage = "Prefill cancelled",
                 TotalTime = timer.Elapsed
             };
         }

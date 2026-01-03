@@ -40,7 +40,7 @@ namespace SteamPrefill.Handlers
         /// </summary>
         /// <returns>True if all downloads succeeded.  False if any downloads failed 3 times in a row.</returns>
         public async Task<bool> DownloadQueuedChunksAsync(List<QueuedRequest> queuedRequests, DownloadArguments downloadArgs,
-                                                          uint appId = 0, string? appName = null)
+                                                          uint appId = 0, string? appName = null, CancellationToken cancellationToken = default)
         {
             await InitializeAsync();
 
@@ -50,14 +50,15 @@ namespace SteamPrefill.Handlers
             {
                 // Run the initial download
                 failedRequests = await AttemptDownloadAsync(ctx, "Downloading..", queuedRequests, downloadArgs,
-                    forceRecache: false, appId: appId, appName: appName);
+                    forceRecache: false, appId: appId, appName: appName, cancellationToken: cancellationToken);
 
                 // Handle any failed requests
                 while (failedRequests.Any() && retryCount < 2)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     retryCount++;
                     failedRequests = await AttemptDownloadAsync(ctx, $"Retrying  {retryCount}..", failedRequests.ToList(), downloadArgs,
-                        forceRecache: true, appId: appId, appName: appName);
+                        forceRecache: true, appId: appId, appName: appName, cancellationToken: cancellationToken);
                 }
             });
 
@@ -89,7 +90,7 @@ namespace SteamPrefill.Handlers
         /// <returns>A list of failed requests</returns>
         public async Task<ConcurrentBag<QueuedRequest>> AttemptDownloadAsync(ProgressContext ctx, string taskTitle, List<QueuedRequest> requestsToDownload,
                                                                                 DownloadArguments downloadArgs, bool forceRecache = false,
-                                                                                uint appId = 0, string? appName = null)
+                                                                                uint appId = 0, string? appName = null, CancellationToken cancellationToken = default)
         {
             double requestTotalSize = requestsToDownload.Sum(e => e.CompressedLength);
             var progressTask = ctx.AddTask(taskTitle, new ProgressTaskSettings { MaxValue = requestTotalSize });
@@ -101,7 +102,7 @@ namespace SteamPrefill.Handlers
             var progressThrottle = TimeSpan.FromMilliseconds(500);
 
             var cdnServer = _cdnPool.TakeConnection();
-            await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests }, body: async (request, _) =>
+            await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests, CancellationToken = cancellationToken }, body: async (request, ct) =>
             {
                 try
                 {
@@ -113,16 +114,20 @@ namespace SteamPrefill.Handlers
                     using var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
                     requestMessage.Headers.Host = cdnServer.Host;
 
-                    using var cts = new CancellationTokenSource();
-                    using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, cts.Token);
-                    using Stream responseStream = await response.Content.ReadAsStreamAsync(cts.Token);
+                    using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, ct);
+                    using Stream responseStream = await response.Content.ReadAsStreamAsync(ct);
                     response.EnsureSuccessStatusCode();
 
                     // Don't save the data anywhere, so we don't have to waste time writing it to disk.
                     var buffer = new byte[4096];
-                    while (await responseStream.ReadAsync(buffer, cts.Token) != 0)
+                    while (await responseStream.ReadAsync(buffer, ct) != 0)
                     {
                     }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    // Cancellation requested - don't add to failed requests, just exit
+                    throw;
                 }
                 catch (Exception e)
                 {
