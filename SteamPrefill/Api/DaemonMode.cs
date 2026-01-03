@@ -158,6 +158,10 @@ public static class DaemonMode
             if (now - _lastWrite < WriteThrottle)
                 return;
 
+            // Log progress to console
+            var speedMBps = progress.BytesPerSecond / 1024.0 / 1024.0;
+            Console.WriteLine($"{DateTime.UtcNow:HH:mm:ss} [PROGRESS] {progress.AppName}: {progress.PercentComplete:F1}% @ {speedMBps:F1} MB/s");
+
             WriteProgress(new PrefillProgressUpdate
             {
                 State = "downloading",

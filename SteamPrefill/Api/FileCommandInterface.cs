@@ -38,7 +38,8 @@ public sealed class SecureFileCommandInterface : IDisposable
     private static readonly HashSet<string> PreLoginCommands = new(StringComparer.OrdinalIgnoreCase)
     {
         "login",
-        "status"
+        "status",
+        "cancel-login"
     };
 
     public SecureFileCommandInterface(
@@ -243,6 +244,12 @@ public sealed class SecureFileCommandInterface : IDisposable
                     response.Message = "Logged out successfully";
                     break;
 
+                case "cancel-login":
+                    await HandleCancelLoginAsync();
+                    response.Success = true;
+                    response.Message = "Login cancelled";
+                    break;
+
                 case "get-owned-games":
                     var games = await HandleGetOwnedGamesAsync();
                     response.Success = true;
@@ -352,6 +359,34 @@ public sealed class SecureFileCommandInterface : IDisposable
         _api = null;
         _isLoggedIn = false;
         _progress.OnLog(LogLevel.Info, "Logged out");
+    }
+
+    private async Task HandleCancelLoginAsync()
+    {
+        _progress.OnLog(LogLevel.Info, "Cancelling login...");
+
+        // Cancel any pending credential requests
+        _authProvider.CancelPendingRequest();
+
+        // Clean up any partially initialized API
+        if (_api != null)
+        {
+            try
+            {
+                _api.Shutdown();
+                _api.Dispose();
+            }
+            catch { /* ignore cleanup errors */ }
+            _api = null;
+        }
+
+        // Reset login state
+        _isLoggedIn = false;
+
+        // Update status to allow new login attempt
+        await WriteStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+
+        _progress.OnLog(LogLevel.Info, "Login cancelled, ready for new attempt");
     }
 
     private async Task<List<OwnedGame>> HandleGetOwnedGamesAsync()

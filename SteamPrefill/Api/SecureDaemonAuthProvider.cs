@@ -184,6 +184,40 @@ public sealed class SecureDaemonAuthProvider : ISteamAuthProvider, IDisposable
     public Task<string?> GetCachedPasswordAsync(CancellationToken cancellationToken = default)
         => Task.FromResult<string?>(null); // Daemon always requires secure credential exchange
 
+    /// <summary>
+    /// Cancels any pending credential request and clears challenge files.
+    /// Call this when the user wants to abort a login attempt.
+    /// </summary>
+    public void CancelPendingRequest()
+    {
+        _progress.OnLog(LogLevel.Info, "Cancelling pending credential request...");
+
+        // Cancel the pending credential wait
+        _pendingCredential?.TrySetCanceled();
+        _pendingCredential = null;
+        _currentChallengeId = null;
+
+        // Clear any pending challenge files
+        try
+        {
+            var challengeFiles = Directory.GetFiles(_responsesDir, "auth_challenge_*.json");
+            foreach (var file in challengeFiles)
+            {
+                try { File.Delete(file); } catch { /* ignore */ }
+            }
+            _progress.OnLog(LogLevel.Debug, $"Cleared {challengeFiles.Length} challenge file(s)");
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Error clearing challenge files: {ex.Message}");
+        }
+
+        // Clear any stored credentials
+        ClearPinnedCredential();
+
+        _progress.OnLog(LogLevel.Info, "Pending credential request cancelled");
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
