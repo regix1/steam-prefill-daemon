@@ -1,10 +1,6 @@
 ﻿global using AutoMapper;
 global using ByteSizeLib;
-global using CliFx;
-global using CliFx.Attributes;
-global using CliFx.Exceptions;
-global using CliFx.Extensibility;
-global using CliFx.Infrastructure;
+
 global using HexMate;
 global using JetBrains.Annotations;
 global using LancachePrefill.Common;
@@ -19,7 +15,7 @@ global using SteamKit2;
 global using SteamKit2.Authentication;
 global using SteamKit2.CDN;
 global using SteamKit2.Internal;
-global using SteamPrefill.CliCommands.Benchmark;
+
 global using SteamPrefill.Handlers;
 global using SteamPrefill.Handlers.Steam;
 global using SteamPrefill.Models;
@@ -42,7 +38,7 @@ global using System.Text.Json;
 global using System.Text.Json.Serialization;
 global using System.Text.RegularExpressions;
 global using System.Threading.Tasks;
-global using Terminal.Gui;
+
 global using static LancachePrefill.Common.SpectreFormatters;
 global using static SteamKit2.SteamApps;
 global using AnsiConsoleExtensions = LancachePrefill.Common.Extensions.AnsiConsoleExtensions;

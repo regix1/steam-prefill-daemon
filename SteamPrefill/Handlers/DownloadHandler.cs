@@ -48,11 +48,11 @@ namespace SteamPrefill.Handlers
             var failedRequests = new ConcurrentBag<QueuedRequest>();
             await _ansiConsole.CreateSpectreProgress(downloadArgs.TransferSpeedUnit).StartAsync(async ctx =>
             {
-                // Run the initial download
+                // Run the initial download - use Force flag to bypass Lancache's cache
                 failedRequests = await AttemptDownloadAsync(ctx, "Downloading..", queuedRequests, downloadArgs,
-                    forceRecache: false, appId: appId, appName: appName, cancellationToken: cancellationToken);
+                    forceRecache: downloadArgs.Force, appId: appId, appName: appName, cancellationToken: cancellationToken);
 
-                // Handle any failed requests
+                // Handle any failed requests - always force recache on retry
                 while (failedRequests.Any() && retryCount < 2)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
