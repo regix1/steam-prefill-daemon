@@ -28,11 +28,13 @@ public sealed class SecureFileCommandInterface : IDisposable
     private readonly IPrefillProgress _progress;
     private readonly CancellationTokenSource _cts = new();
     private CancellationTokenSource? _loginCts;  // Per-login cancellation token
+    private CancellationTokenSource? _prefillCts;  // Per-prefill cancellation token
     private FileSystemWatcher? _watcher;
     private SteamPrefillApi? _api;
     private bool _isRunning;
     private bool _isDisposed;
     private bool _isLoggedIn;
+    private bool _isPrefilling;
     private readonly SemaphoreSlim _commandLock = new(1, 1);
 
     // Commands that are allowed before login
@@ -132,6 +134,13 @@ public sealed class SecureFileCommandInterface : IDisposable
                 if (content.Contains("\"cancel-login\"", StringComparison.OrdinalIgnoreCase))
                 {
                     await HandleCancelLoginDirectAsync(e.FullPath);
+                    return;
+                }
+
+                // Handle cancel-prefill without acquiring the lock - it needs to interrupt a prefill in progress
+                if (content.Contains("\"cancel-prefill\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    await HandleCancelPrefillDirectAsync(e.FullPath);
                     return;
                 }
 
@@ -483,7 +492,8 @@ public sealed class SecureFileCommandInterface : IDisposable
         // and any other cancellable operations in the login flow
         try
         {
-            _loginCts?.Cancel();
+            if (_loginCts != null)
+                await _loginCts.CancelAsync();
         }
         catch { /* ignore if already disposed */ }
 
@@ -513,6 +523,67 @@ public sealed class SecureFileCommandInterface : IDisposable
         try { File.Delete(filePath); } catch { /* ignore */ }
 
         _progress.OnLog(LogLevel.Info, "Cancel-login signal sent, waiting for login process to complete cleanup");
+    }
+
+    /// <summary>
+    /// Handle cancel-prefill command directly without acquiring the command lock.
+    /// This is necessary because cancel-prefill needs to interrupt a prefill that holds the lock.
+    /// </summary>
+    private async Task HandleCancelPrefillDirectAsync(string filePath)
+    {
+        _progress.OnLog(LogLevel.Info, "Cancel-prefill command received (direct handler)");
+
+        CommandRequest? command = null;
+        string? commandId = null;
+
+        try
+        {
+            // Parse command to get the ID for response
+            var json = await File.ReadAllTextAsync(filePath, _cts.Token);
+            command = JsonSerializer.Deserialize(json, DaemonSerializationContext.Default.CommandRequest);
+            commandId = command?.Id;
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Failed to parse cancel-prefill command: {ex.Message}");
+        }
+
+        // Cancel the prefill-specific cancellation token
+        if (_isPrefilling && _prefillCts != null)
+        {
+            try
+            {
+                await _prefillCts.CancelAsync();
+                _progress.OnLog(LogLevel.Info, "Prefill cancellation requested");
+            }
+            catch { /* ignore if already disposed */ }
+        }
+        else
+        {
+            _progress.OnLog(LogLevel.Info, "No prefill in progress to cancel");
+        }
+
+        // Write response
+        var response = new CommandResponse
+        {
+            Id = commandId ?? Guid.NewGuid().ToString(),
+            Success = true,
+            Message = _isPrefilling ? "Prefill cancellation requested" : "No prefill in progress"
+        };
+
+        try
+        {
+            var responseJson = JsonSerializer.Serialize(response, DaemonSerializationContext.Default.CommandResponse);
+            var responsePath = Path.Combine(_responsesDir, $"response_{response.Id}.json");
+            await File.WriteAllTextAsync(responsePath, responseJson, _cts.Token);
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Failed to write cancel-prefill response: {ex.Message}");
+        }
+
+        // Delete command file
+        try { File.Delete(filePath); } catch { /* ignore */ }
     }
 
     private async Task<List<OwnedGame>> HandleGetOwnedGamesAsync()
@@ -555,6 +626,11 @@ public sealed class SecureFileCommandInterface : IDisposable
     {
         EnsureLoggedIn();
 
+        if (_isPrefilling)
+        {
+            return new PrefillResult { Success = false, ErrorMessage = "A prefill is already in progress" };
+        }
+
         // Log selected apps before prefill
         var selectedApps = _api!.GetSelectedApps();
         _progress.OnLog(LogLevel.Info, $"HandlePrefillAsync: {selectedApps.Count} apps selected for prefill");
@@ -577,7 +653,7 @@ public sealed class SecureFileCommandInterface : IDisposable
                 options.PrefillTopGames = top;
             if (bool.TryParse(command.Parameters.GetValueOrDefault("force"), out var force))
                 options.Force = force;
-            
+
             // Parse operating systems (comma-separated: "windows,linux,macos")
             var osParam = command.Parameters.GetValueOrDefault("os");
             if (!string.IsNullOrEmpty(osParam))
@@ -599,7 +675,26 @@ public sealed class SecureFileCommandInterface : IDisposable
 
         _progress.OnLog(LogLevel.Info, $"HandlePrefillAsync: Options - all={options.DownloadAllOwnedGames}, recent={options.PrefillRecentGames}, force={options.Force}, os={string.Join(",", options.OperatingSystems.Select(o => o.Value))}");
 
-        return await _api!.PrefillAsync(options, _cts.Token);
+        // Create prefill-specific cancellation token
+        _prefillCts?.Dispose();
+        _prefillCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        _isPrefilling = true;
+
+        try
+        {
+            return await _api!.PrefillAsync(options, _prefillCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            _progress.OnLog(LogLevel.Info, "Prefill cancelled by user");
+            return new PrefillResult { Success = false, ErrorMessage = "Prefill cancelled by user" };
+        }
+        finally
+        {
+            _isPrefilling = false;
+            _prefillCts?.Dispose();
+            _prefillCts = null;
+        }
     }
 
     private void HandleShutdown()
@@ -646,6 +741,8 @@ public sealed class SecureFileCommandInterface : IDisposable
             return;
 
         Stop();
+        _loginCts?.Dispose();
+        _prefillCts?.Dispose();
         _cts.Dispose();
         _api?.Dispose();
         _authProvider.Dispose();
