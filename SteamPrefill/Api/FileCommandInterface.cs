@@ -127,6 +127,13 @@ public sealed class SecureFileCommandInterface : IDisposable
                 if (content.Contains("encryptedCredential", StringComparison.OrdinalIgnoreCase))
                     return;
 
+                // Handle cancel-login without acquiring the lock - it needs to interrupt a login in progress
+                if (content.Contains("\"cancel-login\"", StringComparison.OrdinalIgnoreCase))
+                {
+                    await HandleCancelLoginDirectAsync(e.FullPath);
+                    return;
+                }
+
                 await ProcessCommandFileAsync(e.FullPath);
             }
             catch (OperationCanceledException)
@@ -387,6 +394,75 @@ public sealed class SecureFileCommandInterface : IDisposable
         await WriteStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
 
         _progress.OnLog(LogLevel.Info, "Login cancelled, ready for new attempt");
+    }
+
+    /// <summary>
+    /// Handle cancel-login command directly without acquiring the command lock.
+    /// This is necessary because cancel-login needs to interrupt a login that holds the lock.
+    /// </summary>
+    private async Task HandleCancelLoginDirectAsync(string filePath)
+    {
+        _progress.OnLog(LogLevel.Info, "Cancel-login command received (direct handler)");
+
+        CommandRequest? command = null;
+        string? commandId = null;
+
+        try
+        {
+            // Parse command to get the ID for response
+            var json = await File.ReadAllTextAsync(filePath, _cts.Token);
+            command = JsonSerializer.Deserialize(json, DaemonSerializationContext.Default.CommandRequest);
+            commandId = command?.Id;
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Failed to parse cancel-login command: {ex.Message}");
+        }
+
+        // Cancel any pending credential requests - this releases the blocked login
+        _authProvider.CancelPendingRequest();
+
+        // Clean up any partially initialized API
+        if (_api != null)
+        {
+            try
+            {
+                _api.Shutdown();
+                _api.Dispose();
+            }
+            catch { /* ignore cleanup errors */ }
+            _api = null;
+        }
+
+        // Reset login state
+        _isLoggedIn = false;
+
+        // Write response
+        var response = new CommandResponse
+        {
+            Id = commandId ?? Guid.NewGuid().ToString(),
+            Success = true,
+            Message = "Login cancelled"
+        };
+
+        try
+        {
+            var responseJson = JsonSerializer.Serialize(response, DaemonSerializationContext.Default.CommandResponse);
+            var responsePath = Path.Combine(_responsesDir, $"response_{response.Id}.json");
+            await File.WriteAllTextAsync(responsePath, responseJson, _cts.Token);
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Failed to write cancel-login response: {ex.Message}");
+        }
+
+        // Delete command file
+        try { File.Delete(filePath); } catch { /* ignore */ }
+
+        // Update status
+        await WriteStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+
+        _progress.OnLog(LogLevel.Info, "Login cancelled via direct handler, ready for new attempt");
     }
 
     private async Task<List<OwnedGame>> HandleGetOwnedGamesAsync()
