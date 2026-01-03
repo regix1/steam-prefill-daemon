@@ -37,12 +37,12 @@ namespace SteamPrefill
         ///
         /// Required to be called first before using SteamManager class.
         /// </summary>
-        public async Task InitializeAsync()
+        public async Task InitializeAsync(CancellationToken cancellationToken = default)
         {
             var timer = Stopwatch.StartNew();
             _ansiConsole.LogMarkupLine("Starting login!");
 
-            await _steam3.LoginToSteamAsync();
+            await _steam3.LoginToSteamAsync(cancellationToken);
             _steam3.WaitForLicenseCallback();
 
             _ansiConsole.LogMarkupLine("Steam session initialization complete!", timer);

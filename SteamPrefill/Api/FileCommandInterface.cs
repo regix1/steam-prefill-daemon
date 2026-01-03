@@ -27,6 +27,7 @@ public sealed class SecureFileCommandInterface : IDisposable
     private readonly SecureDaemonAuthProvider _authProvider;
     private readonly IPrefillProgress _progress;
     private readonly CancellationTokenSource _cts = new();
+    private CancellationTokenSource? _loginCts;  // Per-login cancellation token
     private FileSystemWatcher? _watcher;
     private SteamPrefillApi? _api;
     private bool _isRunning;
@@ -346,13 +347,18 @@ public sealed class SecureFileCommandInterface : IDisposable
 
         _progress.OnLog(LogLevel.Info, "Starting secure login process...");
 
+        // Create a login-specific cancellation token linked to the main one
+        _loginCts?.Dispose();
+        _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+
         // Create API with secure auth provider
         _api = new SteamPrefillApi(_authProvider, _progress);
 
         try
         {
             // This will trigger the secure credential exchange
-            await _api.InitializeAsync(_cts.Token);
+            // Pass the login-specific token so cancel-login can abort the Steam auth polling
+            await _api.InitializeAsync(_loginCts.Token);
 
             _isLoggedIn = true;
             _progress.OnLog(LogLevel.Info, "Login successful - commands now available");
@@ -400,6 +406,12 @@ public sealed class SecureFileCommandInterface : IDisposable
             await WriteStatusAsync("awaiting-login", $"Login failed: {ex.Message}");
 
             throw;
+        }
+        finally
+        {
+            // Clean up login CTS
+            _loginCts?.Dispose();
+            _loginCts = null;
         }
     }
 
@@ -467,8 +479,15 @@ public sealed class SecureFileCommandInterface : IDisposable
             _progress.OnLog(LogLevel.Warning, $"Failed to parse cancel-login command: {ex.Message}");
         }
 
-        // Cancel any pending credential requests - this causes the blocked login to throw OperationCanceledException
-        // The login process will then clean up _api and set _isLoggedIn = false as it unwinds
+        // Cancel the login-specific cancellation token - this will abort PollingWaitForResultAsync
+        // and any other cancellable operations in the login flow
+        try
+        {
+            _loginCts?.Cancel();
+        }
+        catch { /* ignore if already disposed */ }
+
+        // Also cancel any pending credential requests
         _authProvider.CancelPendingRequest();
 
         // Write response

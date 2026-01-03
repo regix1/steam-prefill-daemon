@@ -71,7 +71,7 @@ public sealed class SteamPrefillApi : IDisposable
 
             _steamManager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress);
 
-            await _steamManager.InitializeAsync();
+            await _steamManager.InitializeAsync(cancellationToken);
             _isInitialized = true;
 
             _progress.OnOperationCompleted("Initializing Steam connection", timer.Elapsed);

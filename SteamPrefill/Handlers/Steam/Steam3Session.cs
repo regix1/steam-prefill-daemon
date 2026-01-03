@@ -109,27 +109,29 @@ namespace SteamPrefill.Handlers.Steam
             }
         }
 
-        public async Task LoginToSteamAsync()
+        public async Task LoginToSteamAsync(CancellationToken cancellationToken = default)
         {
-            await ConfigureLoginDetailsAsync();
+            await ConfigureLoginDetailsAsync(cancellationToken);
 
             int retryCount = 0;
             bool logonSuccess = false;
             while (!logonSuccess)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
 
                 SteamUser.LoggedOnCallback logonResult = null;
                 await _ansiConsole.StatusSpinner().StartAsync("Connecting to Steam...", async ctx =>
                 {
-                    ConnectToSteam();
+                    ConnectToSteam(cancellationToken);
 
                     // Making sure that we have a valid access token before moving onto the login
                     ctx.Status = "Retrieving access token...";
-                    await GetAccessTokenAsync();
+                    await GetAccessTokenAsync(cancellationToken);
 
                     ctx.Status = "Logging in to Steam...";
-                    logonResult = AttemptSteamLogin();
+                    logonResult = AttemptSteamLogin(cancellationToken);
                 });
 
                 logonSuccess = HandleLogonResult(logonResult);
@@ -144,7 +146,7 @@ namespace SteamPrefill.Handlers.Steam
             _ansiConsole.LogMarkupVerbose($"Connected to CM {Cyan(_steamClient.CurrentEndPoint)}");
         }
 
-        private async Task GetAccessTokenAsync()
+        private async Task GetAccessTokenAsync(CancellationToken cancellationToken = default)
         {
             if (_userAccountStore.AccessTokenIsValid())
             {
@@ -168,7 +170,8 @@ namespace SteamPrefill.Handlers.Steam
             });
 
             // Starting polling Steam for authentication response
-            var pollResponse = await authSession.PollingWaitForResultAsync();
+            // Pass cancellation token so we can abort if cancel-login is called
+            var pollResponse = await authSession.PollingWaitForResultAsync(cancellationToken);
             _userAccountStore.AccessToken = pollResponse.RefreshToken;
             _userAccountStore.Save();
 
@@ -177,8 +180,9 @@ namespace SteamPrefill.Handlers.Steam
             GC.Collect();
         }
 
-        private async Task ConfigureLoginDetailsAsync()
+        private async Task ConfigureLoginDetailsAsync(CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var username = await _userAccountStore.GetUsernameAsync(_ansiConsole);
 
             _logonDetails = new SteamUser.LogOnDetails
@@ -200,7 +204,7 @@ namespace SteamPrefill.Handlers.Steam
         /// Retries if necessary until successful connection is established
         /// </summary>
         /// <exception cref="SteamConnectionException">Throws if unable to connect to Steam</exception>
-        private void ConnectToSteam()
+        private void ConnectToSteam(CancellationToken cancellationToken = default)
         {
             _ansiConsole.LogMarkupVerbose($"Connecting with CellId: {Magenta(CellId)}");
             var timeoutAfter = DateTime.Now.AddSeconds(30);
@@ -208,12 +212,16 @@ namespace SteamPrefill.Handlers.Steam
             // Busy waiting until the client has a successful connection established
             while (!_steamClient.IsConnected)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 _isConnecting = true;
                 _steamClient.Connect();
 
                 // Busy waiting until SteamKit2 either succeeds/fails the connection attempt
                 while (_isConnecting)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
+
                     _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
                     if (DateTime.Now > timeoutAfter)
                     {
@@ -232,7 +240,7 @@ namespace SteamPrefill.Handlers.Steam
         private int _failedLogonAttempts;
 
         [SuppressMessage("Maintainability", "CA1508:Avoid dead conditional code", Justification = "while() loop is not infinite.  _loggedOnCallbackResult is set after logging into Steam")]
-        private SteamUser.LoggedOnCallback AttemptSteamLogin()
+        private SteamUser.LoggedOnCallback AttemptSteamLogin(CancellationToken cancellationToken = default)
         {
             var timeoutAfter = DateTime.Now.AddSeconds(30);
             // Need to reset this global result value, as it will be populated once the logon callback completes
@@ -244,6 +252,8 @@ namespace SteamPrefill.Handlers.Steam
             // Busy waiting for the callback to complete, then we can return the callback value synchronously
             while (_loggedOnCallbackResult == null)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
                 _callbackManager.RunWaitAllCallbacks(timeout: TimeSpan.FromMilliseconds(50));
                 if (DateTime.Now > timeoutAfter)
                 {
