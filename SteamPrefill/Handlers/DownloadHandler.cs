@@ -1,20 +1,24 @@
-﻿namespace SteamPrefill.Handlers
+﻿using SteamPrefill.Api;
+
+namespace SteamPrefill.Handlers
 {
     public sealed class DownloadHandler : IDisposable
     {
         private readonly IAnsiConsole _ansiConsole;
         private readonly CdnPool _cdnPool;
         private readonly HttpClient _client;
+        private readonly IPrefillProgress _progress;
 
         /// <summary>
         /// The URL/IP Address where the Lancache has been detected.
         /// </summary>
         private string _lancacheAddress;
 
-        public DownloadHandler(IAnsiConsole ansiConsole, CdnPool cdnPool)
+        public DownloadHandler(IAnsiConsole ansiConsole, CdnPool cdnPool, IPrefillProgress? progress = null)
         {
             _ansiConsole = ansiConsole;
             _cdnPool = cdnPool;
+            _progress = progress ?? NullProgress.Instance;
 
             _client = new HttpClient();
             // Lancache requires this user agent in order to correctly identify and cache Valve's content servers
@@ -35,7 +39,8 @@
         /// false will be returned
         /// </summary>
         /// <returns>True if all downloads succeeded.  False if any downloads failed 3 times in a row.</returns>
-        public async Task<bool> DownloadQueuedChunksAsync(List<QueuedRequest> queuedRequests, DownloadArguments downloadArgs)
+        public async Task<bool> DownloadQueuedChunksAsync(List<QueuedRequest> queuedRequests, DownloadArguments downloadArgs,
+                                                          uint appId = 0, string? appName = null)
         {
             await InitializeAsync();
 
@@ -44,13 +49,15 @@
             await _ansiConsole.CreateSpectreProgress(downloadArgs.TransferSpeedUnit).StartAsync(async ctx =>
             {
                 // Run the initial download
-                failedRequests = await AttemptDownloadAsync(ctx, "Downloading..", queuedRequests, downloadArgs);
+                failedRequests = await AttemptDownloadAsync(ctx, "Downloading..", queuedRequests, downloadArgs,
+                    forceRecache: false, appId: appId, appName: appName);
 
                 // Handle any failed requests
                 while (failedRequests.Any() && retryCount < 2)
                 {
                     retryCount++;
-                    failedRequests = await AttemptDownloadAsync(ctx, $"Retrying  {retryCount}..", failedRequests.ToList(), downloadArgs, forceRecache: true);
+                    failedRequests = await AttemptDownloadAsync(ctx, $"Retrying  {retryCount}..", failedRequests.ToList(), downloadArgs,
+                        forceRecache: true, appId: appId, appName: appName);
                 }
             });
 
@@ -81,12 +88,17 @@
         /// <param name="forceRecache">When specified, will cause the cache to delete the existing cached data for a request, and re-download it again.</param>
         /// <returns>A list of failed requests</returns>
         public async Task<ConcurrentBag<QueuedRequest>> AttemptDownloadAsync(ProgressContext ctx, string taskTitle, List<QueuedRequest> requestsToDownload,
-                                                                                DownloadArguments downloadArgs, bool forceRecache = false)
+                                                                                DownloadArguments downloadArgs, bool forceRecache = false,
+                                                                                uint appId = 0, string? appName = null)
         {
             double requestTotalSize = requestsToDownload.Sum(e => e.CompressedLength);
             var progressTask = ctx.AddTask(taskTitle, new ProgressTaskSettings { MaxValue = requestTotalSize });
 
             var failedRequests = new ConcurrentBag<QueuedRequest>();
+            long bytesDownloaded = 0;
+            var startTime = DateTime.UtcNow;
+            var lastProgressReport = DateTime.MinValue;
+            var progressThrottle = TimeSpan.FromMilliseconds(500);
 
             var cdnServer = _cdnPool.TakeConnection();
             await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests }, body: async (request, _) =>
@@ -118,6 +130,26 @@
                     failedRequests.Add(request);
                 }
                 progressTask.Increment(request.CompressedLength);
+
+                // Report progress via IPrefillProgress (throttled)
+                var downloaded = Interlocked.Add(ref bytesDownloaded, request.CompressedLength);
+                var now = DateTime.UtcNow;
+                if (now - lastProgressReport >= progressThrottle)
+                {
+                    lastProgressReport = now;
+                    var elapsed = now - startTime;
+                    var bytesPerSecond = elapsed.TotalSeconds > 0 ? downloaded / elapsed.TotalSeconds : 0;
+
+                    _progress.OnDownloadProgress(new DownloadProgressInfo
+                    {
+                        AppId = appId,
+                        AppName = appName ?? $"App {appId}",
+                        TotalBytes = (long)requestTotalSize,
+                        BytesDownloaded = downloaded,
+                        BytesPerSecond = bytesPerSecond,
+                        Elapsed = elapsed
+                    });
+                }
             });
 
             //TODO In the scenario where a user still had all requests fail, potentially display a warning that there is an underlying issue

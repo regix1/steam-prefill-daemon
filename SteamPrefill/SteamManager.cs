@@ -15,16 +15,18 @@ namespace SteamPrefill
         private readonly AppInfoHandler _appInfoHandler;
 
         private readonly PrefillSummaryResult _prefillSummaryResult = new PrefillSummaryResult();
+        private readonly IPrefillProgress _progress;
 
-        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null)
+        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null)
         {
             _ansiConsole = ansiConsole;
             _downloadArgs = downloadArgs;
+            _progress = progress ?? NullProgress.Instance;
 
             _steam3 = new Steam3Session(_ansiConsole, authProvider);
             _cdnPool = new CdnPool(_ansiConsole, _steam3);
             _appInfoHandler = new AppInfoHandler(_ansiConsole, _steam3, _steam3.LicenseManager);
-            _downloadHandler = new DownloadHandler(_ansiConsole, _cdnPool);
+            _downloadHandler = new DownloadHandler(_ansiConsole, _cdnPool, _progress);
             _depotHandler = new DepotHandler(_ansiConsole, _steam3, _appInfoHandler, _cdnPool);
         }
 
@@ -200,7 +202,8 @@ namespace SteamPrefill
                 return;
             }
 
-            var downloadSuccessful = await _downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, _downloadArgs);
+            var downloadSuccessful = await _downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, _downloadArgs,
+                appId: appInfo.AppId, appName: appInfo.Name);
             if (downloadSuccessful)
             {
                 _depotHandler.MarkDownloadAsSuccessful(filteredDepots);

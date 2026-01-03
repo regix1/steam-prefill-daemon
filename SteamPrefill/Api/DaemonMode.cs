@@ -268,6 +268,9 @@ public class PrefillProgressUpdate
     [System.Text.Json.Serialization.JsonPropertyName("elapsed")]
     public TimeSpan Elapsed { get; set; }
 
+    [System.Text.Json.Serialization.JsonPropertyName("elapsedSeconds")]
+    public double ElapsedSeconds => Elapsed.TotalSeconds;
+
     [System.Text.Json.Serialization.JsonPropertyName("result")]
     public string? Result { get; set; }
 
@@ -291,6 +294,9 @@ public class PrefillProgressUpdate
 
     [System.Text.Json.Serialization.JsonPropertyName("totalTime")]
     public TimeSpan TotalTime { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("totalTimeSeconds")]
+    public double TotalTimeSeconds => TotalTime.TotalSeconds;
 
     [System.Text.Json.Serialization.JsonPropertyName("updatedAt")]
     public DateTime UpdatedAt { get; set; }

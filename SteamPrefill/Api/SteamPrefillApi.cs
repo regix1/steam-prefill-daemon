@@ -69,7 +69,7 @@ public sealed class SteamPrefillApi : IDisposable
                 OperatingSystems = new List<OperatingSystem> { PrefillOptions.GetCurrentOperatingSystem() }
             };
 
-            _steamManager = new SteamManager(consoleAdapter, downloadArgs, _authProvider);
+            _steamManager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress);
 
             await _steamManager.InitializeAsync();
             _isInitialized = true;
