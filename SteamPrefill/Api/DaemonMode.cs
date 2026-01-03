@@ -113,6 +113,48 @@ public static class DaemonMode
                 _ => "[LOG]"
             };
             Console.WriteLine($"{DateTime.UtcNow:HH:mm:ss} {prefix} {message}");
+
+            // Write progress updates for important status messages
+            // This ensures the frontend can see metadata loading progress
+            if (level == LogLevel.Info && IsProgressMessage(message))
+            {
+                var state = GetStateFromMessage(message);
+                WriteProgress(new PrefillProgressUpdate
+                {
+                    State = state,
+                    Message = message,
+                    UpdatedAt = DateTime.UtcNow
+                });
+            }
+        }
+
+        /// <summary>
+        /// Determines if a message should trigger a progress file update
+        /// </summary>
+        private static bool IsProgressMessage(string message)
+        {
+            return message.Contains("Loading metadata") ||
+                   message.Contains("Metadata loaded") ||
+                   message.Contains("Starting prefill of") ||
+                   message.Contains("apps selected") ||
+                   message.Contains("Starting login") ||
+                   message.Contains("Login successful");
+        }
+
+        /// <summary>
+        /// Determines the state based on the message content
+        /// </summary>
+        private static string GetStateFromMessage(string message)
+        {
+            if (message.Contains("Loading metadata"))
+                return "loading-metadata";
+            if (message.Contains("Metadata loaded"))
+                return "metadata-loaded";
+            if (message.Contains("Starting prefill"))
+                return "starting";
+            if (message.Contains("Login successful"))
+                return "logged-in";
+            return "preparing";
         }
 
         private static bool ContainsSensitiveContent(string message)
@@ -250,6 +292,9 @@ public class PrefillProgressUpdate
 {
     [System.Text.Json.Serialization.JsonPropertyName("state")]
     public string State { get; set; } = "idle";
+
+    [System.Text.Json.Serialization.JsonPropertyName("message")]
+    public string? Message { get; set; }
 
     [System.Text.Json.Serialization.JsonPropertyName("currentAppId")]
     public uint CurrentAppId { get; set; }
