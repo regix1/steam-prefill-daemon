@@ -654,6 +654,10 @@ public sealed class SecureFileCommandInterface : IDisposable
             if (bool.TryParse(command.Parameters.GetValueOrDefault("force"), out var force))
                 options.Force = force;
 
+            // Parse max concurrent threads
+            if (int.TryParse(command.Parameters.GetValueOrDefault("maxConcurrency"), out var maxConcurrency) && maxConcurrency > 0)
+                AppConfig.MaxConcurrencyOverride = maxConcurrency;
+
             // Parse operating systems (comma-separated: "windows,linux,macos")
             var osParam = command.Parameters.GetValueOrDefault("os");
             if (!string.IsNullOrEmpty(osParam))
