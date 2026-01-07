@@ -23,6 +23,16 @@
             _licenseManager = licenseManager;
         }
 
+        /// <summary>
+        /// Clears all cached app metadata, forcing it to be re-fetched from Steam on next request
+        /// </summary>
+        public void ClearLoadedAppInfos()
+        {
+            LoadedAppInfos.Clear();
+            _recentlyPlayed = null;
+            _ansiConsole.LogMarkupVerbose("Cleared app metadata cache");
+        }
+
         #region Loading Metadata
 
         /// <summary>

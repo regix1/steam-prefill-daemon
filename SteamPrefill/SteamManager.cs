@@ -281,12 +281,16 @@ namespace SteamPrefill
 
             var appStatuses = new ConcurrentBag<AppStatus>();
             var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds);
+            
+            _ansiConsole.LogMarkupVerbose($"Getting status for {Magenta(availableGames.Count)} available games out of {Magenta(appIds.Count)} requested");
 
             await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
             {
                 try
                 {
+                    _ansiConsole.LogMarkupVerbose($"Processing {Cyan(app.Name)}: {app.Depots.Count} depots");
                     var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, app.Depots);
+                    _ansiConsole.LogMarkupVerbose($"  Filtered to {filteredDepots.Count} depots");
                     await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
 
                     var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots);
@@ -300,8 +304,12 @@ namespace SteamPrefill
                         IsUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots)
                     });
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
+                    // Log the error so we can debug size calculation failures
+                    _ansiConsole.LogMarkupError($"Failed to get size for {app.Name} ({app.AppId}): {ex.Message}");
+                    FileLogger.LogException($"Failed to get app status for {app.Name}", ex);
+                    
                     // If we can't get info for an app, add it with zero size
                     appStatuses.Add(new AppStatus
                     {
@@ -327,6 +335,15 @@ namespace SteamPrefill
             var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(ownedGameIds);
 
             return availableGames;
+        }
+
+        /// <summary>
+        /// Clears in-memory caches for app metadata.
+        /// Should be called when manifest cache is cleared to ensure consistency.
+        /// </summary>
+        public void ClearAppInfoCache()
+        {
+            _appInfoHandler.ClearLoadedAppInfos();
         }
 
         private async Task PrintUnownedAppsAsync(List<uint> distinctAppIds)

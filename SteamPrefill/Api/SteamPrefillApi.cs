@@ -296,6 +296,18 @@ public sealed class SteamPrefillApi : IDisposable
         }
     }
 
+    /// <summary>
+    /// Clears the in-memory app info cache.
+    /// Should be called when clearing disk cache to ensure data consistency.
+    /// </summary>
+    public void ClearAppInfoCache()
+    {
+        if (_steamManager != null && _isInitialized)
+        {
+            _steamManager.ClearAppInfoCache();
+            _progress.OnLog(LogLevel.Info, "Cleared in-memory app info cache");
+        }
+    }
 
     /// <summary>
     /// Clears the temporary cache directory to free up disk space.

@@ -310,6 +310,11 @@ public sealed class SecureFileCommandInterface : IDisposable
 
                 case "clear-cache":
                     var clearResult = SteamPrefillApi.ClearCache();
+                    // Also clear in-memory cache to ensure data consistency
+                    if (_api != null && _isLoggedIn)
+                    {
+                        _api.ClearAppInfoCache();
+                    }
                     response.Success = clearResult.Success;
                     response.Data = clearResult;
                     response.Message = clearResult.Message;
