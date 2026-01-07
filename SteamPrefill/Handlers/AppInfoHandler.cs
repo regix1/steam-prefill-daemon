@@ -33,6 +33,19 @@
             _ansiConsole.LogMarkupVerbose("Cleared app metadata cache");
         }
 
+        /// <summary>
+        /// Removes specific app IDs from the cache, forcing them to be re-fetched from Steam.
+        /// Use this to ensure fresh metadata for specific apps without clearing the entire cache.
+        /// </summary>
+        public void InvalidateApps(List<uint> appIds)
+        {
+            foreach (var appId in appIds)
+            {
+                LoadedAppInfos.TryRemove(appId, out _);
+            }
+            _ansiConsole.LogMarkupVerbose($"Invalidated cache for {Magenta(appIds.Count)} apps");
+        }
+
         #region Loading Metadata
 
         /// <summary>

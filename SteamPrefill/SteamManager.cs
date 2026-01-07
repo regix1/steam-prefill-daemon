@@ -276,6 +276,8 @@ namespace SteamPrefill
         /// </summary>
         public async Task<List<AppStatus>> GetSelectedAppsStatusAsync(List<uint> appIds)
         {
+            // Force-refresh app metadata for these specific apps to ensure accurate size calculations
+            _appInfoHandler.InvalidateApps(appIds);
             await _appInfoHandler.RetrieveAppMetadataAsync(appIds);
             await _cdnPool.PopulateAvailableServersAsync();
 
