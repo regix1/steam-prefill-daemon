@@ -316,9 +316,9 @@ public sealed class SteamPrefillApi : IDisposable
     /// <returns>Cache clear result with file count and total size cleared</returns>
     public static ClearCacheResult ClearCache()
     {
-        var rootTempDir = new DirectoryInfo(AppConfig.TempDir).Parent;
-        
-        if (rootTempDir == null || !rootTempDir.Exists)
+        var tempDir = new DirectoryInfo(AppConfig.TempDir);
+
+        if (!tempDir.Exists)
         {
             return new ClearCacheResult
             {
@@ -329,7 +329,7 @@ public sealed class SteamPrefillApi : IDisposable
             };
         }
 
-        var tempFiles = rootTempDir.EnumerateFiles("*.*", SearchOption.AllDirectories).ToList();
+        var tempFiles = tempDir.EnumerateFiles("*.*", SearchOption.AllDirectories).ToList();
         var totalBytes = tempFiles.Sum(e => e.Length);
         var fileCount = tempFiles.Count;
 
@@ -346,7 +346,9 @@ public sealed class SteamPrefillApi : IDisposable
 
         try
         {
-            Directory.Delete(rootTempDir.FullName, true);
+            Directory.Delete(tempDir.FullName, true);
+            // Recreate the temp directory so future operations can use it
+            Directory.CreateDirectory(AppConfig.TempDir);
             var clearedSize = ByteSize.FromBytes(totalBytes);
             return new ClearCacheResult
             {
@@ -373,9 +375,9 @@ public sealed class SteamPrefillApi : IDisposable
     /// </summary>
     public static ClearCacheResult GetCacheInfo()
     {
-        var rootTempDir = new DirectoryInfo(AppConfig.TempDir).Parent;
-        
-        if (rootTempDir == null || !rootTempDir.Exists)
+        var tempDir = new DirectoryInfo(AppConfig.TempDir);
+
+        if (!tempDir.Exists)
         {
             return new ClearCacheResult
             {
@@ -386,7 +388,7 @@ public sealed class SteamPrefillApi : IDisposable
             };
         }
 
-        var tempFiles = rootTempDir.EnumerateFiles("*.*", SearchOption.AllDirectories).ToList();
+        var tempFiles = tempDir.EnumerateFiles("*.*", SearchOption.AllDirectories).ToList();
         var totalBytes = tempFiles.Sum(e => e.Length);
         var cacheSize = ByteSize.FromBytes(totalBytes);
 
