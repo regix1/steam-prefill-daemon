@@ -62,11 +62,12 @@ public sealed class SteamPrefillApi : IDisposable
             // Create console adapter that routes through our auth provider
             var consoleAdapter = new ApiConsoleAdapter(_authProvider, _progress);
 
+            // Default to ALL operating systems since Lancache serves clients on any platform
             var downloadArgs = new DownloadArguments
             {
                 Force = false,
                 TransferSpeedUnit = TransferSpeedUnit.Bits,
-                OperatingSystems = new List<OperatingSystem> { PrefillOptions.GetCurrentOperatingSystem() }
+                OperatingSystems = new List<OperatingSystem> { OperatingSystem.Windows, OperatingSystem.Linux, OperatingSystem.MacOS }
             };
 
             _steamManager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress);
@@ -310,6 +311,17 @@ public sealed class SteamPrefillApi : IDisposable
     }
 
     /// <summary>
+    /// Updates download options that affect filtering (e.g., operating systems).
+    /// </summary>
+    public void UpdateDownloadOptions(bool? force = null, List<OperatingSystem>? operatingSystems = null)
+    {
+        if (_steamManager != null && _isInitialized)
+        {
+            _steamManager.UpdateDownloadOptions(force, operatingSystems);
+        }
+    }
+
+    /// <summary>
     /// Clears the temporary cache directory to free up disk space.
     /// This is a static method that doesn't require initialization.
     /// </summary>
@@ -505,6 +517,14 @@ public class AppStatus
     public string Name { get; init; } = "";
     public long DownloadSize { get; init; }
     public bool IsUpToDate { get; init; }
+    /// <summary>
+    /// If true, this game has no depots for the selected operating systems
+    /// </summary>
+    public bool IsUnsupportedOs { get; init; }
+    /// <summary>
+    /// Human-readable reason why the game is unavailable (e.g., "Not available for Linux")
+    /// </summary>
+    public string? UnavailableReason { get; init; }
 }
 
 /// <summary>

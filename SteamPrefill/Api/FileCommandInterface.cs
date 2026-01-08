@@ -329,6 +329,23 @@ public sealed class SecureFileCommandInterface : IDisposable
 
                 case "get-selected-apps-status":
                     EnsureLoggedIn();
+                    // Parse and apply operating systems if provided
+                    var statusOsParam = command.Parameters?.GetValueOrDefault("os");
+                    if (!string.IsNullOrEmpty(statusOsParam))
+                    {
+                        var statusOsList = new List<OperatingSystem>();
+                        foreach (var os in statusOsParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        {
+                            if (OperatingSystem.TryFromValue(os.ToLowerInvariant(), out var operatingSystem))
+                            {
+                                statusOsList.Add(operatingSystem);
+                            }
+                        }
+                        if (statusOsList.Count > 0)
+                        {
+                            _api!.UpdateDownloadOptions(operatingSystems: statusOsList);
+                        }
+                    }
                     var appsStatus = await _api!.GetSelectedAppsStatusAsync(_cts.Token);
                     response.Success = true;
                     response.Data = appsStatus;

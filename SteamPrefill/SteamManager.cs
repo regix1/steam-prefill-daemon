@@ -286,6 +286,9 @@ namespace SteamPrefill
             
             _ansiConsole.LogMarkupVerbose($"Getting status for {Magenta(availableGames.Count)} available games out of {Magenta(appIds.Count)} requested");
 
+            // Build OS names string for error messages
+            var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
+
             await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
             {
                 try
@@ -293,6 +296,23 @@ namespace SteamPrefill
                     _ansiConsole.LogMarkupVerbose($"Processing {Cyan(app.Name)}: {app.Depots.Count} depots");
                     var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, app.Depots);
                     _ansiConsole.LogMarkupVerbose($"  Filtered to {filteredDepots.Count} depots");
+
+                    // Check if game has no depots for the selected OS
+                    if (filteredDepots.Count == 0 && app.Depots.Count > 0)
+                    {
+                        // Game has depots but none match the selected OS
+                        appStatuses.Add(new AppStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            IsUnsupportedOs = true,
+                            UnavailableReason = $"Not available for {selectedOsNames}"
+                        });
+                        return;
+                    }
+
                     await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
 
                     var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots);
@@ -311,14 +331,15 @@ namespace SteamPrefill
                     // Log the error so we can debug size calculation failures
                     _ansiConsole.LogMarkupError($"Failed to get size for {app.Name} ({app.AppId}): {ex.Message}");
                     FileLogger.LogException($"Failed to get app status for {app.Name}", ex);
-                    
+
                     // If we can't get info for an app, add it with zero size
                     appStatuses.Add(new AppStatus
                     {
                         AppId = app.AppId,
                         Name = app.Name,
                         DownloadSize = 0,
-                        IsUpToDate = false
+                        IsUpToDate = false,
+                        UnavailableReason = "Failed to calculate size"
                     });
                 }
             });
