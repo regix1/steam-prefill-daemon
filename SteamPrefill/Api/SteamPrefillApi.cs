@@ -185,6 +185,40 @@ public sealed class SteamPrefillApi : IDisposable
         }
     }
 
+
+    /// <summary>
+    /// Checks cache status by comparing cached depot manifests against Steam's current manifests.
+    /// This allows accurate detection of which apps are truly up-to-date even when daemon restarts.
+    /// </summary>
+    public async Task<CacheStatusResult> CheckCacheStatusAsync(List<CachedDepotInput> cachedDepots, CancellationToken cancellationToken = default)
+    {
+        ThrowIfNotInitialized();
+        ThrowIfDisposed();
+
+        if (cachedDepots.Count == 0)
+        {
+            return new CacheStatusResult
+            {
+                Apps = new List<AppCacheStatus>(),
+                Message = "No cached depots provided"
+            };
+        }
+
+        try
+        {
+            return await _steamManager!.CheckCacheStatusAsync(cachedDepots);
+        }
+        catch (Exception ex)
+        {
+            _progress.OnError("Failed to check cache status", ex);
+            return new CacheStatusResult
+            {
+                Apps = new List<AppCacheStatus>(),
+                Message = $"Error: {ex.Message}"
+            };
+        }
+    }
+
     /// <summary>
     /// Sets the list of app IDs to prefill
     /// </summary>
@@ -535,6 +569,48 @@ public class SelectedAppsStatus
     public List<AppStatus> Apps { get; init; } = new();
     public long TotalDownloadSize { get; init; }
     public string? Message { get; init; }
+}
+
+
+/// <summary>
+/// Input for cached depot manifest info from lancache-manager.
+/// </summary>
+public class CachedDepotInput
+{
+    public uint AppId { get; init; }
+    public uint DepotId { get; init; }
+    public ulong ManifestId { get; init; }
+}
+
+/// <summary>
+/// Result of cache status check for all apps.
+/// </summary>
+public class CacheStatusResult
+{
+    public List<AppCacheStatus> Apps { get; init; } = new();
+    public string? Message { get; init; }
+}
+
+/// <summary>
+/// Cache status for a single app.
+/// </summary>
+public class AppCacheStatus
+{
+    public uint AppId { get; init; }
+    public string Name { get; init; } = "";
+    public bool IsUpToDate { get; init; }
+    public long DownloadSize { get; init; }
+    public List<OutdatedDepot> OutdatedDepots { get; init; } = new();
+}
+
+/// <summary>
+/// Details about an outdated depot that needs updating.
+/// </summary>
+public class OutdatedDepot
+{
+    public uint DepotId { get; init; }
+    public ulong CachedManifest { get; init; }
+    public ulong CurrentManifest { get; init; }
 }
 
 /// <summary>

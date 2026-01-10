@@ -352,6 +352,28 @@ public sealed class SecureFileCommandInterface : IDisposable
                     response.Message = appsStatus.Message;
                     break;
 
+                case "check-cache-status":
+                    EnsureLoggedIn();
+                    var cachedDepotsJson = command.Parameters?.GetValueOrDefault("cachedDepots");
+                    if (string.IsNullOrEmpty(cachedDepotsJson))
+                    {
+                        response.Success = false;
+                        response.Error = "Missing cachedDepots parameter";
+                        break;
+                    }
+                    var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson);
+                    if (cachedDepots == null)
+                    {
+                        response.Success = false;
+                        response.Error = "Invalid cachedDepots format";
+                        break;
+                    }
+                    var cacheStatus = await _api!.CheckCacheStatusAsync(cachedDepots, _cts.Token);
+                    response.Success = true;
+                    response.Data = cacheStatus;
+                    response.Message = cacheStatus.Message;
+                    break;
+
                 default:
                     response.Success = false;
                     response.Error = $"Unknown command type: {command.Type}";

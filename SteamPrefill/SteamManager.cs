@@ -367,6 +367,132 @@ namespace SteamPrefill
             return appStatuses.OrderBy(a => a.Name).ToList();
         }
 
+
+        /// <summary>
+        /// Checks cache status by comparing cached depot manifests against Steam's current manifests.
+        /// This allows accurate detection of which apps are truly up-to-date even when daemon restarts.
+        /// </summary>
+        public async Task<CacheStatusResult> CheckCacheStatusAsync(List<CachedDepotInput> cachedDepots)
+        {
+            if (cachedDepots.Count == 0)
+            {
+                return new CacheStatusResult
+                {
+                    Apps = new List<AppCacheStatus>(),
+                    Message = "No cached depots provided"
+                };
+            }
+
+            // Group cached depots by app ID
+            var cachedByApp = cachedDepots
+                .GroupBy(d => d.AppId)
+                .ToDictionary(g => g.Key, g => g.ToDictionary(d => d.DepotId, d => d.ManifestId));
+
+            var appIds = cachedByApp.Keys.ToList();
+
+            // Force-refresh app metadata for these specific apps to ensure accurate manifest info
+            _appInfoHandler.InvalidateApps(appIds);
+            await _appInfoHandler.RetrieveAppMetadataAsync(appIds);
+            await _cdnPool.PopulateAvailableServersAsync();
+
+            var appStatuses = new ConcurrentBag<AppCacheStatus>();
+            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds);
+
+            _ansiConsole.LogMarkupVerbose($"Checking cache status for {Magenta(availableGames.Count)} available games");
+
+            // Build OS names string for error messages
+            var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
+
+            await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
+            {
+                try
+                {
+                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, app.Depots);
+
+                    // Check if game has no depots for the selected OS
+                    if (filteredDepots.Count == 0 && app.Depots.Count > 0)
+                    {
+                        appStatuses.Add(new AppCacheStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            OutdatedDepots = new List<OutdatedDepot>()
+                        });
+                        return;
+                    }
+
+                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
+
+                    // Get cached manifests for this app
+                    var cachedManifests = cachedByApp.GetValueOrDefault(app.AppId) ?? new Dictionary<uint, ulong>();
+
+                    // Compare each depot's current manifest against cached manifest
+                    var outdatedDepots = new List<OutdatedDepot>();
+                    long downloadSize = 0;
+
+                    foreach (var depot in filteredDepots)
+                    {
+                        var currentManifest = depot.ManifestId.Value;
+                        var hasCached = cachedManifests.TryGetValue(depot.DepotId, out var cachedManifest);
+
+                        if (!hasCached || cachedManifest != currentManifest)
+                        {
+                            outdatedDepots.Add(new OutdatedDepot
+                            {
+                                DepotId = depot.DepotId,
+                                CachedManifest = hasCached ? cachedManifest : 0,
+                                CurrentManifest = currentManifest
+                            });
+                        }
+                    }
+
+                    // If any depot is outdated, calculate download size for outdated depots
+                    if (outdatedDepots.Count > 0)
+                    {
+                        var outdatedDepotIds = outdatedDepots.Select(d => d.DepotId).ToHashSet();
+                        var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
+                        var chunks = await _depotHandler.BuildChunkDownloadQueueAsync(depotsToDownload);
+                        downloadSize = chunks.Sum(e => e.CompressedLength);
+                    }
+
+                    appStatuses.Add(new AppCacheStatus
+                    {
+                        AppId = app.AppId,
+                        Name = app.Name,
+                        IsUpToDate = outdatedDepots.Count == 0,
+                        DownloadSize = downloadSize,
+                        OutdatedDepots = outdatedDepots
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _ansiConsole.LogMarkupError($"Failed to check cache status for {app.Name} ({app.AppId}): {ex.Message}");
+                    FileLogger.LogException($"Failed to check cache status for {app.Name}", ex);
+
+                    appStatuses.Add(new AppCacheStatus
+                    {
+                        AppId = app.AppId,
+                        Name = app.Name,
+                        DownloadSize = 0,
+                        IsUpToDate = false,
+                        OutdatedDepots = new List<OutdatedDepot>()
+                    });
+                }
+            });
+
+            var upToDateCount = appStatuses.Count(a => a.IsUpToDate);
+            var needsUpdateCount = appStatuses.Count - upToDateCount;
+            var totalDownloadSize = ByteSize.FromBytes(appStatuses.Sum(a => a.DownloadSize));
+
+            return new CacheStatusResult
+            {
+                Apps = appStatuses.OrderBy(a => a.Name).ToList(),
+                Message = $"{upToDateCount} apps up-to-date, {needsUpdateCount} need updates ({totalDownloadSize.ToDecimalString()} to download)"
+            };
+        }
+
         #endregion
 
         public async Task<List<AppInfo>> GetAllAvailableAppsAsync()
