@@ -221,11 +221,18 @@ public static class DaemonMode
         public void OnAppCompleted(AppDownloadInfo app, AppDownloadResult result)
         {
             OnLog(LogLevel.Info, $"Completed: {app.Name} - {result}");
+
+            // Determine bytes downloaded based on result
+            // Success = downloaded full size, AlreadyUpToDate/Skipped = 0 bytes transferred
+            var bytesDownloaded = result == AppDownloadResult.Success ? app.TotalBytes : 0;
+
             WriteProgress(new PrefillProgressUpdate
             {
                 State = "app_completed",
                 CurrentAppId = app.AppId,
                 CurrentAppName = app.Name,
+                TotalBytes = app.TotalBytes,
+                BytesDownloaded = bytesDownloaded,
                 Result = result.ToString(),
                 UpdatedAt = DateTime.UtcNow
             });

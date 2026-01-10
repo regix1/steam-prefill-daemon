@@ -185,27 +185,29 @@ namespace SteamPrefill
 
             await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
 
+            // Get the full file list for each depot, and queue up the required chunks
+            // We do this before the up-to-date check so we can report accurate sizes for cached games
+            await _cdnPool.PopulateAvailableServersAsync();
+
+            List<QueuedRequest> chunkDownloadQueue = null;
+            await _ansiConsole.StatusSpinner().StartAsync("Fetching depot manifests...", async _ => { chunkDownloadQueue = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots); });
+
+            var totalBytes = ByteSize.FromBytes(chunkDownloadQueue.Sum(e => e.CompressedLength));
+
             // We will want to re-download the entire app, if any of the depots have been updated
             if (_downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
                 _progress.OnAppCompleted(
-                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = (long)totalBytes.Bytes },
                     AppDownloadResult.AlreadyUpToDate);
                 return;
             }
 
             _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}");
 
-            await _cdnPool.PopulateAvailableServersAsync();
-
-            // Get the full file list for each depot, and queue up the required chunks
-            List<QueuedRequest> chunkDownloadQueue = null;
-            await _ansiConsole.StatusSpinner().StartAsync("Fetching depot manifests...", async _ => { chunkDownloadQueue = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots); });
-
             // Finally run the queued downloads
             var downloadTimer = Stopwatch.StartNew();
-            var totalBytes = ByteSize.FromBytes(chunkDownloadQueue.Sum(e => e.CompressedLength));
             _prefillSummaryResult.TotalBytesTransferred += totalBytes;
 
             // Notify that app download is starting
