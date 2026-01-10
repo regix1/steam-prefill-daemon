@@ -45,6 +45,14 @@ public sealed class SecureFileCommandInterface : IDisposable
         "cancel-login"
     };
 
+    // JSON options for deserializing cached depot data from lancache-manager
+    // Handles camelCase property names and manifestId as string (for large numbers)
+    private static readonly JsonSerializerOptions CachedDepotJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        NumberHandling = JsonNumberHandling.AllowReadingFromString
+    };
+
     public SecureFileCommandInterface(
         string commandsDir,
         string responsesDir,
@@ -346,7 +354,16 @@ public sealed class SecureFileCommandInterface : IDisposable
                             _api!.UpdateDownloadOptions(operatingSystems: statusOsList);
                         }
                     }
-                    var appsStatus = await _api!.GetSelectedAppsStatusAsync(_cts.Token);
+                    // Parse optional cachedDepots for accurate isUpToDate calculation
+                    // When provided, uses lancache-manager's database instead of daemon's internal cache
+                    List<CachedDepotInput>? statusCachedDepots = null;
+                    var statusCachedDepotsJson = command.Parameters?.GetValueOrDefault("cachedDepots");
+                    if (!string.IsNullOrEmpty(statusCachedDepotsJson))
+                    {
+                        statusCachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(statusCachedDepotsJson, CachedDepotJsonOptions);
+                        _progress.OnLog(LogLevel.Info, $"Received {statusCachedDepots?.Count ?? 0} cached depot manifests from lancache-manager");
+                    }
+                    var appsStatus = await _api!.GetSelectedAppsStatusAsync(statusCachedDepots, _cts.Token);
                     response.Success = true;
                     response.Data = appsStatus;
                     response.Message = appsStatus.Message;
@@ -361,7 +378,8 @@ public sealed class SecureFileCommandInterface : IDisposable
                         response.Error = "Missing cachedDepots parameter";
                         break;
                     }
-                    var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson);
+                    var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson, CachedDepotJsonOptions);
+                    _progress.OnLog(LogLevel.Info, $"Received {cachedDepots?.Count ?? 0} cached depot manifests for cache status check");
                     if (cachedDepots == null)
                     {
                         response.Success = false;

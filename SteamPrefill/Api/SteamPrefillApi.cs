@@ -143,7 +143,7 @@ public sealed class SteamPrefillApi : IDisposable
     /// Gets detailed status information for selected apps including download sizes.
     /// Requires login to be completed.
     /// </summary>
-    public async Task<SelectedAppsStatus> GetSelectedAppsStatusAsync(CancellationToken cancellationToken = default)
+    public async Task<SelectedAppsStatus> GetSelectedAppsStatusAsync(List<CachedDepotInput>? cachedDepots = null, CancellationToken cancellationToken = default)
     {
         ThrowIfNotInitialized();
         ThrowIfDisposed();
@@ -162,7 +162,7 @@ public sealed class SteamPrefillApi : IDisposable
 
         try
         {
-            var appStatuses = await _steamManager!.GetSelectedAppsStatusAsync(appIds);
+            var appStatuses = await _steamManager!.GetSelectedAppsStatusAsync(appIds, cachedDepots);
             var totalSize = appStatuses.Sum(a => a.DownloadSize);
             var totalSizeFormatted = ByteSize.FromBytes(totalSize);
 

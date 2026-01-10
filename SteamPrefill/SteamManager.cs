@@ -294,7 +294,7 @@ namespace SteamPrefill
         /// <summary>
         /// Gets status information for selected apps including download sizes.
         /// </summary>
-        public async Task<List<AppStatus>> GetSelectedAppsStatusAsync(List<uint> appIds)
+        public async Task<List<AppStatus>> GetSelectedAppsStatusAsync(List<uint> appIds, List<CachedDepotInput>? cachedDepots = null)
         {
             // Force-refresh app metadata for these specific apps to ensure accurate size calculations
             _appInfoHandler.InvalidateApps(appIds);
@@ -308,6 +308,16 @@ namespace SteamPrefill
 
             // Build OS names string for error messages
             var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
+
+            // Build lookup for cached manifests if provided
+            Dictionary<uint, Dictionary<uint, ulong>>? cachedByApp = null;
+            if (cachedDepots != null && cachedDepots.Count > 0)
+            {
+                cachedByApp = cachedDepots
+                    .GroupBy(d => d.AppId)
+                    .ToDictionary(g => g.Key, g => g.ToDictionary(d => d.DepotId, d => d.ManifestId));
+                _ansiConsole.LogMarkupVerbose($"Using {cachedDepots.Count} cached depot manifests for isUpToDate calculation");
+            }
 
             await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
             {
@@ -338,12 +348,28 @@ namespace SteamPrefill
                     var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots);
                     var downloadSize = allChunksForApp.Sum(e => e.CompressedLength);
 
+                    // Determine if app is up to date
+                    bool isUpToDate;
+                    if (cachedByApp != null && cachedByApp.TryGetValue(app.AppId, out var cachedManifests))
+                    {
+                        // Use passed-in cached manifests for comparison
+                        isUpToDate = _downloadArgs.Force == false && 
+                            filteredDepots.All(d => 
+                                cachedManifests.TryGetValue(d.DepotId, out var cachedManifest) && 
+                                cachedManifest == d.ManifestId.Value);
+                    }
+                    else
+                    {
+                        // Fall back to daemon's internal cache (will be empty on fresh session)
+                        isUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots);
+                    }
+
                     appStatuses.Add(new AppStatus
                     {
                         AppId = app.AppId,
                         Name = app.Name,
                         DownloadSize = downloadSize,
-                        IsUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots)
+                        IsUpToDate = isUpToDate
                     });
                 }
                 catch (Exception ex)
