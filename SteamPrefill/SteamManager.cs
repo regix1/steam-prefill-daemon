@@ -194,12 +194,29 @@ namespace SteamPrefill
 
             var totalBytes = ByteSize.FromBytes(chunkDownloadQueue.Sum(e => e.CompressedLength));
 
+            // Build depot manifest info for cache tracking
+            var depotManifests = filteredDepots
+                .Where(d => d.ManifestId.HasValue)
+                .Select(d => new DepotManifestInfo
+                {
+                    DepotId = d.DepotId,
+                    ManifestId = d.ManifestId!.Value,
+                    TotalBytes = 0 // Will be set from chunk queue if downloaded
+                })
+                .ToList();
+
             // We will want to re-download the entire app, if any of the depots have been updated
             if (_downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
                 _progress.OnAppCompleted(
-                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = (long)totalBytes.Bytes },
+                    new AppDownloadInfo
+                    {
+                        AppId = appInfo.AppId,
+                        Name = appInfo.Name,
+                        TotalBytes = (long)totalBytes.Bytes,
+                        Depots = depotManifests
+                    },
                     AppDownloadResult.AlreadyUpToDate);
                 return;
             }
@@ -215,7 +232,8 @@ namespace SteamPrefill
             {
                 AppId = appInfo.AppId,
                 Name = appInfo.Name,
-                TotalBytes = (long)totalBytes.Bytes
+                TotalBytes = (long)totalBytes.Bytes,
+                Depots = depotManifests
             };
             _progress.OnAppStarted(appDownloadInfo);
 

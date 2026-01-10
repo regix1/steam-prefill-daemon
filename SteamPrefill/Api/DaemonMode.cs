@@ -234,6 +234,13 @@ public static class DaemonMode
                 TotalBytes = app.TotalBytes,
                 BytesDownloaded = bytesDownloaded,
                 Result = result.ToString(),
+                // Include depot manifest info for cache tracking
+                Depots = app.Depots?.Select(d => new DepotManifestUpdateInfo
+                {
+                    DepotId = d.DepotId,
+                    ManifestId = d.ManifestId,
+                    TotalBytes = d.TotalBytes
+                }).ToList(),
                 UpdatedAt = DateTime.UtcNow
             });
         }
@@ -356,4 +363,22 @@ public class PrefillProgressUpdate
 
     [System.Text.Json.Serialization.JsonPropertyName("updatedAt")]
     public DateTime UpdatedAt { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("depots")]
+    public List<DepotManifestUpdateInfo>? Depots { get; set; }
+}
+
+/// <summary>
+/// Depot manifest info for cache tracking
+/// </summary>
+public class DepotManifestUpdateInfo
+{
+    [System.Text.Json.Serialization.JsonPropertyName("depotId")]
+    public uint DepotId { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("manifestId")]
+    public ulong ManifestId { get; set; }
+
+    [System.Text.Json.Serialization.JsonPropertyName("totalBytes")]
+    public long TotalBytes { get; set; }
 }

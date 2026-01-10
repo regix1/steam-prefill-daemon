@@ -63,6 +63,19 @@ public class AppDownloadInfo
     public string Name { get; init; } = string.Empty;
     public long TotalBytes { get; init; }
     public int ChunkCount { get; init; }
+
+    /// <summary>
+    /// List of depots that were downloaded, with their manifest IDs.
+    /// Used for cache tracking to detect when games need re-downloading.
+    /// </summary>
+    public List<DepotManifestInfo>? Depots { get; init; }
+}
+
+public class DepotManifestInfo
+{
+    public uint DepotId { get; init; }
+    public ulong ManifestId { get; init; }
+    public long TotalBytes { get; init; }
 }
 
 public class DownloadProgressInfo

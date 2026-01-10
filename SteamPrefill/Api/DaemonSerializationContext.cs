@@ -23,6 +23,8 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(ClearCacheResult))]
 [JsonSerializable(typeof(AppStatus))]
 [JsonSerializable(typeof(SelectedAppsStatus))]
+[JsonSerializable(typeof(DepotManifestUpdateInfo))]
+[JsonSerializable(typeof(List<DepotManifestUpdateInfo>))]
 internal sealed partial class DaemonSerializationContext : JsonSerializerContext
 {
 }
