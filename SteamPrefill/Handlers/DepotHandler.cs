@@ -54,6 +54,24 @@
         }
 
         /// <summary>
+        /// Populates the internal cache with externally provided cached depot manifest data.
+        /// This allows the daemon to know which games are already cached without having downloaded them in this session.
+        /// Used by lancache-manager to restore cache state after daemon restart.
+        /// </summary>
+        /// <param name="cachedDepots">List of cached depot info with depot ID and manifest ID</param>
+        public void SetCachedManifests(IEnumerable<(uint DepotId, ulong ManifestId)> cachedDepots)
+        {
+            foreach (var (depotId, manifestId) in cachedDepots)
+            {
+                if (!_downloadedDepots.ContainsKey(depotId))
+                {
+                    _downloadedDepots.Add(depotId, new HashSet<ulong>());
+                }
+                _downloadedDepots[depotId].Add(manifestId);
+            }
+        }
+
+        /// <summary>
         /// Filters depots based on the language/operating system/cpu architecture specified in the DownloadArguments
         /// </summary>
         public async Task<List<DepotInfo>> FilterDepotsToDownloadAsync(DownloadArguments downloadArgs, List<DepotInfo> allDepots)

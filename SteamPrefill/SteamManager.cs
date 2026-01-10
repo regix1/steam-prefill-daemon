@@ -290,6 +290,17 @@ namespace SteamPrefill
             return JsonSerializer.Deserialize(File.ReadAllText(AppConfig.UserSelectedAppsPath), SerializationContext.Default.ListUInt32);
         }
 
+        /// <summary>
+        /// Populates the internal cache with externally provided cached depot manifest data.
+        /// This allows the daemon to know which games are already cached without having downloaded them in this session.
+        /// Used by lancache-manager to restore cache state after daemon restart.
+        /// </summary>
+        /// <param name="cachedDepots">List of cached depot info with depot ID and manifest ID</param>
+        public void SetCachedManifests(IEnumerable<(uint DepotId, ulong ManifestId)> cachedDepots)
+        {
+            _depotHandler.SetCachedManifests(cachedDepots);
+        }
+
 
         /// <summary>
         /// Gets status information for selected apps including download sizes.

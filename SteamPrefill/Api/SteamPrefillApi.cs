@@ -242,6 +242,23 @@ public sealed class SteamPrefillApi : IDisposable
     }
 
     /// <summary>
+    /// Populates the internal cache with externally provided cached depot manifest data.
+    /// This allows the daemon to know which games are already cached without having downloaded them in this session.
+    /// Used by lancache-manager to restore cache state after daemon restart.
+    /// Call this BEFORE starting a prefill to ensure cached games are recognized.
+    /// </summary>
+    /// <param name="cachedDepots">List of cached depot info with depot ID and manifest ID</param>
+    public void SetCachedManifests(IEnumerable<(uint DepotId, ulong ManifestId)> cachedDepots)
+    {
+        ThrowIfNotInitialized();
+        ThrowIfDisposed();
+
+        var depotList = cachedDepots.ToList();
+        _steamManager!.SetCachedManifests(depotList);
+        _progress.OnLog(LogLevel.Info, $"Set {depotList.Count} cached depot manifests from lancache-manager");
+    }
+
+    /// <summary>
     /// Runs the prefill operation with the specified options
     /// </summary>
     public async Task<PrefillResult> PrefillAsync(

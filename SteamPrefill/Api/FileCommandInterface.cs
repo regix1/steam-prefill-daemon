@@ -701,6 +701,21 @@ public sealed class SecureFileCommandInterface : IDisposable
             _progress.OnLog(LogLevel.Info, $"HandlePrefillAsync: App IDs = [{string.Join(", ", selectedApps.Take(10))}{(selectedApps.Count > 10 ? "..." : "")}]");
         }
 
+        // Process cached depot data from lancache-manager to restore cache state
+        if (command.Parameters != null)
+        {
+            var cachedDepotsJson = command.Parameters.GetValueOrDefault("cachedDepots");
+            if (!string.IsNullOrEmpty(cachedDepotsJson))
+            {
+                var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson, CachedDepotJsonOptions);
+                if (cachedDepots != null && cachedDepots.Count > 0)
+                {
+                    _progress.OnLog(LogLevel.Info, $"Setting {cachedDepots.Count} cached depot manifests from lancache-manager before prefill");
+                    _api!.SetCachedManifests(cachedDepots.Select(d => (d.DepotId, d.ManifestId)));
+                }
+            }
+        }
+
         var options = new PrefillOptions();
 
         if (command.Parameters != null)
