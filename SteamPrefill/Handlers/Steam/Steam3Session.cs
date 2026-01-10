@@ -171,9 +171,20 @@ namespace SteamPrefill.Handlers.Steam
 
             // Starting polling Steam for authentication response
             // Pass cancellation token so we can abort if cancel-login is called
-            var pollResponse = await authSession.PollingWaitForResultAsync(cancellationToken);
-            _userAccountStore.AccessToken = pollResponse.RefreshToken;
-            _userAccountStore.Save();
+            // Also add a 3-minute timeout as a safety measure for device confirmation
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+            
+            try
+            {
+                var pollResponse = await authSession.PollingWaitForResultAsync(linkedCts.Token);
+                _userAccountStore.AccessToken = pollResponse.RefreshToken;
+                _userAccountStore.Save();
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException("Authentication timed out waiting for device confirmation. Please try again.");
+            }
 
             // Clearing password so it doesn't stay in memory
             _logonDetails.Password = null;
