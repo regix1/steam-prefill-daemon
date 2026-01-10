@@ -790,12 +790,23 @@ public sealed class SecureFileCommandInterface : IDisposable
         await File.WriteAllTextAsync(filePath, json, _cts.Token);
     }
 
+    // JSON options for writing responses - must match DaemonSerializationContext settings
+    // but use reflection-based serialization to handle polymorphic Data property
+    private static readonly JsonSerializerOptions ResponseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     private async Task WriteResponseAsync(CommandResponse response)
     {
         var fileName = $"response_{response.Id}.json";
         var filePath = Path.Combine(_responsesDir, fileName);
 
-        var json = JsonSerializer.Serialize(response, DaemonSerializationContext.Default.CommandResponse);
+        // Use reflection-based serialization to properly handle the polymorphic Data property
+        // Source-generated serializers can't serialize object? properties with their runtime type
+        var json = JsonSerializer.Serialize(response, ResponseJsonOptions);
         await File.WriteAllTextAsync(filePath, json, _cts.Token);
 
         _progress.OnLog(LogLevel.Debug, $"Response written: {fileName}");
