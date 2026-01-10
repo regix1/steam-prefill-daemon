@@ -707,11 +707,24 @@ public sealed class SecureFileCommandInterface : IDisposable
             var cachedDepotsJson = command.Parameters.GetValueOrDefault("cachedDepots");
             if (!string.IsNullOrEmpty(cachedDepotsJson))
             {
-                var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson, CachedDepotJsonOptions);
-                if (cachedDepots != null && cachedDepots.Count > 0)
+                try
                 {
-                    _progress.OnLog(LogLevel.Info, $"Setting {cachedDepots.Count} cached depot manifests from lancache-manager before prefill");
-                    _api!.SetCachedManifests(cachedDepots.Select(d => (d.DepotId, d.ManifestId)));
+                    _progress.OnLog(LogLevel.Debug, $"Received cachedDepots JSON: {cachedDepotsJson.Substring(0, Math.Min(200, cachedDepotsJson.Length))}...");
+                    var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson, CachedDepotJsonOptions);
+                    if (cachedDepots != null && cachedDepots.Count > 0)
+                    {
+                        _progress.OnLog(LogLevel.Info, $"Setting {cachedDepots.Count} cached depot manifests from lancache-manager before prefill");
+                        _api!.SetCachedManifests(cachedDepots.Select(d => (d.DepotId, d.ManifestId)));
+                    }
+                    else
+                    {
+                        _progress.OnLog(LogLevel.Warning, "cachedDepots deserialized to null or empty list");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _progress.OnLog(LogLevel.Warning, $"Failed to process cachedDepots: {ex.Message}");
+                    // Continue with prefill even if cache restoration fails
                 }
             }
         }
