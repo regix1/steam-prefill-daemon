@@ -25,6 +25,8 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(SelectedAppsStatus))]
 [JsonSerializable(typeof(DepotManifestUpdateInfo))]
 [JsonSerializable(typeof(List<DepotManifestUpdateInfo>))]
+[JsonSerializable(typeof(CacheStatusResult))]
+[JsonSerializable(typeof(object))] // Required for polymorphic Data property in CommandResponse
 internal sealed partial class DaemonSerializationContext : JsonSerializerContext
 {
 }
