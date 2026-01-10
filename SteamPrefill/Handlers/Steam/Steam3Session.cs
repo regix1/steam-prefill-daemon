@@ -181,6 +181,11 @@ namespace SteamPrefill.Handlers.Steam
                 _userAccountStore.AccessToken = pollResponse.RefreshToken;
                 _userAccountStore.Save();
             }
+            catch (AuthenticationException authEx) when (authEx.Message.Contains("Expired"))
+            {
+                // Steam's authentication session timed out (~2 minutes for mobile confirmation)
+                throw new TimeoutException("Authentication session expired. Please try again and confirm on your Steam Mobile App within 2 minutes, or use a 2FA code instead.");
+            }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
                 throw new TimeoutException("Authentication timed out waiting for device confirmation. Please try again.");
