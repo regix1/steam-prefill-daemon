@@ -591,11 +591,14 @@ public class SelectedAppsStatus
 
 /// <summary>
 /// Input for cached depot manifest info from lancache-manager.
+/// Uses camelCase JSON from lancache-manager with manifestId as string for large numbers.
 /// </summary>
 public class CachedDepotInput
 {
     public uint AppId { get; init; }
     public uint DepotId { get; init; }
+
+    [System.Text.Json.Serialization.JsonNumberHandling(System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString)]
     public ulong ManifestId { get; init; }
 }
 

@@ -45,13 +45,6 @@ public sealed class SecureFileCommandInterface : IDisposable
         "cancel-login"
     };
 
-    // JSON options for deserializing cached depot data from lancache-manager
-    // Handles camelCase property names and manifestId as string (for large numbers)
-    private static readonly JsonSerializerOptions CachedDepotJsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        NumberHandling = JsonNumberHandling.AllowReadingFromString
-    };
 
     public SecureFileCommandInterface(
         string commandsDir,
@@ -360,7 +353,7 @@ public sealed class SecureFileCommandInterface : IDisposable
                     var statusCachedDepotsJson = command.Parameters?.GetValueOrDefault("cachedDepots");
                     if (!string.IsNullOrEmpty(statusCachedDepotsJson))
                     {
-                        statusCachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(statusCachedDepotsJson, CachedDepotJsonOptions);
+                        statusCachedDepots = JsonSerializer.Deserialize(statusCachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
                         _progress.OnLog(LogLevel.Info, $"Received {statusCachedDepots?.Count ?? 0} cached depot manifests from lancache-manager");
                     }
                     var appsStatus = await _api!.GetSelectedAppsStatusAsync(statusCachedDepots, _cts.Token);
@@ -378,7 +371,7 @@ public sealed class SecureFileCommandInterface : IDisposable
                         response.Error = "Missing cachedDepots parameter";
                         break;
                     }
-                    var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson, CachedDepotJsonOptions);
+                    var cachedDepots = JsonSerializer.Deserialize(cachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
                     _progress.OnLog(LogLevel.Info, $"Received {cachedDepots?.Count ?? 0} cached depot manifests for cache status check");
                     if (cachedDepots == null)
                     {
@@ -710,7 +703,8 @@ public sealed class SecureFileCommandInterface : IDisposable
                 try
                 {
                     _progress.OnLog(LogLevel.Debug, $"Received cachedDepots JSON: {cachedDepotsJson.Substring(0, Math.Min(200, cachedDepotsJson.Length))}...");
-                    var cachedDepots = JsonSerializer.Deserialize<List<CachedDepotInput>>(cachedDepotsJson, CachedDepotJsonOptions);
+                    // Use source-generated serializer for AOT compatibility
+                    var cachedDepots = JsonSerializer.Deserialize(cachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
                     if (cachedDepots != null && cachedDepots.Count > 0)
                     {
                         _progress.OnLog(LogLevel.Info, $"Setting {cachedDepots.Count} cached depot manifests from lancache-manager before prefill");
