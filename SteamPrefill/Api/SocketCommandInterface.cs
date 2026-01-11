@@ -729,9 +729,12 @@ public sealed class SocketCommandInterface : IDisposable
             OnLog(LogLevel.Info, $"Completed: {app.Name} - {result}");
             var bytesDownloaded = result == AppDownloadResult.Success ? app.TotalBytes : 0;
 
+            // Use distinct state for cached apps so frontend can show blue animation
+            var state = result == AppDownloadResult.AlreadyUpToDate ? "already_cached" : "app_completed";
+
             BroadcastProgress(new PrefillProgressUpdate
             {
-                State = "app_completed",
+                State = state,
                 CurrentAppId = app.AppId,
                 CurrentAppName = app.Name,
                 TotalBytes = app.TotalBytes,

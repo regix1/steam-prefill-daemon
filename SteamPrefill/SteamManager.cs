@@ -209,15 +209,16 @@ namespace SteamPrefill
             if (_downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
-                _progress.OnAppCompleted(
-                    new AppDownloadInfo
-                    {
-                        AppId = appInfo.AppId,
-                        Name = appInfo.Name,
-                        TotalBytes = (long)totalBytes.Bytes,
-                        Depots = depotManifests
-                    },
-                    AppDownloadResult.AlreadyUpToDate);
+                var cachedAppInfo = new AppDownloadInfo
+                {
+                    AppId = appInfo.AppId,
+                    Name = appInfo.Name,
+                    TotalBytes = (long)totalBytes.Bytes,
+                    Depots = depotManifests
+                };
+                // Notify app started so frontend can animate the cached game
+                _progress.OnAppStarted(cachedAppInfo);
+                _progress.OnAppCompleted(cachedAppInfo, AppDownloadResult.AlreadyUpToDate);
                 return;
             }
 
