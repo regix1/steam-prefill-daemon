@@ -78,6 +78,26 @@ public sealed class SocketServer : IAsyncDisposable
         _listener.Bind(new UnixDomainSocketEndPoint(_socketPath));
         _listener.Listen(5);
 
+        // Set socket file permissions to allow other containers to connect
+        // This is necessary because Docker containers may run as different users
+        try
+        {
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux) ||
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+            {
+                // Set permissions to 0666 (read/write for everyone)
+                File.SetUnixFileMode(_socketPath,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                _progress.OnLog(LogLevel.Debug, $"Set socket permissions to 0666: {_socketPath}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Could not set socket permissions: {ex.Message}");
+        }
+
         _progress.OnLog(LogLevel.Info, $"Socket server listening on: {_socketPath}");
 
         // Start accepting connections
