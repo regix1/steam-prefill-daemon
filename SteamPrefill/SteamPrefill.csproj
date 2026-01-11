@@ -109,4 +109,9 @@
     <ProjectReference Include="..\LancachePrefill.Common\dotnet\LancachePrefill.Common.csproj" />
   </ItemGroup>
 
+  <!-- Trimmer configuration to preserve SignalR client types -->
+  <ItemGroup>
+    <TrimmerRootDescriptor Include="TrimmerRoots.xml" />
+  </ItemGroup>
+
 </Project>

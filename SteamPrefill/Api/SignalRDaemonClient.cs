@@ -142,7 +142,7 @@ public sealed class SignalRDaemonClient : IAsyncDisposable
         _progress.OnLog(LogLevel.Info, $"Received prefill command: {commandId}");
         try
         {
-            var options = JsonSerializer.Deserialize<PrefillCommandOptions>(optionsJson) ?? new PrefillCommandOptions();
+            var options = JsonSerializer.Deserialize(optionsJson, DaemonSerializationContext.Default.PrefillCommandOptions) ?? new PrefillCommandOptions();
             var response = await PrefillAsync(
                 all: options.All,
                 recent: options.Recent,
@@ -163,7 +163,7 @@ public sealed class SignalRDaemonClient : IAsyncDisposable
         _progress.OnLog(LogLevel.Info, $"Received get-selected-apps-status command: {commandId}");
         try
         {
-            var options = JsonSerializer.Deserialize<GetStatusCommandOptions>(optionsJson) ?? new GetStatusCommandOptions();
+            var options = JsonSerializer.Deserialize(optionsJson, DaemonSerializationContext.Default.GetStatusCommandOptions) ?? new GetStatusCommandOptions();
             var response = await GetSelectedAppsStatusAsync(options.OperatingSystems, options.CachedDepots);
             response.Id = commandId;
             await SendCommandResponseAsync(response);

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<linker>
+  <!-- Preserve SignalR client types which use reflection for hub method invocation -->
+  <assembly fullname="Microsoft.AspNetCore.SignalR.Client" preserve="all" />
+  <assembly fullname="Microsoft.AspNetCore.SignalR.Client.Core" preserve="all" />
+  <assembly fullname="Microsoft.AspNetCore.SignalR.Common" preserve="all" />
+  <assembly fullname="Microsoft.AspNetCore.SignalR.Protocols.Json" preserve="all" />
+  <assembly fullname="Microsoft.AspNetCore.Connections.Abstractions" preserve="all" />
+
+  <!-- Preserve our daemon API types that are serialized/deserialized via SignalR -->
+  <assembly fullname="SteamPrefill">
+    <type fullname="SteamPrefill.Api.*" preserve="all" />
+  </assembly>
+</linker>
