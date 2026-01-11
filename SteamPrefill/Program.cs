@@ -14,15 +14,26 @@ namespace SteamPrefill
                 ║                  v{ThisAssembly.Info.InformationalVersion,-20}             ║
                 ╚═══════════════════════════════════════════════════════════╝
 
-                This application runs as a daemon, accepting commands via files.
-                Write JSON command files to the commands directory.
-                Responses will be written to the responses directory.
+                This application runs as a daemon, communicating via SignalR.
+                It connects to the Lancache Manager API for real-time control.
 
                 """);
 
-            // Get directories from environment variables or use defaults
-            var commandsDir = Environment.GetEnvironmentVariable("PREFILL_COMMANDS_DIR") ?? "/commands";
-            var responsesDir = Environment.GetEnvironmentVariable("PREFILL_RESPONSES_DIR") ?? "/responses";
+            // Get session ID from environment variable (required)
+            var sessionId = Environment.GetEnvironmentVariable("PREFILL_SESSION_ID");
+            if (string.IsNullOrEmpty(sessionId))
+            {
+                Console.WriteLine("ERROR: PREFILL_SESSION_ID environment variable is required");
+                return 1;
+            }
+
+            // Get or auto-detect API URL
+            var apiUrl = DaemonMode.AutoDetectApiUrl();
+            if (string.IsNullOrEmpty(apiUrl))
+            {
+                Console.WriteLine("ERROR: Could not determine API URL. Set LANCACHE_API_URL environment variable.");
+                return 1;
+            }
 
             using var cts = new CancellationTokenSource();
 
@@ -34,7 +45,7 @@ namespace SteamPrefill
                 cts.Cancel();
             };
 
-            await DaemonMode.RunFileBasedAsync(commandsDir, responsesDir, cts.Token);
+            await DaemonMode.RunSignalRAsync(apiUrl, sessionId, cts.Token);
             
             return 0;
         }
