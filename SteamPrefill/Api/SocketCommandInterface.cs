@@ -400,19 +400,19 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private async Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
+    private Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
     {
         EnsureLoggedIn();
 
         if (_isPrefilling)
         {
-            return new CommandResponse
+            return Task.FromResult(new CommandResponse
             {
                 Id = request.Id,
                 Success = false,
                 Error = "A prefill is already in progress",
                 CompletedAt = DateTime.UtcNow
-            };
+            });
         }
 
         var options = new PrefillOptions();
@@ -465,39 +465,50 @@ public sealed class SocketCommandInterface : IDisposable
         }
 
         _prefillCts?.Dispose();
-        _prefillCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+        _prefillCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
         _isPrefilling = true;
 
-        try
+        // Run prefill in background task so the command loop isn't blocked
+        // This allows cancel-prefill commands to be processed while prefill is running
+        _ = Task.Run(async () =>
         {
-            var result = await _api!.PrefillAsync(options, _prefillCts.Token);
+            try
+            {
+                var result = await _api!.PrefillAsync(options, _prefillCts.Token);
 
-            return new CommandResponse
+                if (result.Success)
+                {
+                    _progress.OnLog(LogLevel.Info, "Prefill completed successfully");
+                }
+                else
+                {
+                    _progress.OnLog(LogLevel.Warning, $"Prefill completed with errors: {result.ErrorMessage}");
+                }
+            }
+            catch (OperationCanceledException)
             {
-                Id = request.Id,
-                Success = result.Success,
-                Data = result,
-                Message = result.Success ? "Prefill completed" : result.ErrorMessage,
-                CompletedAt = DateTime.UtcNow
-            };
-        }
-        catch (OperationCanceledException)
-        {
-            _progress.OnLog(LogLevel.Info, "Prefill cancelled by user");
-            return new CommandResponse
+                _progress.OnLog(LogLevel.Info, "Prefill cancelled by user");
+            }
+            catch (Exception ex)
             {
-                Id = request.Id,
-                Success = false,
-                Error = "Prefill cancelled by user",
-                CompletedAt = DateTime.UtcNow
-            };
-        }
-        finally
+                _progress.OnLog(LogLevel.Error, $"Prefill failed: {ex.Message}");
+            }
+            finally
+            {
+                _isPrefilling = false;
+                _prefillCts?.Dispose();
+                _prefillCts = null;
+            }
+        }, _prefillCts.Token);
+
+        // Return immediately - prefill process continues in background
+        return Task.FromResult(new CommandResponse
         {
-            _isPrefilling = false;
-            _prefillCts?.Dispose();
-            _prefillCts = null;
-        }
+            Id = request.Id,
+            Success = true,
+            Message = "Prefill started",
+            CompletedAt = DateTime.UtcNow
+        });
     }
 
     private CommandResponse HandleClearCache(CommandRequest request)
