@@ -63,8 +63,24 @@ internal sealed class ApiConsoleAdapter : IAnsiConsole
             return paragraph.ToString() ?? string.Empty;
         }
 
-        // For other types, try to get string representation
-        return renderable.ToString() ?? string.Empty;
+        // Filter out non-text renderables that don't produce meaningful output
+        // ControlCode, Segment, etc. are used for terminal formatting and should be ignored
+        var typeName = renderable.GetType().Name;
+        if (typeName is "ControlCode" or "Segment" or "ControlSequence")
+        {
+            return string.Empty;
+        }
+
+        // For other types, try to get string representation but filter out type names
+        var text = renderable.ToString() ?? string.Empty;
+
+        // If ToString() just returns the type name, it's not useful content
+        if (text.StartsWith("Spectre.Console."))
+        {
+            return string.Empty;
+        }
+
+        return text;
     }
 
     private static string StripMarkup(string text)

@@ -691,6 +691,12 @@ public sealed class SocketCommandInterface : IDisposable
 
             _lastProgressBroadcast = now;
 
+            // Log progress to console
+            var downloadedStr = FormatBytes(progress.BytesDownloaded);
+            var totalStr = FormatBytes(progress.TotalBytes);
+            var speedStr = FormatBytes((long)progress.BytesPerSecond) + "/s";
+            OnLog(LogLevel.Info, $"{progress.AppName}: {progress.PercentComplete:F1}% - {speedStr} - {downloadedStr} / {totalStr}");
+
             BroadcastProgress(new PrefillProgressUpdate
             {
                 State = "downloading",
@@ -703,6 +709,19 @@ public sealed class SocketCommandInterface : IDisposable
                 Elapsed = progress.Elapsed,
                 UpdatedAt = DateTime.UtcNow
             });
+        }
+
+        private static string FormatBytes(long bytes)
+        {
+            string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+            int order = 0;
+            double size = bytes;
+            while (size >= 1024 && order < sizes.Length - 1)
+            {
+                order++;
+                size /= 1024;
+            }
+            return $"{size:F2} {sizes[order]}";
         }
 
         public void OnAppCompleted(AppDownloadInfo app, AppDownloadResult result)

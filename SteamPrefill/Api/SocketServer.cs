@@ -369,8 +369,6 @@ public sealed class SocketServer : IAsyncDisposable
                 await stream.WriteAsync(BitConverter.GetBytes(bytes.Length), cancellationToken);
                 await stream.WriteAsync(bytes, cancellationToken);
                 await stream.FlushAsync(cancellationToken);
-
-                _progress.OnLog(LogLevel.Debug, $"Sent event to {client.Id}");
             }
             finally
             {
