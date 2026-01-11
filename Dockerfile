@@ -27,15 +27,15 @@ ENV \
 # Create app directory structure
 WORKDIR /app
 
-# Create directories for daemon mode and config persistence
-RUN mkdir -p /commands /responses /app/Config /app/.cache
+# Create directories for config persistence
+RUN mkdir -p /app/Config /app/.cache
 
 # Copy architecture-specific binary
 # TARGETARCH is automatically set by docker buildx (amd64, arm64, etc.)
 COPY /publish/${TARGETARCH}/SteamPrefill /app/SteamPrefill
 RUN chmod +x /app/SteamPrefill
 
-# Volumes for persistence and daemon communication
-VOLUME ["/commands", "/responses", "/app/Config", "/app/.cache"]
+# Volumes for persistence (SignalR is used for daemon communication)
+VOLUME ["/app/Config", "/app/.cache"]
 
 ENTRYPOINT [ "/app/SteamPrefill" ]
