@@ -321,6 +321,23 @@ public sealed class SecureFileCommandInterface : IDisposable
                     response.Message = clearResult.Message;
                     break;
 
+                case "clear-cached-manifests":
+                    // Clear the internal depot manifest cache
+                    // This forces all games to be re-evaluated on the next prefill
+                    if (_api != null && _isLoggedIn)
+                    {
+                        var clearedCount = _api.ClearCachedManifests();
+                        response.Success = true;
+                        response.Data = new { ClearedCount = clearedCount };
+                        response.Message = $"Cleared {clearedCount} cached depot manifests";
+                    }
+                    else
+                    {
+                        response.Success = false;
+                        response.Message = "Not logged in - cannot clear cached manifests";
+                    }
+                    break;
+
                 case "get-cache-info":
                     var cacheInfo = SteamPrefillApi.GetCacheInfo();
                     response.Success = cacheInfo.Success;

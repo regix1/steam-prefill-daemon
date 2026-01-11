@@ -259,6 +259,22 @@ public sealed class SteamPrefillApi : IDisposable
     }
 
     /// <summary>
+    /// Clears all cached manifests from the internal cache.
+    /// This forces all games to be re-evaluated on the next prefill.
+    /// Used by lancache-manager when clearing the prefill cache database.
+    /// </summary>
+    /// <returns>The number of depots that were cleared</returns>
+    public int ClearCachedManifests()
+    {
+        ThrowIfNotInitialized();
+        ThrowIfDisposed();
+
+        var count = _steamManager!.ClearCachedManifests();
+        _progress.OnLog(LogLevel.Info, $"Cleared {count} cached depot manifests");
+        return count;
+    }
+
+    /// <summary>
     /// Runs the prefill operation with the specified options
     /// </summary>
     public async Task<PrefillResult> PrefillAsync(

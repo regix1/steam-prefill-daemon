@@ -301,6 +301,17 @@ namespace SteamPrefill
             _depotHandler.SetCachedManifests(cachedDepots);
         }
 
+        /// <summary>
+        /// Clears all cached manifests from the internal cache.
+        /// This forces all games to be re-evaluated on the next prefill.
+        /// Used by lancache-manager when clearing the prefill cache database.
+        /// </summary>
+        /// <returns>The number of depots that were cleared</returns>
+        public int ClearCachedManifests()
+        {
+            return _depotHandler.ClearCachedManifests();
+        }
+
 
         /// <summary>
         /// Gets status information for selected apps including download sizes.

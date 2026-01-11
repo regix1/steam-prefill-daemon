@@ -72,6 +72,26 @@
         }
 
         /// <summary>
+        /// Clears all cached manifests from the internal cache.
+        /// This forces all games to be re-evaluated on the next prefill.
+        /// Used by lancache-manager when clearing the prefill cache database.
+        /// </summary>
+        /// <returns>The number of depots that were cleared</returns>
+        public int ClearCachedManifests()
+        {
+            var count = _downloadedDepots.Count;
+            _downloadedDepots.Clear();
+
+            // Also clear the persisted file if it exists
+            if (File.Exists(AppConfig.SuccessfullyDownloadedDepotsPath))
+            {
+                File.Delete(AppConfig.SuccessfullyDownloadedDepotsPath);
+            }
+
+            return count;
+        }
+
+        /// <summary>
         /// Filters depots based on the language/operating system/cpu architecture specified in the DownloadArguments
         /// </summary>
         public async Task<List<DepotInfo>> FilterDepotsToDownloadAsync(DownloadArguments downloadArgs, List<DepotInfo> allDepots)
