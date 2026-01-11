@@ -72,7 +72,7 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
 
             // Send challenge event to all connected clients via socket
             var challengeEvent = new CredentialChallengeEvent(challenge);
-            await _socketServer.BroadcastEventAsync(challengeEvent, cancellationToken);
+            await _socketServer.BroadcastCredentialChallengeAsync(challengeEvent, cancellationToken);
 
             // Wait for credential with timeout
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));

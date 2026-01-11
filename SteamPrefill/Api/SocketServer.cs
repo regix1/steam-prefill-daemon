@@ -16,11 +16,18 @@ namespace SteamPrefill.Api;
 /// - All messages are JSON with a 4-byte little-endian length prefix
 /// - Client sends CommandRequest, receives CommandResponse
 /// - Server can send unsolicited SocketEvent messages (progress, challenges, etc.)
+///
+/// Security:
+/// - Socket file permissions: 0660 (owner/group only)
+/// - Optional shared secret via PREFILL_SOCKET_SECRET environment variable
+/// - Credential encryption: ECDH + AES-GCM
+/// - Challenge expiration: 5 minutes
 /// </summary>
 public sealed class SocketServer : IAsyncDisposable
 {
     private readonly string _socketPath;
     private readonly IPrefillProgress _progress;
+    private readonly string? _sharedSecret;
     private readonly CancellationTokenSource _cts = new();
     private Socket? _listener;
     private readonly ConcurrentDictionary<string, ConnectedClient> _clients = new();
@@ -46,6 +53,13 @@ public sealed class SocketServer : IAsyncDisposable
     {
         _socketPath = socketPath;
         _progress = progress ?? NullProgress.Instance;
+
+        // Optional shared secret for additional security
+        _sharedSecret = Environment.GetEnvironmentVariable("PREFILL_SOCKET_SECRET");
+        if (!string.IsNullOrEmpty(_sharedSecret))
+        {
+            _progress.OnLog(LogLevel.Info, "Socket authentication enabled via PREFILL_SOCKET_SECRET");
+        }
     }
 
     /// <summary>
@@ -67,36 +81,34 @@ public sealed class SocketServer : IAsyncDisposable
             }
         }
 
-        // Ensure directory exists
+        // Ensure directory exists with secure permissions
         var dir = Path.GetDirectoryName(_socketPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
+            // Set directory permissions to 0770 (owner/group only) for security
+            TrySetUnixPermissions(dir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute);
         }
 
         _listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         _listener.Bind(new UnixDomainSocketEndPoint(_socketPath));
         _listener.Listen(5);
 
-        // Set socket file permissions to allow other containers to connect
-        // This is necessary because Docker containers may run as different users
-        try
-        {
-            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux) ||
-                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
-            {
-                // Set permissions to 0666 (read/write for everyone)
-                File.SetUnixFileMode(_socketPath,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite |
-                    UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
-                    UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
-                _progress.OnLog(LogLevel.Debug, $"Set socket permissions to 0666: {_socketPath}");
-            }
-        }
-        catch (Exception ex)
-        {
-            _progress.OnLog(LogLevel.Warning, $"Could not set socket permissions: {ex.Message}");
-        }
+        // SECURITY: Set socket file permissions for container communication
+        // The socket is protected by:
+        // 1. Docker volume isolation - only containers with the volume mounted can access it
+        // 2. File permissions - we use 0660 (owner/group only) for defense in depth
+        // 3. Credential encryption - all credentials use ECDH + AES-GCM encryption
+        // 4. Challenge expiration - credential challenges expire after 5 minutes
+        //
+        // For proper security, both containers should run as the same user (recommended)
+        // or in the same group. Using 0660 instead of 0666 prevents access from
+        // unrelated processes even if they somehow access the volume.
+        TrySetUnixPermissions(_socketPath,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite |
+            UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
 
         _progress.OnLog(LogLevel.Info, $"Socket server listening on: {_socketPath}");
 
@@ -198,7 +210,53 @@ public sealed class SocketServer : IAsyncDisposable
                     }
                     else
                     {
-                        response = await OnCommand(request, token);
+                        // Check authentication if shared secret is configured
+                        if (!string.IsNullOrEmpty(_sharedSecret) && !client.IsAuthenticated)
+                        {
+                            // First command must be "auth" with correct secret
+                            if (request.Type == "auth" && request.Parameters?.TryGetValue("secret", out var providedSecret) == true)
+                            {
+                                if (providedSecret == _sharedSecret)
+                                {
+                                    client.IsAuthenticated = true;
+                                    _progress.OnLog(LogLevel.Info, $"Client {client.Id} authenticated successfully");
+                                    response = new CommandResponse
+                                    {
+                                        Id = request.Id,
+                                        Success = true,
+                                        Message = "Authenticated"
+                                    };
+                                }
+                                else
+                                {
+                                    _progress.OnLog(LogLevel.Warning, $"Client {client.Id} failed authentication - invalid secret");
+                                    response = new CommandResponse
+                                    {
+                                        Id = request.Id,
+                                        Success = false,
+                                        Error = "Authentication failed: invalid secret"
+                                    };
+                                    // Disconnect on auth failure
+                                    break;
+                                }
+                            }
+                            else
+                            {
+                                _progress.OnLog(LogLevel.Warning, $"Client {client.Id} sent command without authenticating first");
+                                response = new CommandResponse
+                                {
+                                    Id = request.Id,
+                                    Success = false,
+                                    Error = "Authentication required. Send 'auth' command with secret first."
+                                };
+                                // Disconnect unauthenticated client trying to send commands
+                                break;
+                            }
+                        }
+                        else
+                        {
+                            response = await OnCommand(request, token);
+                        }
                     }
                 }
                 catch (Exception ex)
@@ -234,35 +292,76 @@ public sealed class SocketServer : IAsyncDisposable
     }
 
     /// <summary>
-    /// Send an event to all connected clients.
+    /// Send a credential challenge event to all connected clients.
     /// </summary>
-    public async Task BroadcastEventAsync<T>(SocketEvent<T> eventData, CancellationToken cancellationToken = default)
+    public async Task BroadcastCredentialChallengeAsync(SocketEvent<CredentialChallenge> eventData, CancellationToken cancellationToken = default)
     {
         var tasks = _clients.Values.Select(client =>
-            SendEventToClientAsync(client, eventData, cancellationToken));
-
+            SendEventToClientInternalAsync(client, eventData, DaemonSerializationContext.Default.SocketEventCredentialChallenge, cancellationToken));
         await Task.WhenAll(tasks);
     }
 
     /// <summary>
-    /// Send an event to a specific client.
+    /// Send a progress event to all connected clients.
     /// </summary>
-    public async Task SendEventToClientAsync<T>(string clientId, SocketEvent<T> eventData, CancellationToken cancellationToken = default)
+    public async Task BroadcastProgressAsync(SocketEvent<PrefillProgressUpdate> eventData, CancellationToken cancellationToken = default)
+    {
+        var tasks = _clients.Values.Select(client =>
+            SendEventToClientInternalAsync(client, eventData, DaemonSerializationContext.Default.SocketEventPrefillProgressUpdate, cancellationToken));
+        await Task.WhenAll(tasks);
+    }
+
+    /// <summary>
+    /// Send an auth state event to all connected clients.
+    /// </summary>
+    public async Task BroadcastAuthStateAsync(SocketEvent<AuthStateData> eventData, CancellationToken cancellationToken = default)
+    {
+        var tasks = _clients.Values.Select(client =>
+            SendEventToClientInternalAsync(client, eventData, DaemonSerializationContext.Default.SocketEventAuthStateData, cancellationToken));
+        await Task.WhenAll(tasks);
+    }
+
+    /// <summary>
+    /// Send a credential challenge event to a specific client.
+    /// </summary>
+    public async Task SendCredentialChallengeAsync(string clientId, SocketEvent<CredentialChallenge> eventData, CancellationToken cancellationToken = default)
     {
         if (_clients.TryGetValue(clientId, out var client))
         {
-            await SendEventToClientAsync(client, eventData, cancellationToken);
+            await SendEventToClientInternalAsync(client, eventData, DaemonSerializationContext.Default.SocketEventCredentialChallenge, cancellationToken);
         }
     }
 
-    private async Task SendEventToClientAsync<T>(ConnectedClient client, SocketEvent<T> eventData, CancellationToken cancellationToken)
+    /// <summary>
+    /// Send a progress event to a specific client.
+    /// </summary>
+    public async Task SendProgressAsync(string clientId, SocketEvent<PrefillProgressUpdate> eventData, CancellationToken cancellationToken = default)
+    {
+        if (_clients.TryGetValue(clientId, out var client))
+        {
+            await SendEventToClientInternalAsync(client, eventData, DaemonSerializationContext.Default.SocketEventPrefillProgressUpdate, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Send an auth state event to a specific client.
+    /// </summary>
+    public async Task SendAuthStateAsync(string clientId, SocketEvent<AuthStateData> eventData, CancellationToken cancellationToken = default)
+    {
+        if (_clients.TryGetValue(clientId, out var client))
+        {
+            await SendEventToClientInternalAsync(client, eventData, DaemonSerializationContext.Default.SocketEventAuthStateData, cancellationToken);
+        }
+    }
+
+    private async Task SendEventToClientInternalAsync<T>(ConnectedClient client, T eventData, System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken)
     {
         try
         {
             await client.SendLock.WaitAsync(cancellationToken);
             try
             {
-                var json = JsonSerializer.Serialize(eventData, SocketSerializationContext.Options);
+                var json = JsonSerializer.Serialize(eventData, typeInfo);
                 var bytes = Encoding.UTF8.GetBytes(json);
 
                 using var stream = new NetworkStream(client.Socket, ownsSocket: false);
@@ -270,7 +369,7 @@ public sealed class SocketServer : IAsyncDisposable
                 await stream.WriteAsync(bytes, cancellationToken);
                 await stream.FlushAsync(cancellationToken);
 
-                _progress.OnLog(LogLevel.Debug, $"Sent event to {client.Id}: {eventData.Type}");
+                _progress.OnLog(LogLevel.Debug, $"Sent event to {client.Id}");
             }
             finally
             {
@@ -377,6 +476,26 @@ public sealed class SocketServer : IAsyncDisposable
         _disposed = true;
     }
 
+    /// <summary>
+    /// Attempts to set Unix file permissions. No-op on Windows.
+    /// </summary>
+    private void TrySetUnixPermissions(string path, UnixFileMode mode)
+    {
+        try
+        {
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux) ||
+                System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+            {
+                File.SetUnixFileMode(path, mode);
+                _progress.OnLog(LogLevel.Debug, $"Set permissions on {path}: {mode}");
+            }
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Could not set permissions on {path}: {ex.Message}");
+        }
+    }
+
     private class ConnectedClient : IDisposable
     {
         public string Id { get; }
@@ -384,6 +503,11 @@ public sealed class SocketServer : IAsyncDisposable
         public SemaphoreSlim SendLock { get; } = new(1, 1);
         public CancellationTokenSource CancellationTokenSource { get; } = new();
         public CancellationToken CancellationToken => CancellationTokenSource.Token;
+
+        /// <summary>
+        /// Whether the client has been authenticated (only relevant when shared secret is configured).
+        /// </summary>
+        public bool IsAuthenticated { get; set; }
 
         public ConnectedClient(string id, Socket socket)
         {
@@ -459,17 +583,4 @@ public class AuthStateData
 {
     public string State { get; init; } = string.Empty;
     public string? Message { get; init; }
-}
-
-/// <summary>
-/// Serialization context for socket events (using standard options, not source-generated for flexibility).
-/// </summary>
-internal static class SocketSerializationContext
-{
-    public static readonly JsonSerializerOptions Options = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        WriteIndented = false,
-        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-    };
 }

@@ -600,7 +600,7 @@ public sealed class SocketCommandInterface : IDisposable
     private async Task BroadcastStatusAsync(string status, string message)
     {
         var statusEvent = new AuthStateEvent(status, message);
-        await _socketServer.BroadcastEventAsync(statusEvent);
+        await _socketServer.BroadcastAuthStateAsync(statusEvent);
     }
 
     public void Dispose()
@@ -740,7 +740,7 @@ public sealed class SocketCommandInterface : IDisposable
             if (SocketServer == null) return;
 
             var progressEvent = new ProgressEvent(update);
-            _ = SocketServer.BroadcastEventAsync(progressEvent);
+            _ = SocketServer.BroadcastProgressAsync(progressEvent);
         }
     }
 }
