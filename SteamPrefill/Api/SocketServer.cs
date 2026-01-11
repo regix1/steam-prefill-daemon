@@ -81,15 +81,16 @@ public sealed class SocketServer : IAsyncDisposable
             }
         }
 
-        // Ensure directory exists with secure permissions
+        // Ensure directory exists
         var dir = Path.GetDirectoryName(_socketPath);
         if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
         {
             Directory.CreateDirectory(dir);
-            // Set directory permissions to 0770 (owner/group only) for security
+            // Set directory permissions to 0777 for cross-container access
             TrySetUnixPermissions(dir,
                 UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute);
+                UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+                UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
         }
 
         _listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
@@ -99,16 +100,16 @@ public sealed class SocketServer : IAsyncDisposable
         // SECURITY: Set socket file permissions for container communication
         // The socket is protected by:
         // 1. Docker volume isolation - only containers with the volume mounted can access it
-        // 2. File permissions - we use 0660 (owner/group only) for defense in depth
-        // 3. Credential encryption - all credentials use ECDH + AES-GCM encryption
-        // 4. Challenge expiration - credential challenges expire after 5 minutes
+        // 2. Credential encryption - all credentials use ECDH + AES-GCM encryption
+        // 3. Challenge expiration - credential challenges expire after 5 minutes
+        // 4. Optional shared secret authentication via PREFILL_SOCKET_SECRET env var
         //
-        // For proper security, both containers should run as the same user (recommended)
-        // or in the same group. Using 0660 instead of 0666 prevents access from
-        // unrelated processes even if they somehow access the volume.
+        // We use 0666 to allow cross-container communication when containers run as
+        // different users. Docker volume isolation is the primary security boundary.
         TrySetUnixPermissions(_socketPath,
             UnixFileMode.UserRead | UnixFileMode.UserWrite |
-            UnixFileMode.GroupRead | UnixFileMode.GroupWrite);
+            UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+            UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
 
         _progress.OnLog(LogLevel.Info, $"Socket server listening on: {_socketPath}");
 
