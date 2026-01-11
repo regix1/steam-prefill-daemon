@@ -10,6 +10,14 @@ namespace SteamPrefill.Api;
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     WriteIndented = true,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+// Primitive types used by SignalR
+[JsonSerializable(typeof(string))]
+[JsonSerializable(typeof(bool))]
+[JsonSerializable(typeof(int))]
+[JsonSerializable(typeof(uint))]
+[JsonSerializable(typeof(long))]
+[JsonSerializable(typeof(double))]
+// API types
 [JsonSerializable(typeof(CommandRequest))]
 [JsonSerializable(typeof(CommandResponse))]
 [JsonSerializable(typeof(CredentialChallenge))]

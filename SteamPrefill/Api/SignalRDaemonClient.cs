@@ -2,6 +2,7 @@
 
 using System.Text.Json;
 using Microsoft.AspNetCore.SignalR.Client;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace SteamPrefill.Api;
 
@@ -46,6 +47,11 @@ public sealed class SignalRDaemonClient : IAsyncDisposable
             {
                 // Pass session ID as query parameter for authentication
                 options.Headers.Add("X-Session-Id", sessionId);
+            })
+            .AddJsonProtocol(options =>
+            {
+                // Use source-generated JSON serialization for AOT/trimming compatibility
+                options.PayloadSerializerOptions.TypeInfoResolver = DaemonSerializationContext.Default;
             })
             .WithAutomaticReconnect(new[] {
                 TimeSpan.Zero,
