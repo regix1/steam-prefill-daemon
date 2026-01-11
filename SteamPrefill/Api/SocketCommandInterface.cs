@@ -24,7 +24,9 @@ public sealed class SocketCommandInterface : IDisposable
     private CancellationTokenSource? _loginCts;
     private CancellationTokenSource? _prefillCts;
     private SteamPrefillApi? _api;
+    private Task? _loginTask;
     private bool _isLoggedIn;
+    private bool _isLoggingIn;
     private bool _isPrefilling;
     private bool _disposed;
 
@@ -130,80 +132,86 @@ public sealed class SocketCommandInterface : IDisposable
         }
     }
 
-    private async Task<CommandResponse> HandleLoginAsync(CommandRequest request, CancellationToken cancellationToken)
+    private Task<CommandResponse> HandleLoginAsync(CommandRequest request, CancellationToken cancellationToken)
     {
         if (_isLoggedIn)
         {
             _progress.OnLog(LogLevel.Info, "Already logged in");
-            return new CommandResponse
+            return Task.FromResult(new CommandResponse
             {
                 Id = request.Id,
                 Success = true,
                 Message = "Already logged in",
                 CompletedAt = DateTime.UtcNow
-            };
+            });
+        }
+
+        if (_isLoggingIn)
+        {
+            _progress.OnLog(LogLevel.Info, "Login already in progress");
+            return Task.FromResult(new CommandResponse
+            {
+                Id = request.Id,
+                Success = true,
+                Message = "Login already in progress",
+                CompletedAt = DateTime.UtcNow
+            });
         }
 
         _progress.OnLog(LogLevel.Info, "Starting secure login process via socket...");
+        _isLoggingIn = true;
 
         // Create a login-specific cancellation token
         _loginCts?.Dispose();
-        _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+        _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
 
         // Create API with socket auth provider
         _api = new SteamPrefillApi(_authProvider, _progress);
 
-        try
+        // Run login in background task so the command loop isn't blocked
+        // This allows provide-credential commands to be processed while login is waiting
+        _loginTask = Task.Run(async () =>
         {
-            // This will trigger credential challenges via socket
-            await _api.InitializeAsync(_loginCts.Token);
-
-            _isLoggedIn = true;
-            _progress.OnLog(LogLevel.Info, "Login successful - commands now available");
-
-            await BroadcastStatusAsync("logged-in", "Authenticated and ready for commands");
-
-            return new CommandResponse
+            try
             {
-                Id = request.Id,
-                Success = true,
-                Message = "Login successful",
-                CompletedAt = DateTime.UtcNow
-            };
-        }
-        catch (OperationCanceledException)
-        {
-            _progress.OnLog(LogLevel.Info, "Login cancelled");
-            CleanupApiInstance();
-            await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+                // This will trigger credential challenges via socket
+                await _api.InitializeAsync(_loginCts.Token);
 
-            return new CommandResponse
-            {
-                Id = request.Id,
-                Success = false,
-                Error = "Login cancelled",
-                CompletedAt = DateTime.UtcNow
-            };
-        }
-        catch (Exception ex)
-        {
-            _progress.OnLog(LogLevel.Error, $"Login failed: {ex.Message}");
-            CleanupApiInstance();
-            await BroadcastStatusAsync("awaiting-login", $"Login failed: {ex.Message}");
+                _isLoggedIn = true;
+                _isLoggingIn = false;
+                _progress.OnLog(LogLevel.Info, "Login successful - commands now available");
 
-            return new CommandResponse
+                await BroadcastStatusAsync("logged-in", "Authenticated and ready for commands");
+            }
+            catch (OperationCanceledException)
             {
-                Id = request.Id,
-                Success = false,
-                Error = ex.Message,
-                CompletedAt = DateTime.UtcNow
-            };
-        }
-        finally
+                _progress.OnLog(LogLevel.Info, "Login cancelled");
+                _isLoggingIn = false;
+                CleanupApiInstance();
+                await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+            }
+            catch (Exception ex)
+            {
+                _progress.OnLog(LogLevel.Error, $"Login failed: {ex.Message}");
+                _isLoggingIn = false;
+                CleanupApiInstance();
+                await BroadcastStatusAsync("awaiting-login", $"Login failed: {ex.Message}");
+            }
+            finally
+            {
+                _loginCts?.Dispose();
+                _loginCts = null;
+            }
+        }, _loginCts.Token);
+
+        // Return immediately - login process continues in background
+        return Task.FromResult(new CommandResponse
         {
-            _loginCts?.Dispose();
-            _loginCts = null;
-        }
+            Id = request.Id,
+            Success = true,
+            Message = "Login started - awaiting credentials",
+            CompletedAt = DateTime.UtcNow
+        });
     }
 
     private CommandResponse HandleLogout(CommandRequest request)
@@ -595,6 +603,7 @@ public sealed class SocketCommandInterface : IDisposable
         catch { /* ignore cleanup errors */ }
         _api = null;
         _isLoggedIn = false;
+        _isLoggingIn = false;
     }
 
     private async Task BroadcastStatusAsync(string status, string message)
