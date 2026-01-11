@@ -28,6 +28,11 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(CacheStatusResult))]
 [JsonSerializable(typeof(CachedDepotInput))]
 [JsonSerializable(typeof(List<CachedDepotInput>))]
+// Socket event types
+[JsonSerializable(typeof(SocketEvent<CredentialChallenge>))]
+[JsonSerializable(typeof(SocketEvent<PrefillProgressUpdate>))]
+[JsonSerializable(typeof(SocketEvent<AuthStateData>))]
+[JsonSerializable(typeof(AuthStateData))]
 [JsonSerializable(typeof(object))] // Required for polymorphic Data property in CommandResponse
 internal sealed partial class DaemonSerializationContext : JsonSerializerContext
 {
@@ -43,7 +48,7 @@ public class StatusData
 }
 
 /// <summary>
-/// Daemon status update written to responses directory
+/// Daemon status update
 /// </summary>
 public class DaemonStatus
 {
@@ -51,4 +56,71 @@ public class DaemonStatus
     public string Status { get; init; } = string.Empty;
     public string Message { get; init; } = string.Empty;
     public DateTime Timestamp { get; init; }
+}
+
+/// <summary>
+/// Command request sent from client to daemon via socket
+/// </summary>
+public class CommandRequest
+{
+    /// <summary>
+    /// Unique request ID for tracking
+    /// </summary>
+    public string Id { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Command type (login, logout, prefill, status, etc.)
+    /// </summary>
+    public string Type { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Command parameters (varies by command type)
+    /// </summary>
+    public Dictionary<string, string>? Parameters { get; set; }
+
+    /// <summary>
+    /// Timestamp when command was created
+    /// </summary>
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+}
+
+/// <summary>
+/// Command response sent from daemon to client via socket
+/// </summary>
+public class CommandResponse
+{
+    /// <summary>
+    /// Request ID this response corresponds to
+    /// </summary>
+    public string Id { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Whether the command succeeded
+    /// </summary>
+    public bool Success { get; set; }
+
+    /// <summary>
+    /// Human-readable message
+    /// </summary>
+    public string? Message { get; set; }
+
+    /// <summary>
+    /// Error message if failed
+    /// </summary>
+    public string? Error { get; set; }
+
+    /// <summary>
+    /// Response data (varies by command type)
+    /// </summary>
+    public object? Data { get; set; }
+
+    /// <summary>
+    /// Whether login is required
+    /// </summary>
+    public bool RequiresLogin { get; set; }
+
+    /// <summary>
+    /// Timestamp when response was created
+    /// </summary>
+    public DateTime CompletedAt { get; set; } = DateTime.UtcNow;
 }

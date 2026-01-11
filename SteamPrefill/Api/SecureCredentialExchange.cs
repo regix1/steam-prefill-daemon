@@ -2,28 +2,25 @@
 
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using Convert = System.Convert;
 
 namespace SteamPrefill.Api;
 
 /// <summary>
-/// Secure credential exchange using X25519 key exchange and AES-GCM encryption.
-/// This prevents plain text credentials from ever being written to disk or logs.
+/// Secure credential exchange using ECDH key exchange and AES-GCM encryption.
+/// This prevents plain text credentials from ever being transmitted in clear text.
 ///
 /// Protocol:
-/// 1. Server generates ephemeral X25519 keypair
-/// 2. Server writes public key + challenge to response file
-/// 3. Client generates ephemeral X25519 keypair
+/// 1. Server generates ephemeral ECDH keypair
+/// 2. Server sends public key + challenge via socket
+/// 3. Client generates ephemeral ECDH keypair
 /// 4. Client derives shared secret, encrypts credentials with AES-GCM
-/// 5. Client writes encrypted credentials + client public key to command file
+/// 5. Client sends encrypted credentials + client public key via socket
 /// 6. Server derives same shared secret, decrypts credentials
 /// 7. Server uses credentials immediately, then securely clears memory
 /// </summary>
 public sealed class SecureCredentialExchange : IDisposable
 {
-    private readonly string _responsesDir;
     private readonly string _challengeId;
     private byte[]? _serverPrivateKey;
     private byte[]? _serverPublicKey;
@@ -37,9 +34,8 @@ public sealed class SecureCredentialExchange : IDisposable
     public bool IsExpired => DateTime.UtcNow > _expiresAt;
     private readonly DateTime _expiresAt;
 
-    private SecureCredentialExchange(string responsesDir)
+    private SecureCredentialExchange()
     {
-        _responsesDir = responsesDir;
         _challengeId = Guid.NewGuid().ToString("N");
         _expiresAt = DateTime.UtcNow.AddMinutes(5); // Challenge expires in 5 minutes
         GenerateKeyPair();
@@ -47,7 +43,7 @@ public sealed class SecureCredentialExchange : IDisposable
 
     private void GenerateKeyPair()
     {
-        // Generate X25519 keypair for Diffie-Hellman key exchange
+        // Generate ECDH keypair for Diffie-Hellman key exchange
         using var ecdh = ECDiffieHellman.Create(ECCurve.NamedCurves.nistP256);
         var parameters = ecdh.ExportParameters(true);
 
@@ -62,20 +58,21 @@ public sealed class SecureCredentialExchange : IDisposable
     }
 
     /// <summary>
-    /// Creates a new credential challenge and writes it to the responses directory.
+    /// Creates a new credential challenge.
+    /// The challenge is sent via socket to the client.
     /// </summary>
-    public static SecureCredentialExchange CreateChallenge(string responsesDir, string credentialType, string? email = null)
+    public static CredentialChallenge CreateChallenge(string credentialType, string? email = null)
     {
         lock (_lock)
         {
             // Dispose previous challenge
             _currentChallenge?.Dispose();
 
-            var exchange = new SecureCredentialExchange(responsesDir);
+            var exchange = new SecureCredentialExchange();
             _currentChallenge = exchange;
 
-            // Write challenge to file
-            var challenge = new CredentialChallenge
+            // Return challenge object (caller sends it via socket)
+            return new CredentialChallenge
             {
                 ChallengeId = exchange._challengeId,
                 CredentialType = credentialType,
@@ -84,13 +81,6 @@ public sealed class SecureCredentialExchange : IDisposable
                 ExpiresAt = exchange._expiresAt,
                 CreatedAt = DateTime.UtcNow
             };
-
-            var fileName = $"auth_challenge_{exchange._challengeId}.json";
-            var filePath = Path.Combine(responsesDir, fileName);
-            var json = JsonSerializer.Serialize(challenge, DaemonSerializationContext.Default.CredentialChallenge);
-            File.WriteAllText(filePath, json);
-
-            return exchange;
         }
     }
 
@@ -118,10 +108,6 @@ public sealed class SecureCredentialExchange : IDisposable
             try
             {
                 var credential = _currentChallenge.DecryptInternal(response);
-
-                // Delete the challenge file after use
-                var challengeFilePath = Path.Combine(_currentChallenge._responsesDir, $"auth_challenge_{_currentChallenge._challengeId}.json");
-                try { File.Delete(challengeFilePath); } catch { /* ignore */ }
 
                 // Dispose challenge after use - one-time use only
                 _currentChallenge.Dispose();
