@@ -423,8 +423,14 @@ public sealed class SocketCommandInterface : IDisposable
                 options.DownloadAllOwnedGames = all;
             if (bool.TryParse(request.Parameters.GetValueOrDefault("recent"), out var recent))
                 options.PrefillRecentGames = recent;
+            if (bool.TryParse(request.Parameters.GetValueOrDefault("recently_purchased"), out var recentlyPurchased))
+                options.PrefillRecentlyPurchased = recentlyPurchased;
+            if (int.TryParse(request.Parameters.GetValueOrDefault("top"), out var top))
+                options.PrefillTopGames = top;
             if (bool.TryParse(request.Parameters.GetValueOrDefault("force"), out var force))
                 options.Force = force;
+            if (int.TryParse(request.Parameters.GetValueOrDefault("maxConcurrency"), out var maxConcurrency) && maxConcurrency > 0)
+                AppConfig.MaxConcurrencyOverride = maxConcurrency;
 
             // Parse operating systems
             var osParam = request.Parameters.GetValueOrDefault("os");
