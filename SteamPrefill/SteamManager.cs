@@ -95,7 +95,10 @@ namespace SteamPrefill
                                                     CancellationToken cancellationToken = default)
         {
             // Building out the list of AppIds to download
-            var appIdsToDownload = LoadPreviouslySelectedApps();
+            // Only include previously selected apps if no specific filter is being used
+            // When using filters like "recently purchased" or "recent games", users expect ONLY those games
+            var hasSpecificFilter = downloadAllOwnedGames || prefillRecentGames || prefillPopularGames != null || prefillRecentlyPurchasedGames;
+            var appIdsToDownload = hasSpecificFilter ? new List<uint>() : LoadPreviouslySelectedApps();
             if (downloadAllOwnedGames)
             {
                 appIdsToDownload.AddRange(_steam3.LicenseManager.AllOwnedAppIds);

@@ -20,9 +20,42 @@ namespace SteamPrefill.Handlers
             _cdnPool = cdnPool;
             _progress = progress ?? NullProgress.Instance;
 
-            _client = new HttpClient();
+            // Configure SocketsHttpHandler with TCP keep-alive to detect stalled connections
+            var handler = new SocketsHttpHandler
+            {
+                // Enable TCP keep-alive pings for HTTP/2 connections
+                KeepAlivePingDelay = TimeSpan.FromSeconds(30),
+                KeepAlivePingTimeout = TimeSpan.FromSeconds(15),
+                // Enable TCP keep-alive at the socket level via ConnectCallback
+                ConnectCallback = async (context, cancellationToken) =>
+                {
+                    var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                    try
+                    {
+                        // Enable TCP keep-alive to detect dead connections
+                        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+                        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
+                        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
+                        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+                        await socket.ConnectAsync(context.DnsEndPoint, cancellationToken);
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch
+                    {
+                        socket.Dispose();
+                        throw;
+                    }
+                },
+                // Connection pool settings
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2)
+            };
+
+            _client = new HttpClient(handler);
             // Lancache requires this user agent in order to correctly identify and cache Valve's content servers
             _client.DefaultRequestHeaders.Add("User-Agent", "Valve/Steam HTTP Client 1.0");
+            // Set a reasonable overall timeout (individual request timeouts are handled separately)
+            _client.Timeout = TimeSpan.FromMinutes(5);
         }
 
         public async Task InitializeAsync()
@@ -100,10 +133,19 @@ namespace SteamPrefill.Handlers
             var startTime = DateTime.UtcNow;
             var lastProgressReport = DateTime.MinValue;
             var progressThrottle = TimeSpan.FromMilliseconds(500);
+            
+            // Per-request timeout to prevent indefinite hangs (2 minutes should be plenty for any chunk)
+            var perRequestTimeout = TimeSpan.FromMinutes(2);
 
             var cdnServer = _cdnPool.TakeConnection();
             await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests, CancellationToken = cancellationToken }, body: async (request, ct) =>
             {
+                // Create a linked cancellation token with a per-request timeout
+                // This ensures that individual requests don't hang indefinitely even if the main token doesn't have a timeout
+                using var requestTimeoutCts = new CancellationTokenSource(perRequestTimeout);
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, requestTimeoutCts.Token);
+                var requestCt = linkedCts.Token;
+                
                 try
                 {
                     var url = $"http://{_lancacheAddress}/depot/{request.DepotId}/chunk/{request.ChunkId}";
@@ -114,20 +156,27 @@ namespace SteamPrefill.Handlers
                     using var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
                     requestMessage.Headers.Host = cdnServer.Host;
 
-                    using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, ct);
-                    using Stream responseStream = await response.Content.ReadAsStreamAsync(ct);
+                    using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, requestCt);
                     response.EnsureSuccessStatusCode();
+                    using Stream responseStream = await response.Content.ReadAsStreamAsync(requestCt);
 
+                    // Use larger buffer for more efficient reads (64KB instead of 4KB)
+                    var buffer = new byte[65536];
                     // Don't save the data anywhere, so we don't have to waste time writing it to disk.
-                    var buffer = new byte[4096];
-                    while (await responseStream.ReadAsync(buffer, ct) != 0)
+                    while (await responseStream.ReadAsync(buffer, requestCt) != 0)
                     {
                     }
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    // Cancellation requested - don't add to failed requests, just exit
+                    // Main cancellation requested - don't add to failed requests, just exit
                     throw;
+                }
+                catch (OperationCanceledException) when (requestTimeoutCts.IsCancellationRequested)
+                {
+                    // Per-request timeout - treat as a failure that can be retried
+                    request.LastFailureReason = new TimeoutException($"Request timed out after {perRequestTimeout.TotalSeconds} seconds");
+                    failedRequests.Add(request);
                 }
                 catch (Exception e)
                 {
