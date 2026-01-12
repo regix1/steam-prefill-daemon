@@ -20,42 +20,21 @@ namespace SteamPrefill.Handlers
             _cdnPool = cdnPool;
             _progress = progress ?? NullProgress.Instance;
 
-            // Configure SocketsHttpHandler with TCP keep-alive to detect stalled connections
+            // Configure SocketsHttpHandler with connection pooling settings
             var handler = new SocketsHttpHandler
             {
-                // Enable TCP keep-alive pings for HTTP/2 connections
-                KeepAlivePingDelay = TimeSpan.FromSeconds(30),
-                KeepAlivePingTimeout = TimeSpan.FromSeconds(15),
-                // Enable TCP keep-alive at the socket level via ConnectCallback
-                ConnectCallback = async (context, cancellationToken) =>
-                {
-                    var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
-                    try
-                    {
-                        // Enable TCP keep-alive to detect dead connections
-                        socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
-                        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
-                        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
-                        socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
-                        await socket.ConnectAsync(context.DnsEndPoint, cancellationToken);
-                        return new NetworkStream(socket, ownsSocket: true);
-                    }
-                    catch
-                    {
-                        socket.Dispose();
-                        throw;
-                    }
-                },
-                // Connection pool settings
-                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(2)
+                // Connection pool settings to keep connections alive longer
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+                // Allow more concurrent connections per server
+                MaxConnectionsPerServer = 100
             };
 
             _client = new HttpClient(handler);
             // Lancache requires this user agent in order to correctly identify and cache Valve's content servers
             _client.DefaultRequestHeaders.Add("User-Agent", "Valve/Steam HTTP Client 1.0");
             // Set a reasonable overall timeout (individual request timeouts are handled separately)
-            _client.Timeout = TimeSpan.FromMinutes(5);
+            _client.Timeout = TimeSpan.FromMinutes(10);
         }
 
         public async Task InitializeAsync()
