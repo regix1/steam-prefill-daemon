@@ -168,6 +168,17 @@ namespace SteamPrefill
 
             _ansiConsole.LogMarkupLine("Prefill complete!");
             _prefillSummaryResult.RenderSummaryTable(_ansiConsole);
+
+            // Notify completion via progress interface
+            _progress.OnPrefillCompleted(new PrefillSummary
+            {
+                TotalApps = _prefillSummaryResult.AlreadyUpToDate + _prefillSummaryResult.Updated + _prefillSummaryResult.FailedApps,
+                UpdatedApps = _prefillSummaryResult.Updated,
+                AlreadyUpToDate = _prefillSummaryResult.AlreadyUpToDate,
+                FailedApps = _prefillSummaryResult.FailedApps,
+                TotalBytesTransferred = (long)_prefillSummaryResult.TotalBytesTransferred.Bytes,
+                TotalTime = _prefillSummaryResult.PrefillElapsedTime.Elapsed
+            });
         }
 
         private async Task DownloadSingleAppAsync(AppInfo appInfo, CancellationToken cancellationToken = default)
