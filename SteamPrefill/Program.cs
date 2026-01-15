@@ -16,9 +16,16 @@ namespace SteamPrefill
                     ║                  v{ThisAssembly.Info.InformationalVersion,-20}             ║
                     ╚═══════════════════════════════════════════════════════════╝
 
-                    Using Unix Domain Socket for reliable, low-latency IPC.
-
                     """);
+
+                var tcpPortEnv = Environment.GetEnvironmentVariable("PREFILL_TCP_PORT");
+                var useTcp = int.TryParse(tcpPortEnv, out var tcpPort) && tcpPort > 0;
+
+                if (!useTcp)
+                {
+                    Console.WriteLine("Using Unix Domain Socket for reliable, low-latency IPC.");
+                    Console.WriteLine();
+                }
 
                 // Get socket path from environment or use default in responses dir
                 var responsesDir = Environment.GetEnvironmentVariable("PREFILL_RESPONSES_DIR") ?? "/responses";
@@ -34,7 +41,14 @@ namespace SteamPrefill
                     cts.Cancel();
                 };
 
-                await DaemonMode.RunAsync(socketPath, cts.Token);
+                if (useTcp)
+                {
+                    await DaemonMode.RunTcpAsync(tcpPort, cts.Token);
+                }
+                else
+                {
+                    await DaemonMode.RunAsync(socketPath, cts.Token);
+                }
 
                 return 0;
             }

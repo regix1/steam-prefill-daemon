@@ -50,6 +50,16 @@ public sealed class SocketCommandInterface : IDisposable
         _progress.SocketServer = _socketServer;
     }
 
+    public SocketCommandInterface(int tcpPort)
+    {
+        _progress = new SocketProgress();
+        _socketServer = new SocketServer(tcpPort, _progress);
+        _authProvider = new SocketAuthProvider(_socketServer, _progress);
+        _socketServer.OnCommand = HandleCommandAsync;
+
+        _progress.SocketServer = _socketServer;
+    }
+
     /// <summary>
     /// Start the socket server and begin accepting connections.
     /// </summary>

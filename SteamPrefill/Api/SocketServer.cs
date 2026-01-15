@@ -9,7 +9,7 @@ using System.Text.Json;
 namespace SteamPrefill.Api;
 
 /// <summary>
-/// Unix Domain Socket server for IPC with lancache-manager.
+/// Socket server for IPC with lancache-manager (Unix domain socket or TCP).
 /// Provides reliable, low-latency bidirectional communication.
 ///
 /// Protocol:
@@ -23,9 +23,18 @@ namespace SteamPrefill.Api;
 /// - Credential encryption: ECDH + AES-GCM
 /// - Challenge expiration: 5 minutes
 /// </summary>
+public enum SocketServerMode
+{
+    UnixSocket,
+    Tcp
+}
+
 public sealed class SocketServer : IAsyncDisposable
 {
-    private readonly string _socketPath;
+    private readonly SocketServerMode _mode;
+    private readonly string? _socketPath;
+    private readonly int _tcpPort;
+    private readonly IPAddress _tcpBindAddress;
     private readonly IPrefillProgress _progress;
     private readonly string? _sharedSecret;
     private readonly CancellationTokenSource _cts = new();
@@ -51,10 +60,28 @@ public sealed class SocketServer : IAsyncDisposable
 
     public SocketServer(string socketPath, IPrefillProgress? progress = null)
     {
+        _mode = SocketServerMode.UnixSocket;
         _socketPath = socketPath;
+        _tcpPort = 0;
+        _tcpBindAddress = IPAddress.Any;
         _progress = progress ?? NullProgress.Instance;
 
         // Optional shared secret for additional security
+        _sharedSecret = Environment.GetEnvironmentVariable("PREFILL_SOCKET_SECRET");
+        if (!string.IsNullOrEmpty(_sharedSecret))
+        {
+            _progress.OnLog(LogLevel.Info, "Socket authentication enabled via PREFILL_SOCKET_SECRET");
+        }
+    }
+
+    public SocketServer(int tcpPort, IPrefillProgress? progress = null, IPAddress? bindAddress = null)
+    {
+        _mode = SocketServerMode.Tcp;
+        _socketPath = null;
+        _tcpPort = tcpPort;
+        _tcpBindAddress = bindAddress ?? IPAddress.Any;
+        _progress = progress ?? NullProgress.Instance;
+
         _sharedSecret = Environment.GetEnvironmentVariable("PREFILL_SOCKET_SECRET");
         if (!string.IsNullOrEmpty(_sharedSecret))
         {
@@ -67,51 +94,63 @@ public sealed class SocketServer : IAsyncDisposable
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
-        // Remove existing socket file if any (from previous crash)
-        if (File.Exists(_socketPath))
+        if (_mode == SocketServerMode.UnixSocket)
         {
-            try
+            // Remove existing socket file if any (from previous crash)
+            if (_socketPath != null && File.Exists(_socketPath))
             {
-                File.Delete(_socketPath);
-                _progress.OnLog(LogLevel.Debug, $"Removed stale socket file: {_socketPath}");
+                try
+                {
+                    File.Delete(_socketPath);
+                    _progress.OnLog(LogLevel.Debug, $"Removed stale socket file: {_socketPath}");
+                }
+                catch (Exception ex)
+                {
+                    _progress.OnLog(LogLevel.Warning, $"Could not remove stale socket file: {ex.Message}");
+                }
             }
-            catch (Exception ex)
-            {
-                _progress.OnLog(LogLevel.Warning, $"Could not remove stale socket file: {ex.Message}");
-            }
-        }
 
-        // Ensure directory exists
-        var dir = Path.GetDirectoryName(_socketPath);
-        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            var socketPath = _socketPath ?? throw new InvalidOperationException("Socket path is required for Unix socket mode.");
+
+            // Ensure directory exists
+            var dir = Path.GetDirectoryName(socketPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+                // Set directory permissions to 0777 for cross-container access
+                TrySetUnixPermissions(dir,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+            }
+
+            _listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            _listener.Bind(new UnixDomainSocketEndPoint(socketPath));
+            _listener.Listen(5);
+
+            // SECURITY: Set socket file permissions for container communication
+            // The socket is protected by:
+            // 1. Docker volume isolation - only containers with the volume mounted can access it
+            // 2. Credential encryption - all credentials use ECDH + AES-GCM encryption
+            // 3. Challenge expiration - credential challenges expire after 5 minutes
+            // 4. Optional shared secret authentication via PREFILL_SOCKET_SECRET env var
+            //
+            // We use 0666 to allow cross-container communication when containers run as
+            // different users. Docker volume isolation is the primary security boundary.
+            TrySetUnixPermissions(socketPath,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
+                UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+
+            _progress.OnLog(LogLevel.Info, $"Socket server listening on: {socketPath}");
+        }
+        else
         {
-            Directory.CreateDirectory(dir);
-            // Set directory permissions to 0777 for cross-container access
-            TrySetUnixPermissions(dir,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
-                UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute |
-                UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
+            _listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            _listener.Bind(new IPEndPoint(_tcpBindAddress, _tcpPort));
+            _listener.Listen(5);
+            _progress.OnLog(LogLevel.Info, $"TCP socket server listening on: {_tcpBindAddress}:{_tcpPort}");
         }
-
-        _listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        _listener.Bind(new UnixDomainSocketEndPoint(_socketPath));
-        _listener.Listen(5);
-
-        // SECURITY: Set socket file permissions for container communication
-        // The socket is protected by:
-        // 1. Docker volume isolation - only containers with the volume mounted can access it
-        // 2. Credential encryption - all credentials use ECDH + AES-GCM encryption
-        // 3. Challenge expiration - credential challenges expire after 5 minutes
-        // 4. Optional shared secret authentication via PREFILL_SOCKET_SECRET env var
-        //
-        // We use 0666 to allow cross-container communication when containers run as
-        // different users. Docker volume isolation is the primary security boundary.
-        TrySetUnixPermissions(_socketPath,
-            UnixFileMode.UserRead | UnixFileMode.UserWrite |
-            UnixFileMode.GroupRead | UnixFileMode.GroupWrite |
-            UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
-
-        _progress.OnLog(LogLevel.Info, $"Socket server listening on: {_socketPath}");
 
         // Start accepting connections
         _acceptTask = AcceptConnectionsAsync(_cts.Token);
@@ -450,7 +489,7 @@ public sealed class SocketServer : IAsyncDisposable
         }
 
         // Remove socket file
-        if (File.Exists(_socketPath))
+        if (_mode == SocketServerMode.UnixSocket && _socketPath != null && File.Exists(_socketPath))
         {
             try
             {

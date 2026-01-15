@@ -68,6 +68,51 @@ public static class DaemonMode
         await socketInterface.StopAsync();
         Console.WriteLine("Daemon stopped.");
     }
+
+    /// <summary>
+    /// Run in TCP-based daemon mode.
+    /// Uses TCP for bidirectional communication (useful for Windows Docker Desktop).
+    /// </summary>
+    public static async Task RunTcpAsync(
+        int port,
+        CancellationToken cancellationToken = default)
+    {
+        Console.WriteLine("Starting SteamPrefill daemon (TCP mode)...");
+        Console.WriteLine($"TCP port: {port}");
+        Console.WriteLine();
+        Console.WriteLine("┌──────────────────────────────────────────────────────────────┐");
+        Console.WriteLine("│ TCP IPC                                                     │");
+        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
+        Console.WriteLine("│ • Reliable bidirectional communication                       │");
+        Console.WriteLine("│ • Useful for Windows Docker Desktop bind mounts              │");
+        Console.WriteLine("│ • Real-time progress streaming                               │");
+        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
+        Console.WriteLine("│ SECURITY                                                     │");
+        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
+        Console.WriteLine("│ • Login is REQUIRED before any other commands                │");
+        Console.WriteLine("│ • All credentials are encrypted using ECDH + AES-GCM         │");
+        Console.WriteLine("│ • Challenges expire after 5 minutes                          │");
+        Console.WriteLine("└──────────────────────────────────────────────────────────────┘");
+        Console.WriteLine();
+
+        using var socketInterface = new SocketCommandInterface(port);
+
+        await socketInterface.StartAsync(cancellationToken);
+
+        Console.WriteLine("Daemon started. Waiting for connections...");
+
+        try
+        {
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("Daemon shutdown requested...");
+        }
+
+        await socketInterface.StopAsync();
+        Console.WriteLine("Daemon stopped.");
+    }
 }
 
 /// <summary>
