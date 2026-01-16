@@ -119,6 +119,7 @@ public sealed class SocketCommandInterface : IDisposable
                 "clear-cache" => HandleClearCache(request),
                 "get-cache-info" => HandleGetCacheInfo(request),
                 "get-selected-apps-status" => await HandleGetSelectedAppsStatusAsync(request, cancellationToken),
+                "check-cache-status" => await HandleCheckCacheStatusAsync(request, cancellationToken),
                 "shutdown" => HandleShutdown(request),
                 _ => new CommandResponse
                 {
@@ -590,6 +591,48 @@ public sealed class SocketCommandInterface : IDisposable
         }
 
         var status = await _api!.GetSelectedAppsStatusAsync(cachedDepots, cancellationToken);
+
+        return new CommandResponse
+        {
+            Id = request.Id,
+            Success = true,
+            Data = status,
+            Message = status.Message,
+            CompletedAt = DateTime.UtcNow
+        };
+    }
+
+    private async Task<CommandResponse> HandleCheckCacheStatusAsync(CommandRequest request, CancellationToken cancellationToken)
+    {
+        EnsureLoggedIn();
+
+        var cachedDepotsJson = request.Parameters?.GetValueOrDefault("cachedDepots");
+        if (string.IsNullOrEmpty(cachedDepotsJson))
+        {
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = true,
+                Data = new CacheStatusResult { Apps = new List<AppCacheStatus>(), Message = "No cached depots provided" },
+                Message = "No cached depots provided",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
+
+        var cachedDepots = JsonSerializer.Deserialize(cachedDepotsJson, DaemonSerializationContext.Default.ListCachedDepotInput);
+        if (cachedDepots == null || cachedDepots.Count == 0)
+        {
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = true,
+                Data = new CacheStatusResult { Apps = new List<AppCacheStatus>(), Message = "No cached depots provided" },
+                Message = "No cached depots provided",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
+
+        var status = await _api!.CheckCacheStatusAsync(cachedDepots, cancellationToken);
 
         return new CommandResponse
         {
