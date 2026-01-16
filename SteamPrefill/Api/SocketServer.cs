@@ -223,7 +223,28 @@ public sealed class SocketServer : IAsyncDisposable
                 }
 
                 var json = Encoding.UTF8.GetString(messageBytes);
-                _progress.OnLog(LogLevel.Debug, $"Received from {client.Id}: {json[..Math.Min(200, json.Length)]}...");
+                try
+                {
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+                    var type = root.TryGetProperty("type", out var typeProp) ? typeProp.GetString() : "unknown";
+                    var id = root.TryGetProperty("id", out var idProp) ? idProp.GetString() : "unknown";
+                    var redactedTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        "provide-credential",
+                        "auth"
+                    };
+
+                    _progress.OnLog(
+                        LogLevel.Debug,
+                        redactedTypes.Contains(type ?? string.Empty)
+                            ? $"Received from {client.Id}: {type} (id: {id}) [redacted]"
+                            : $"Received from {client.Id}: {type} (id: {id})");
+                }
+                catch
+                {
+                    _progress.OnLog(LogLevel.Debug, $"Received from {client.Id}: <unparseable message>");
+                }
 
                 // Parse and handle command
                 CommandResponse response;
