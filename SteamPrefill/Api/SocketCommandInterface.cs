@@ -494,7 +494,7 @@ public sealed class SocketCommandInterface : IDisposable
             System.Security.Cryptography.CryptographicOperations.ZeroMemory(plaintext);
 
             // Parse JSON: {"username":"...", "refreshToken":"..."}
-            var autoLoginData = JsonSerializer.Deserialize<AutoLoginCredentials>(decryptedJson);
+            var autoLoginData = JsonSerializer.Deserialize(decryptedJson, DaemonSerializationContext.Default.AutoLoginCredentials);
             if (autoLoginData == null || string.IsNullOrEmpty(autoLoginData.Username) || string.IsNullOrEmpty(autoLoginData.RefreshToken))
             {
                 return new CommandResponse
@@ -1048,12 +1048,4 @@ public sealed class SocketCommandInterface : IDisposable
         public required DateTime ExpiresAt { get; init; }
     }
 
-    /// <summary>
-    /// Auto-login credentials format
-    /// </summary>
-    private sealed class AutoLoginCredentials
-    {
-        public string Username { get; init; } = string.Empty;
-        public string RefreshToken { get; init; } = string.Empty;
-    }
 }

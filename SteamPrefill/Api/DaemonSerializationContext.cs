@@ -34,8 +34,18 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(SocketEvent<AuthStateData>))]
 [JsonSerializable(typeof(AuthStateData))]
 [JsonSerializable(typeof(object))] // Required for polymorphic Data property in CommandResponse
+[JsonSerializable(typeof(AutoLoginCredentials))]
 internal sealed partial class DaemonSerializationContext : JsonSerializerContext
 {
+}
+
+/// <summary>
+/// Auto-login credentials format for secure token exchange
+/// </summary>
+public sealed class AutoLoginCredentials
+{
+    public string Username { get; init; } = string.Empty;
+    public string RefreshToken { get; init; } = string.Empty;
 }
 
 /// <summary>
