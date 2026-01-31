@@ -131,9 +131,7 @@ dotnet_diagnostic.AsyncFixer01.severity = none
 dotnet_diagnostic.AsyncFixer02.severity = none
 
 # Spectre.Console analyzer: prefer AnsiConsole over Console
-dotnet_diagnostic.Spectre1000.severity = none
-
-# Visual Studio threading analyzers
+dotnet_diagnostic.Spectre1000.severity = none# Visual Studio threading analyzers
 dotnet_diagnostic.VSTHRD002.severity = none
 dotnet_diagnostic.VSTHRD003.severity = none
 dotnet_diagnostic.VSTHRD103.severity = none

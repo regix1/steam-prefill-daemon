@@ -30,13 +30,18 @@ public sealed class SocketCommandInterface : IDisposable
     private bool _isPrefilling;
     private bool _disposed;
 
+    // Auto-login challenge storage
+    private readonly Dictionary<string, AutoLoginChallengeData> _pendingAutoLoginChallenges = new();
+
     // Commands allowed before login
     private static readonly HashSet<string> PreLoginCommands = new(StringComparer.OrdinalIgnoreCase)
     {
         "login",
         "status",
         "cancel-login",
-        "provide-credential"
+        "provide-credential",
+        "get-auto-login-challenge",
+        "provide-auto-login"
     };
 
     public SocketCommandInterface(string socketPath)
@@ -111,6 +116,8 @@ public sealed class SocketCommandInterface : IDisposable
                 "cancel-login" => await HandleCancelLoginAsync(request),
                 "cancel-prefill" => HandleCancelPrefill(request),
                 "provide-credential" => HandleProvideCredential(request),
+                "get-auto-login-challenge" => HandleGetAutoLoginChallengeAsync(request),
+                "provide-auto-login" => await HandleProvideAutoLoginAsync(request, cancellationToken),
                 "status" => HandleStatus(request),
                 "get-owned-games" => await HandleGetOwnedGamesAsync(request, cancellationToken),
                 "get-selected-apps" => HandleGetSelectedApps(request),
@@ -334,6 +341,191 @@ public sealed class SocketCommandInterface : IDisposable
             Message = "Credential received",
             CompletedAt = DateTime.UtcNow
         };
+    }
+
+    private CommandResponse HandleGetAutoLoginChallengeAsync(CommandRequest request)
+    {
+        using var ecdh = System.Security.Cryptography.ECDiffieHellman.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+        var parameters = ecdh.ExportParameters(true);
+
+        // Export public key in uncompressed point format
+        var serverPublicKey = new byte[65];
+        serverPublicKey[0] = 0x04; // Uncompressed point indicator
+        Array.Copy(parameters.Q.X!, 0, serverPublicKey, 1, 32);
+        Array.Copy(parameters.Q.Y!, 0, serverPublicKey, 33, 32);
+
+        var challengeId = Guid.NewGuid().ToString("N");
+        var expiresAt = DateTime.UtcNow.AddMinutes(5);
+
+        // Store challenge data
+        var challengeData = new AutoLoginChallengeData
+        {
+            ChallengeId = challengeId,
+            ServerPrivateKey = parameters,
+            ServerPublicKey = serverPublicKey,
+            ExpiresAt = expiresAt
+        };
+
+        _pendingAutoLoginChallenges[challengeId] = challengeData;
+
+        // Clean up expired challenges
+        var expiredChallenges = _pendingAutoLoginChallenges
+            .Where(kvp => kvp.Value.ExpiresAt < DateTime.UtcNow)
+            .Select(kvp => kvp.Key)
+            .ToList();
+        foreach (var expiredId in expiredChallenges)
+        {
+            _pendingAutoLoginChallenges.Remove(expiredId);
+        }
+
+        _progress.OnLog(LogLevel.Info, $"Auto-login challenge created: {challengeId}");
+
+        return new CommandResponse
+        {
+            Id = request.Id,
+            Success = true,
+            Data = new CredentialChallenge
+            {
+                ChallengeId = challengeId,
+                CredentialType = "auto-login",
+                ServerPublicKey = System.Convert.ToBase64String(serverPublicKey),
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = expiresAt
+            },
+            CompletedAt = DateTime.UtcNow
+        };
+    }
+
+    private async Task<CommandResponse> HandleProvideAutoLoginAsync(CommandRequest request, CancellationToken cancellationToken)
+    {
+        var challengeId = request.Parameters?.GetValueOrDefault("challengeId");
+        var clientPublicKey = request.Parameters?.GetValueOrDefault("clientPublicKey");
+        var encryptedCredential = request.Parameters?.GetValueOrDefault("encryptedCredential");
+        var nonce = request.Parameters?.GetValueOrDefault("nonce");
+        var tag = request.Parameters?.GetValueOrDefault("tag");
+
+        if (string.IsNullOrEmpty(challengeId) || string.IsNullOrEmpty(clientPublicKey) ||
+            string.IsNullOrEmpty(encryptedCredential) || string.IsNullOrEmpty(nonce) || string.IsNullOrEmpty(tag))
+        {
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = "Missing required auto-login parameters",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
+
+        // Get challenge from dictionary
+        if (!_pendingAutoLoginChallenges.TryGetValue(challengeId, out var challengeData))
+        {
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = "Invalid or expired challenge ID",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
+
+        // Validate not expired
+        if (challengeData.ExpiresAt < DateTime.UtcNow)
+        {
+            _pendingAutoLoginChallenges.Remove(challengeId);
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = "Challenge has expired",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
+
+        // Remove from dictionary (one-time use)
+        _pendingAutoLoginChallenges.Remove(challengeId);
+
+        try
+        {
+            // Decrypt using ECDH + AES-GCM (same as SecureCredentialExchange)
+            var clientPublicKeyBytes = System.Convert.FromBase64String(clientPublicKey);
+
+            // Recreate server ECDH instance
+            using var serverEcdh = System.Security.Cryptography.ECDiffieHellman.Create();
+            serverEcdh.ImportParameters(challengeData.ServerPrivateKey);
+
+            // Import client public key
+            using var clientEcdh = System.Security.Cryptography.ECDiffieHellman.Create();
+            var clientParams = new System.Security.Cryptography.ECParameters
+            {
+                Curve = System.Security.Cryptography.ECCurve.NamedCurves.nistP256,
+                Q = new System.Security.Cryptography.ECPoint
+                {
+                    X = clientPublicKeyBytes.AsSpan(1, 32).ToArray(),
+                    Y = clientPublicKeyBytes.AsSpan(33, 32).ToArray()
+                }
+            };
+            clientEcdh.ImportParameters(clientParams);
+
+            // Derive shared secret
+            var sharedSecret = serverEcdh.DeriveKeyMaterial(clientEcdh.PublicKey);
+
+            // Derive AES key from shared secret using HKDF
+            var aesKey = System.Security.Cryptography.HKDF.DeriveKey(
+                System.Security.Cryptography.HashAlgorithmName.SHA256,
+                sharedSecret,
+                32, // 256-bit key
+                System.Text.Encoding.UTF8.GetBytes(challengeId),
+                System.Text.Encoding.UTF8.GetBytes("SteamPrefill-Credential-Encryption"));
+
+            // Decrypt with AES-GCM
+            var nonceBytes = System.Convert.FromBase64String(nonce);
+            var ciphertext = System.Convert.FromBase64String(encryptedCredential);
+            var tagBytes = System.Convert.FromBase64String(tag);
+
+            var plaintext = new byte[ciphertext.Length];
+            using var aesGcm = new System.Security.Cryptography.AesGcm(aesKey, 16);
+            aesGcm.Decrypt(nonceBytes, ciphertext, tagBytes, plaintext);
+
+            var decryptedJson = System.Text.Encoding.UTF8.GetString(plaintext);
+
+            // Securely clear sensitive data
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(sharedSecret);
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(aesKey);
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(plaintext);
+
+            // Parse JSON: {"username":"...", "refreshToken":"..."}
+            var autoLoginData = JsonSerializer.Deserialize<AutoLoginCredentials>(decryptedJson);
+            if (autoLoginData == null || string.IsNullOrEmpty(autoLoginData.Username) || string.IsNullOrEmpty(autoLoginData.RefreshToken))
+            {
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = false,
+                    Error = "Invalid auto-login credential format",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+
+            _progress.OnLog(LogLevel.Info, $"Auto-login credentials received for user: {autoLoginData.Username}");
+
+            // Set credentials in UserAccountStore and start login
+            var accountStore = UserAccountStore.LoadFromFile();
+            accountStore.SetCredentialsFromToken(autoLoginData.Username, autoLoginData.RefreshToken);
+
+            // Trigger login process
+            return await HandleLoginAsync(request, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Error, $"Failed to decrypt auto-login credentials: {ex.Message}");
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = $"Failed to decrypt credentials: {ex.Message}",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
     }
 
     private CommandResponse HandleStatus(CommandRequest request)
@@ -843,5 +1035,25 @@ public sealed class SocketCommandInterface : IDisposable
             var progressEvent = new ProgressEvent(update);
             _ = SocketServer.BroadcastProgressAsync(progressEvent);
         }
+    }
+
+    /// <summary>
+    /// Auto-login challenge data storage
+    /// </summary>
+    private sealed class AutoLoginChallengeData
+    {
+        public required string ChallengeId { get; init; }
+        public required System.Security.Cryptography.ECParameters ServerPrivateKey { get; init; }
+        public required byte[] ServerPublicKey { get; init; }
+        public required DateTime ExpiresAt { get; init; }
+    }
+
+    /// <summary>
+    /// Auto-login credentials format
+    /// </summary>
+    private sealed class AutoLoginCredentials
+    {
+        public string Username { get; init; } = string.Empty;
+        public string RefreshToken { get; init; } = string.Empty;
     }
 }

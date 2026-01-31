@@ -10,7 +10,7 @@ namespace SteamPrefill.Settings
     public sealed class UserAccountStore
     {
         [ProtoMember(3)]
-        private string CurrentUsername { get; set; }
+        public string CurrentUsername { get; set; }
 
         /// <summary>
         /// Used to identify separate instances of Steam/SteamPrefill on the Steam network.
@@ -107,6 +107,16 @@ namespace SteamPrefill.Settings
                 };
                 return ansiConsole.Prompt(prompt);
             });
+        }
+
+        /// <summary>
+        /// Sets credentials from a refresh token (for auto-login)
+        /// </summary>
+        public void SetCredentialsFromToken(string username, string refreshToken)
+        {
+            CurrentUsername = username;
+            AccessToken = refreshToken;
+            Save();
         }
 
         #region Serialization
