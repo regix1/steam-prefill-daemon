@@ -508,12 +508,105 @@ public sealed class SocketCommandInterface : IDisposable
 
             _progress.OnLog(LogLevel.Info, $"Auto-login credentials received for user: {autoLoginData.Username}");
 
-            // Set credentials in UserAccountStore and start login
+            // Set credentials in UserAccountStore
             var accountStore = UserAccountStore.LoadFromFile();
             accountStore.SetCredentialsFromToken(autoLoginData.Username, autoLoginData.RefreshToken);
 
-            // Trigger login process
-            return await HandleLoginAsync(request, cancellationToken);
+            // For auto-login, we wait for login to complete (no interactive credentials needed)
+            // This is different from regular login which runs in background to allow credential prompts
+            if (_isLoggedIn)
+            {
+                _progress.OnLog(LogLevel.Info, "Already logged in");
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = true,
+                    Message = "Already logged in",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+
+            if (_isLoggingIn)
+            {
+                // Wait for existing login to complete
+                if (_loginTask != null)
+                {
+                    await _loginTask;
+                }
+
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = _isLoggedIn,
+                    Message = _isLoggedIn ? "Login completed" : "Login failed",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+
+            _progress.OnLog(LogLevel.Info, "Starting auto-login with refresh token...");
+            _isLoggingIn = true;
+
+            // Create a login-specific cancellation token
+            _loginCts?.Dispose();
+            _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+
+            // Create API with a static auth provider (refresh token login doesn't need interactive auth)
+            _api = new SteamPrefillApi(_authProvider, _progress);
+
+            try
+            {
+                // Wait for login to complete - auto-login with refresh token should not require credentials
+                await _api.InitializeAsync(_loginCts.Token);
+
+                _isLoggedIn = true;
+                _isLoggingIn = false;
+                _progress.OnLog(LogLevel.Info, "Auto-login successful - commands now available");
+
+                await BroadcastStatusAsync("logged-in", "Authenticated and ready for commands");
+
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = true,
+                    Message = "Auto-login successful",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+            catch (OperationCanceledException)
+            {
+                _progress.OnLog(LogLevel.Info, "Auto-login cancelled");
+                _isLoggingIn = false;
+                CleanupApiInstance();
+                await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = false,
+                    Error = "Auto-login cancelled",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+            catch (Exception ex)
+            {
+                _progress.OnLog(LogLevel.Error, $"Auto-login failed: {ex.Message}");
+                _isLoggingIn = false;
+                CleanupApiInstance();
+                await BroadcastStatusAsync("awaiting-login", $"Auto-login failed: {ex.Message}");
+
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = false,
+                    Error = $"Auto-login failed: {ex.Message}",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+            finally
+            {
+                _loginCts?.Dispose();
+                _loginCts = null;
+            }
         }
         catch (Exception ex)
         {
