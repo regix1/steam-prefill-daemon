@@ -14,7 +14,6 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(CommandResponse))]
 [JsonSerializable(typeof(CredentialChallenge))]
 [JsonSerializable(typeof(EncryptedCredentialResponse))]
-[JsonSerializable(typeof(DaemonStatus))]
 [JsonSerializable(typeof(List<OwnedGame>))]
 [JsonSerializable(typeof(List<uint>))]
 [JsonSerializable(typeof(PrefillResult))]
@@ -55,17 +54,6 @@ public class StatusData
 {
     public bool IsLoggedIn { get; init; }
     public bool IsInitialized { get; init; }
-}
-
-/// <summary>
-/// Daemon status update
-/// </summary>
-public class DaemonStatus
-{
-    public string Type { get; init; } = "status-update";
-    public string Status { get; init; } = string.Empty;
-    public string Message { get; init; } = string.Empty;
-    public DateTime Timestamp { get; init; }
 }
 
 /// <summary>
