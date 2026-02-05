@@ -121,6 +121,7 @@ namespace SteamPrefill.Settings
 
         #region Serialization
 
+        [SuppressMessage("Security", "CA5394:Random is an insecure RNG", Justification = "Security doesn't matter here, as all that is needed is a unique id.")]
         public static UserAccountStore LoadFromFile()
         {
             if (!File.Exists(AppConfig.AccountSettingsStorePath))
@@ -130,6 +131,16 @@ namespace SteamPrefill.Settings
 
             using var fileStream = File.Open(AppConfig.AccountSettingsStorePath, FileMode.Open, FileAccess.Read);
             var userAccountStore = ProtoBuf.Serializer.Deserialize<UserAccountStore>(fileStream);
+
+            // Ensure SessionId is set - protobuf skips constructor so old files may not have it
+            // This prevents LoginID collisions with lancache-manager depot mapping (which uses 16384-65535)
+            if (userAccountStore.SessionId == null)
+            {
+                var random = new Random();
+                userAccountStore.SessionId = (uint)random.Next(0, 16384);
+                userAccountStore.Save(); // Persist so it stays consistent
+            }
+
             return userAccountStore;
         }
 
