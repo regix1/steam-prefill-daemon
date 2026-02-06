@@ -208,6 +208,7 @@ namespace SteamPrefill.Handlers.Steam
                 Password = _userAccountStore.AccessTokenIsValid() ? null : await _userAccountStore.GetPasswordAsync(_ansiConsole),
                 LoginID = _userAccountStore.SessionId
             };
+            _ansiConsole.LogMarkupLine($"Session LoginID set to: {_userAccountStore.SessionId} (0x{_userAccountStore.SessionId:X8})");
         }
 
         #region  Connecting to Steam
@@ -263,6 +264,7 @@ namespace SteamPrefill.Handlers.Steam
             _loggedOnCallbackResult = null;
 
             _logonDetails.AccessToken = _userAccountStore.AccessToken;
+            _ansiConsole.LogMarkupLine($"Logging in with LoginID: {_logonDetails.LoginID} (0x{_logonDetails.LoginID:X8})");
             _steamClient.GetHandler<SteamUser>().LogOn(_logonDetails);
 
             // Busy waiting for the callback to complete, then we can return the callback value synchronously
