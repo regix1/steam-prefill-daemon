@@ -128,9 +128,7 @@ dotnet_diagnostic.rs0030.severity = error
 # The method does not need to use async/await - Introduces annoying 'return' statements for async methods, that hurt code readability.
 dotnet_diagnostic.AsyncFixer01.severity = none
 # AsyncFixer02: CancelAsync instead of Cancel
-dotnet_diagnostic.AsyncFixer02.severity = none
-
-# Spectre.Console analyzer: prefer AnsiConsole over Console
+dotnet_diagnostic.AsyncFixer02.severity = none# Spectre.Console analyzer: prefer AnsiConsole over Console
 dotnet_diagnostic.Spectre1000.severity = none# Visual Studio threading analyzers
 dotnet_diagnostic.VSTHRD002.severity = none
 dotnet_diagnostic.VSTHRD003.severity = none

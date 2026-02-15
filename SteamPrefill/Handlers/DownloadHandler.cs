@@ -27,7 +27,7 @@ namespace SteamPrefill.Handlers
                 PooledConnectionLifetime = TimeSpan.FromMinutes(10),
                 PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
                 // Allow more concurrent connections per server
-                MaxConnectionsPerServer = 100
+                MaxConnectionsPerServer = 512
             };
 
             _client = new HttpClient(handler);
