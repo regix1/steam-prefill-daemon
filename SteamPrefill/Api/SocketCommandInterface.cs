@@ -725,6 +725,7 @@ public sealed class SocketCommandInterface : IDisposable
                 options.PrefillTopGames = top;
             if (bool.TryParse(request.Parameters.GetValueOrDefault("force"), out var force))
                 options.Force = force;
+            AppConfig.MaxConcurrencyOverride = null;
             if (int.TryParse(request.Parameters.GetValueOrDefault("maxConcurrency"), out var maxConcurrency) && maxConcurrency > 0)
                 AppConfig.MaxConcurrencyOverride = maxConcurrency;
 
