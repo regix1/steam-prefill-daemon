@@ -1,4 +1,4 @@
-﻿namespace SteamPrefill.Models
+namespace SteamPrefill.Models
 {
     /// <summary>
     /// Requests a ManifestRequestCode for the specified depot.  Each depot will have a unique code, that gets rotated every 5 minutes.
@@ -12,7 +12,6 @@
     public sealed class ManifestRequestCode
     {
         public ulong Code { get; set; }
-        public DateTime RetrievedAt { get; set; }
 
         public override string ToString()
         {

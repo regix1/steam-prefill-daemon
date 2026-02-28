@@ -1,4 +1,3 @@
-﻿global using AutoMapper;
 global using ByteSizeLib;
 
 global using HexMate;

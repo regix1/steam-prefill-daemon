@@ -62,7 +62,7 @@ namespace SteamPrefill.Handlers.Steam
                 }
             });
 
-            if (retryCount == _maxRetries && AvailableServerEndpoints.Empty())
+            if (retryCount >= _maxRetries && AvailableServerEndpoints.Empty())
             {
                 throw new CdnExhaustionException("Request for Steam CDN servers timed out!");
             }

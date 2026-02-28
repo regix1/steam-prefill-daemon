@@ -1,9 +1,11 @@
-﻿using SteamPrefill.Api;
+using SteamPrefill.Api;
 
 namespace SteamPrefill.Handlers
 {
     public sealed class DownloadHandler : IDisposable
     {
+        private const int MaxDownloadRetries = 2;
+
         private readonly IAnsiConsole _ansiConsole;
         private readonly CdnPool _cdnPool;
         private readonly HttpClient _client;
@@ -65,7 +67,7 @@ namespace SteamPrefill.Handlers
                     forceRecache: downloadArgs.Force, appId: appId, appName: appName, cancellationToken: cancellationToken);
 
                 // Handle any failed requests - always force recache on retry
-                while (failedRequests.Any() && retryCount < 2)
+                while (failedRequests.Any() && retryCount < MaxDownloadRetries)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     retryCount++;
@@ -110,7 +112,7 @@ namespace SteamPrefill.Handlers
             var failedRequests = new ConcurrentBag<QueuedRequest>();
             long bytesDownloaded = 0;
             var startTime = DateTime.UtcNow;
-            var lastProgressReport = DateTime.MinValue;
+            long lastProgressReportTicks = 0;
             var progressThrottle = TimeSpan.FromMilliseconds(500);
             
             // Per-request timeout to prevent indefinite hangs (2 minutes should be plenty for any chunk)
@@ -167,9 +169,11 @@ namespace SteamPrefill.Handlers
                 // Report progress via IPrefillProgress (throttled)
                 var downloaded = Interlocked.Add(ref bytesDownloaded, request.CompressedLength);
                 var now = DateTime.UtcNow;
-                if (now - lastProgressReport >= progressThrottle)
+                var lastTicks = Interlocked.Read(ref lastProgressReportTicks);
+                var lastReport = lastTicks == 0 ? DateTime.MinValue : new DateTime(lastTicks);
+                if (now - lastReport >= progressThrottle)
                 {
-                    lastProgressReport = now;
+                    Interlocked.Exchange(ref lastProgressReportTicks, now.Ticks);
                     var elapsed = now - startTime;
                     var bytesPerSecond = elapsed.TotalSeconds > 0 ? downloaded / elapsed.TotalSeconds : 0;
 

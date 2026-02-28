@@ -1,4 +1,4 @@
-﻿namespace SteamPrefill.Models
+namespace SteamPrefill.Models
 {
     /// <summary>
     /// Represents an application (game, tool, video, server) that can be downloaded from steam
@@ -57,8 +57,6 @@
 
         public bool IsInvalidApp => Type == null;
 
-        public bool IsFreeGame { get; set; }
-
         public int? MinutesPlayed2Weeks { get; set; }
 
         public List<Category> Categories { get; init; }
@@ -91,7 +89,6 @@
             }
 
             // Extended Section
-            IsFreeGame = rootKeyValue["extended"]["isfreeapp"].AsBoolean();
             var listOfDlc = rootKeyValue["extended"]["listofdlc"].Value;
             if (listOfDlc != null)
             {

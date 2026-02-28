@@ -13,7 +13,6 @@ public sealed class SteamPrefillApi : IDisposable
 {
     private readonly ISteamAuthProvider _authProvider;
     private readonly IPrefillProgress _progress;
-    private readonly PrefillApiSession? _session;
 
     private SteamManager? _steamManager;
 
@@ -27,15 +26,12 @@ public sealed class SteamPrefillApi : IDisposable
     /// </summary>
     /// <param name="authProvider">Provider for Steam authentication credentials</param>
     /// <param name="progress">Optional progress reporter for status updates</param>
-    /// <param name="session">Optional session for storing/loading credentials between runs</param>
     public SteamPrefillApi(
         ISteamAuthProvider authProvider,
-        IPrefillProgress? progress = null,
-        PrefillApiSession? session = null)
+        IPrefillProgress? progress = null)
     {
         _authProvider = authProvider ?? throw new ArgumentNullException(nameof(authProvider));
         _progress = progress ?? NullProgress.Instance;
-        _session = session;
     }
 
     /// <summary>
@@ -555,10 +551,6 @@ public class PrefillResult
 {
     public bool Success { get; init; }
     public string? ErrorMessage { get; init; }
-    public int AppsUpdated { get; init; }
-    public int AppsAlreadyUpToDate { get; init; }
-    public int AppsFailed { get; init; }
-    public long TotalBytesTransferred { get; init; }
     public TimeSpan TotalTime { get; init; }
 }
 
@@ -660,12 +652,3 @@ public class OwnedGame
     public DateOnly? ReleaseDate { get; init; }
 }
 
-/// <summary>
-/// Session storage for persisting login state between API instances
-/// </summary>
-public class PrefillApiSession
-{
-    public string? Username { get; set; }
-    public string? AccessToken { get; set; }
-    public uint SessionId { get; set; }
-}

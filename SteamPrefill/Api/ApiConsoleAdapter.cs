@@ -12,7 +12,6 @@ internal sealed class ApiConsoleAdapter : IAnsiConsole
 {
     private readonly ISteamAuthProvider _authProvider;
     private readonly IPrefillProgress _progress;
-    private readonly StringBuilder _outputBuffer = new();
 
     public ApiConsoleAdapter(ISteamAuthProvider authProvider, IPrefillProgress progress)
     {
@@ -31,7 +30,6 @@ internal sealed class ApiConsoleAdapter : IAnsiConsole
 
     public void Clear(bool home)
     {
-        _outputBuffer.Clear();
     }
 
     public void Write(IRenderable renderable)

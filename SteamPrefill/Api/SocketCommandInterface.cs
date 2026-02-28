@@ -979,7 +979,7 @@ public sealed class SocketCommandInterface : IDisposable
         _cts.Dispose();
         _api?.Dispose();
         _authProvider.Dispose();
-        _socketServer.DisposeAsync().AsTask().Wait();
+        _socketServer.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _disposed = true;
 
         GC.SuppressFinalize(this);

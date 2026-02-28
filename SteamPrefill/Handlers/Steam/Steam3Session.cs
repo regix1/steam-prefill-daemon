@@ -5,6 +5,8 @@ namespace SteamPrefill.Handlers.Steam
 {
     public sealed class Steam3Session : IDisposable
     {
+        private const int MaxLoginRetries = 5;
+
         /// <summary>
         /// CellId represents the region that the user is geographically located in, and determines which Connection Managers and CDNs
         /// will be used by SteamPrefill.
@@ -137,7 +139,7 @@ namespace SteamPrefill.Handlers.Steam
                 logonSuccess = HandleLogonResult(logonResult);
 
                 retryCount++;
-                if (retryCount == 5)
+                if (retryCount >= MaxLoginRetries)
                 {
                     throw new SteamLoginException("Unable to login to Steam!  Try again in a few moments...");
                 }

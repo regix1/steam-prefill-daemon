@@ -77,7 +77,7 @@ namespace SteamPrefill
             var args = Environment.GetCommandLineArgs().Skip(1).ToList();
 
             // Enables SteamKit2 debugging as well as SteamPrefill verbose logs
-            if (args.Any(e => e.Contains("--debug")))
+            if (args.Any(e => e == "--debug"))
             {
                 Console.WriteLine($"Using --debug flag. Displaying debug only logging...");
                 Console.WriteLine($"Additional debugging files will be output to {AppConfig.DebugOutputDir}");

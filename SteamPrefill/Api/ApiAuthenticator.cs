@@ -30,11 +30,11 @@ public class ApiAuthenticator : IAuthenticator
             _progress.OnLog(LogLevel.Warning, "Previous Steam Guard code was incorrect. Please try again.");
         }
 
-        _progress.OnLog(LogLevel.Info, "Steam Guard code required (check your email)");
+        _progress.OnLog(LogLevel.Info, "Steam Guard code required (check your Steam mobile app)");
 
         try
         {
-            return await _authProvider.GetSteamGuardCodeAsync("your email");
+            return await _authProvider.GetTwoFactorCodeAsync(default);
         }
         catch (Exception ex)
         {
@@ -88,67 +88,5 @@ public class ApiAuthenticator : IAuthenticator
             return "***" + email[atIndex..];
 
         return email[0] + "***" + email[(atIndex - 1)..];
-    }
-}
-
-/// <summary>
-/// Extended authentication provider that handles the full Steam authentication flow
-/// </summary>
-public class ApiSteamAuth
-{
-    private readonly ISteamAuthProvider _authProvider;
-    private readonly IPrefillProgress _progress;
-
-    public ApiSteamAuth(ISteamAuthProvider authProvider, IPrefillProgress? progress = null)
-    {
-        _authProvider = authProvider;
-        _progress = progress ?? NullProgress.Instance;
-    }
-
-    /// <summary>
-    /// Creates a SteamKit2 IAuthenticator for use with SteamClient.Authentication
-    /// </summary>
-    public IAuthenticator CreateAuthenticator()
-    {
-        return new ApiAuthenticator(_authProvider, _progress);
-    }
-
-    /// <summary>
-    /// Gets username from the auth provider
-    /// </summary>
-    public async Task<string> GetUsernameAsync(CancellationToken cancellationToken = default)
-    {
-        return await _authProvider.GetUsernameAsync(cancellationToken);
-    }
-
-    /// <summary>
-    /// Gets password from the auth provider
-    /// </summary>
-    public async Task<string?> GetPasswordAsync(bool hasValidToken, CancellationToken cancellationToken = default)
-    {
-        if (hasValidToken)
-        {
-            // If we have a valid token, we might not need the password
-            return await _authProvider.GetCachedPasswordAsync(cancellationToken);
-        }
-
-        return await _authProvider.GetPasswordAsync(cancellationToken);
-    }
-
-    /// <summary>
-    /// Gets a new password when the token has expired
-    /// </summary>
-    public async Task<string> GetNewPasswordAsync(string message, CancellationToken cancellationToken = default)
-    {
-        _progress.OnLog(LogLevel.Warning, message);
-        return await _authProvider.GetNewPasswordAsync(message, cancellationToken);
-    }
-
-    /// <summary>
-    /// Gets 2FA code from mobile authenticator
-    /// </summary>
-    public async Task<string> GetTwoFactorCodeAsync(CancellationToken cancellationToken = default)
-    {
-        return await _authProvider.GetTwoFactorCodeAsync(cancellationToken);
     }
 }

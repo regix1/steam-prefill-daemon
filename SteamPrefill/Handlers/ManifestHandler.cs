@@ -1,4 +1,4 @@
-﻿namespace SteamPrefill.Handlers
+namespace SteamPrefill.Handlers
 {
     /// <summary>
     /// Responsible for downloading manifests from Steam, as well as loading previously saved manifests from disk.
@@ -79,7 +79,7 @@
                     attempts++;
                     await Task.Delay(500 * attempts);
 
-                    if (attempts == MaxRetries)
+                    if (attempts >= MaxRetries)
                     {
                         throw new ManifestException("Unable to download manifests!");
                     }
@@ -151,8 +151,7 @@
 
             return new ManifestRequestCode
             {
-                Code = manifestRequestCode,
-                RetrievedAt = DateTime.Now
+                Code = manifestRequestCode
             };
         }
 
