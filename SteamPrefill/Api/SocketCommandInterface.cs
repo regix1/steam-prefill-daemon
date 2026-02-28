@@ -680,23 +680,39 @@ public sealed class SocketCommandInterface : IDisposable
             };
         }
 
-        var appIds = JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListUInt32);
-
-        // Lancache-manager sends Steam app IDs as strings; support both string and numeric arrays.
-        if ((appIds == null || appIds.Count == 0) &&
-            JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListString) is { Count: > 0 } stringAppIds)
+        // Lancache-manager may send Steam app IDs as numbers or strings.
+        // Parse a mixed array safely so string payloads don't throw before fallback logic can run.
+        var appIds = new List<uint>();
+        using (var appIdsDoc = JsonDocument.Parse(appIdsJson))
         {
-            appIds = new List<uint>();
-            foreach (var appId in stringAppIds)
+            if (appIdsDoc.RootElement.ValueKind != JsonValueKind.Array)
             {
-                if (uint.TryParse(appId, out var parsedAppId))
+                return new CommandResponse
                 {
-                    appIds.Add(parsedAppId);
+                    Id = request.Id,
+                    Success = false,
+                    Error = "appIds must be a JSON array",
+                    CompletedAt = DateTime.UtcNow
+                };
+            }
+
+            foreach (var element in appIdsDoc.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind == JsonValueKind.Number && element.TryGetUInt32(out var numericAppId))
+                {
+                    appIds.Add(numericAppId);
+                    continue;
+                }
+
+                if (element.ValueKind == JsonValueKind.String &&
+                    uint.TryParse(element.GetString(), out var stringAppId))
+                {
+                    appIds.Add(stringAppId);
                 }
             }
         }
 
-        if (appIds != null && appIds.Count > 0)
+        if (appIds.Count > 0)
         {
             _api!.SetSelectedApps(appIds);
             _progress.OnLog(LogLevel.Info, $"Set {appIds.Count} selected apps");
