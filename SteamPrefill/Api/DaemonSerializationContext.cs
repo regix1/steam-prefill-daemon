@@ -16,6 +16,7 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(EncryptedCredentialResponse))]
 [JsonSerializable(typeof(List<OwnedGame>))]
 [JsonSerializable(typeof(List<uint>))]
+[JsonSerializable(typeof(List<string>))]
 [JsonSerializable(typeof(PrefillResult))]
 [JsonSerializable(typeof(StatusData))]
 [JsonSerializable(typeof(PrefillProgressUpdate))]

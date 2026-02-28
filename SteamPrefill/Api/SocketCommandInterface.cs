@@ -681,10 +681,35 @@ public sealed class SocketCommandInterface : IDisposable
         }
 
         var appIds = JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListUInt32);
+
+        // Lancache-manager sends Steam app IDs as strings; support both string and numeric arrays.
+        if ((appIds == null || appIds.Count == 0) &&
+            JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListString) is { Count: > 0 } stringAppIds)
+        {
+            appIds = new List<uint>();
+            foreach (var appId in stringAppIds)
+            {
+                if (uint.TryParse(appId, out var parsedAppId))
+                {
+                    appIds.Add(parsedAppId);
+                }
+            }
+        }
+
         if (appIds != null && appIds.Count > 0)
         {
             _api!.SetSelectedApps(appIds);
             _progress.OnLog(LogLevel.Info, $"Set {appIds.Count} selected apps");
+        }
+        else
+        {
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = "No valid Steam app IDs provided",
+                CompletedAt = DateTime.UtcNow
+            };
         }
 
         return new CommandResponse
