@@ -331,8 +331,8 @@ public sealed class SocketServer : IAsyncDisposable
                     };
                 }
 
-                // Send response
-                await SendMessageAsync(client, response, DaemonSerializationContext.Default.CommandResponse, token);
+                // Use reflection-based JSON for CommandResponse because Data is object?
+                await SendMessageAsync(client, response, CommandResponseJsonOptions, token);
             }
         }
         catch (OperationCanceledException)
@@ -441,12 +441,34 @@ public sealed class SocketServer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Reflection-based JSON options for CommandResponse serialization.
+    /// Source-generated JSON cannot reliably serialize the polymorphic object? Data property.
+    /// </summary>
+    private static readonly JsonSerializerOptions CommandResponseJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
     private async Task SendMessageAsync<T>(ConnectedClient client, T message, System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken)
+    {
+        var json = JsonSerializer.Serialize(message, typeInfo);
+        await SendRawJsonAsync(client, json, cancellationToken);
+    }
+
+    private async Task SendMessageAsync<T>(ConnectedClient client, T message, JsonSerializerOptions options, CancellationToken cancellationToken)
+    {
+        var json = JsonSerializer.Serialize(message, options);
+        await SendRawJsonAsync(client, json, cancellationToken);
+    }
+
+    private async Task SendRawJsonAsync(ConnectedClient client, string json, CancellationToken cancellationToken)
     {
         await client.SendLock.WaitAsync(cancellationToken);
         try
         {
-            var json = JsonSerializer.Serialize(message, typeInfo);
             var bytes = Encoding.UTF8.GetBytes(json);
 
             using var stream = new NetworkStream(client.Socket, ownsSocket: false);
