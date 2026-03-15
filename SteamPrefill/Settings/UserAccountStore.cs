@@ -129,8 +129,28 @@ namespace SteamPrefill.Settings
                 return new UserAccountStore();
             }
 
-            using var fileStream = File.Open(AppConfig.AccountSettingsStorePath, FileMode.Open, FileAccess.Read);
-            var userAccountStore = ProtoBuf.Serializer.Deserialize<UserAccountStore>(fileStream);
+            // Read file content to determine if it's encrypted or legacy plaintext protobuf
+            var fileContent = File.ReadAllText(AppConfig.AccountSettingsStorePath);
+
+            UserAccountStore userAccountStore;
+            bool needsMigration = false;
+
+            if (TokenStorageEncryption.IsEncrypted(fileContent))
+            {
+                // Encrypted format: decrypt -> Base64 decode -> protobuf deserialize
+                var decryptedBase64 = TokenStorageEncryption.Decrypt(fileContent);
+                var protobufBytes = System.Convert.FromBase64String(decryptedBase64);
+                using var memStream = new MemoryStream(protobufBytes);
+                userAccountStore = ProtoBuf.Serializer.Deserialize<UserAccountStore>(memStream);
+            }
+            else
+            {
+                // Legacy unencrypted protobuf binary — deserialize directly
+                var fileBytes = File.ReadAllBytes(AppConfig.AccountSettingsStorePath);
+                using var memStream = new MemoryStream(fileBytes);
+                userAccountStore = ProtoBuf.Serializer.Deserialize<UserAccountStore>(memStream);
+                needsMigration = true;
+            }
 
             // Ensure SessionId is set - protobuf skips constructor so old files may not have it
             // This prevents LoginID collisions with lancache-manager depot mapping (which uses 16384-65535)
@@ -138,7 +158,13 @@ namespace SteamPrefill.Settings
             {
                 var random = new Random();
                 userAccountStore.SessionId = (uint)random.Next(0, 16384);
-                userAccountStore.Save(); // Persist so it stays consistent
+                needsMigration = true;
+            }
+
+            if (needsMigration)
+            {
+                AnsiConsole.MarkupLine("Migrating account credentials to encrypted storage...");
+                userAccountStore.Save();
             }
 
             return userAccountStore;
@@ -146,8 +172,14 @@ namespace SteamPrefill.Settings
 
         public void Save()
         {
-            using var fs = File.Open(AppConfig.AccountSettingsStorePath, FileMode.Create, FileAccess.Write);
-            ProtoBuf.Serializer.Serialize(fs, this);
+            // Protobuf serialize -> byte[] -> Base64 string -> encrypt -> write to file
+            using var memStream = new MemoryStream();
+            ProtoBuf.Serializer.Serialize(memStream, this);
+            var base64 = System.Convert.ToBase64String(memStream.ToArray());
+            var encrypted = TokenStorageEncryption.Encrypt(base64);
+
+            File.WriteAllText(AppConfig.AccountSettingsStorePath, encrypted);
+            TokenStorageEncryption.SetRestrictivePermissions(AppConfig.AccountSettingsStorePath);
         }
 
         #endregion
