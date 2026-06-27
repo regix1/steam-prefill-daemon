@@ -95,6 +95,28 @@ namespace SteamPrefill.Settings
             return tokenHasExpired;
         }
 
+        /// <summary>
+        /// Gets the UTC expiry (<c>ValidTo</c>) of the current refresh-token JWT, or null if no token is stored
+        /// or it cannot be parsed.  Reuses the same JWT read as <see cref="AccessTokenIsValid"/>; no new crypto.
+        /// </summary>
+        public DateTime? GetAccessTokenExpiryUtc()
+        {
+            if (string.IsNullOrEmpty(AccessToken))
+            {
+                return null;
+            }
+
+            try
+            {
+                var parsedToken = new JwtSecurityToken(AccessToken);
+                return DateTime.SpecifyKind(parsedToken.ValidTo, DateTimeKind.Utc);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         private async Task<string> PromptForUsernameAsync(IAnsiConsole ansiConsole)
         {
             return await Task.Run(() =>

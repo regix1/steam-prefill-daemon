@@ -41,6 +41,25 @@ namespace SteamPrefill
                     cts.Cancel();
                 };
 
+                // Optional self-shutdown timer. When PREFILL_MAX_LIFETIME_SECONDS is set and > 0, the daemon
+                // cancels its host token after that many seconds, triggering a clean shutdown (process exits 0,
+                // container stops). Unset/0/invalid => no timer, behaves exactly as before.
+                Timer? lifetimeTimer = null;
+                var maxLifetimeEnv = Environment.GetEnvironmentVariable("PREFILL_MAX_LIFETIME_SECONDS");
+                if (int.TryParse(maxLifetimeEnv, out var maxLifetimeSeconds) && maxLifetimeSeconds > 0)
+                {
+                    var lifetime = TimeSpan.FromSeconds(maxLifetimeSeconds);
+                    Console.WriteLine($"Max lifetime set to {maxLifetimeSeconds}s (PREFILL_MAX_LIFETIME_SECONDS). Daemon will self-shutdown when it elapses.");
+                    lifetimeTimer = new Timer(_ =>
+                    {
+                        Console.WriteLine($"\nMax lifetime of {maxLifetimeSeconds}s elapsed. Performing clean shutdown...");
+                        // ReSharper disable once AccessToDisposedClosure
+                        try { cts.Cancel(); } catch (ObjectDisposedException) { }
+                    }, null, lifetime, Timeout.InfiniteTimeSpan);
+                }
+
+                using var _lifetimeTimer = lifetimeTimer;
+
                 if (useTcp)
                 {
                     await DaemonMode.RunTcpAsync(tcpPort, cts.Token);

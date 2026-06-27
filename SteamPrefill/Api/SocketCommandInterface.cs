@@ -623,6 +623,25 @@ public sealed class SocketCommandInterface : IDisposable
 
     private CommandResponse HandleStatus(CommandRequest request)
     {
+        DateTime? authExpiryUtc = null;
+        string? username = null;
+
+        // Surface the refresh-token expiry + username so a manager can show a login countdown.
+        // Only meaningful when logged in; reuses the existing JWT ValidTo read (no new crypto).
+        if (_isLoggedIn)
+        {
+            try
+            {
+                var accountStore = UserAccountStore.LoadFromFile();
+                authExpiryUtc = accountStore.GetAccessTokenExpiryUtc();
+                username = string.IsNullOrEmpty(accountStore.CurrentUsername) ? null : accountStore.CurrentUsername;
+            }
+            catch (Exception ex)
+            {
+                _progress.OnLog(LogLevel.Warning, $"Could not read auth expiry for status: {ex.Message}");
+            }
+        }
+
         return new CommandResponse
         {
             Id = request.Id,
@@ -630,7 +649,9 @@ public sealed class SocketCommandInterface : IDisposable
             Data = new StatusData
             {
                 IsLoggedIn = _isLoggedIn,
-                IsInitialized = _api?.IsInitialized ?? false
+                IsInitialized = _api?.IsInitialized ?? false,
+                AuthExpiryUtc = authExpiryUtc,
+                Username = username
             },
             CompletedAt = DateTime.UtcNow
         };

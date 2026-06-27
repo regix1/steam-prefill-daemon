@@ -55,6 +55,17 @@ public class StatusData
 {
     public bool IsLoggedIn { get; init; }
     public bool IsInitialized { get; init; }
+
+    /// <summary>
+    /// UTC expiry of the stored refresh-token JWT (ISO-8601), or null when not logged in / no token.
+    /// Lets a manager show a login-expiry countdown.
+    /// </summary>
+    public DateTime? AuthExpiryUtc { get; init; }
+
+    /// <summary>
+    /// The logged-in Steam account username, or null when not available.
+    /// </summary>
+    public string? Username { get; init; }
 }
 
 /// <summary>
