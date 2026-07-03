@@ -1,4 +1,5 @@
 ﻿using System.IdentityModel.Tokens.Jwt;
+using System.Security.Cryptography;
 using SteamPrefill.Api;
 
 namespace SteamPrefill.Settings
@@ -160,7 +161,28 @@ namespace SteamPrefill.Settings
             if (TokenStorageEncryption.IsEncrypted(fileContent))
             {
                 // Encrypted format: decrypt -> Base64 decode -> protobuf deserialize
-                var decryptedBase64 = TokenStorageEncryption.Decrypt(fileContent);
+                string decryptedBase64;
+                try
+                {
+                    decryptedBase64 = TokenStorageEncryption.Decrypt(fileContent);
+                }
+                catch (CryptographicException)
+                {
+                    // Store was encrypted under a key this container cannot reproduce
+                    // (pre-key-file build, or lost key file). Discard and start fresh -
+                    // the user must log in again once; afterwards the key travels with the volume.
+                    AnsiConsole.MarkupLine("Stored credentials could not be decrypted, discarded stale token store, please log in again");
+                    try
+                    {
+                        File.Delete(AppConfig.AccountSettingsStorePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Deletion is best-effort; a fresh Save() overwrites it anyway.
+                        AnsiConsole.MarkupLine($"Warning - failed to delete stale token store : {ex.Message}");
+                    }
+                    return new UserAccountStore();
+                }
                 var protobufBytes = System.Convert.FromBase64String(decryptedBase64);
                 using var memStream = new MemoryStream(protobufBytes);
                 userAccountStore = ProtoBuf.Serializer.Deserialize<UserAccountStore>(memStream);
