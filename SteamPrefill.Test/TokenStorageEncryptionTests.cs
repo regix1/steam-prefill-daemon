@@ -10,6 +10,7 @@ namespace SteamPrefill.Test
     /// where a key derived from the container hostname made the persistent volume's stored login
     /// undecryptable by any successor container, hard-crashing every login attempt.
     /// </summary>
+    [Collection("SteamAccountFile")]
     public sealed class TokenStorageEncryptionTests : IDisposable
     {
         private readonly string _accountFilePath;

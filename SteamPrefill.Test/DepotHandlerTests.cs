@@ -10,6 +10,7 @@ using OperatingSystem = SteamPrefill.Models.Enums.OperatingSystem;
 
 namespace SteamPrefill.Test
 {
+    [Collection("SteamAccountFile")]
     public sealed class DepotHandlerTests
     {
         private readonly DepotHandler _depotHandler;

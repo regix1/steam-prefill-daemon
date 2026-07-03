@@ -1,6 +1,7 @@
 #nullable enable
 
 using System.Text.Json;
+using System.Threading;
 
 namespace SteamPrefill.Api;
 
@@ -29,6 +30,17 @@ public sealed class SocketCommandInterface : IDisposable
     private bool _isLoggingIn;
     private bool _isPrefilling;
     private bool _disposed;
+
+    // Bumped by logout (and cancel-login) so a login task that is still unwinding (or already
+    // orphaned by a cancellation that never got observed) can tell it has been superseded and must
+    // not resurrect _isLoggedIn/_api for whatever now owns them. Written from the socket command
+    // loop, read from thread-pool login-task continuations after an await - always accessed via
+    // Interlocked, never a plain read/increment.
+    private long _loginGeneration;
+
+    // How long logout waits for an in-flight login task to unwind before force-cleaning up
+    // anyway. Logout must never hang on a stuck login.
+    private static readonly TimeSpan LogoutLoginTaskTimeout = TimeSpan.FromSeconds(8);
 
     // Auto-login challenge storage
     private readonly Dictionary<string, AutoLoginChallengeData> _pendingAutoLoginChallenges = new();
@@ -182,9 +194,15 @@ public sealed class SocketCommandInterface : IDisposable
         // Create a login-specific cancellation token
         _loginCts?.Dispose();
         _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var loginCts = _loginCts;
+
+        // Captured now: if logout runs before this task settles, it bumps _loginGeneration so a
+        // late-completing (superseded) task can tell and must not touch shared login state.
+        var loginGeneration = Interlocked.Increment(ref _loginGeneration);
 
         // Create API with socket auth provider
-        _api = new SteamPrefillApi(_authProvider, _progress);
+        var api = new SteamPrefillApi(_authProvider, _progress);
+        _api = api;
 
         // Run login in background task so the command loop isn't blocked
         // This allows provide-credential commands to be processed while login is waiting
@@ -193,7 +211,14 @@ public sealed class SocketCommandInterface : IDisposable
             try
             {
                 // This will trigger credential challenges via socket
-                await _api.InitializeAsync(_loginCts.Token);
+                await api.InitializeAsync(loginCts.Token);
+
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    _progress.OnLog(LogLevel.Info, "Login superseded by logout - discarding orphaned session");
+                    DisposeOrphanedApi(api);
+                    return;
+                }
 
                 _isLoggedIn = true;
                 _isLoggingIn = false;
@@ -204,6 +229,11 @@ public sealed class SocketCommandInterface : IDisposable
             catch (OperationCanceledException)
             {
                 _progress.OnLog(LogLevel.Info, "Login cancelled");
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    DisposeOrphanedApi(api);
+                    return;
+                }
                 _isLoggingIn = false;
                 CleanupApiInstance();
                 await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
@@ -211,16 +241,24 @@ public sealed class SocketCommandInterface : IDisposable
             catch (Exception ex)
             {
                 _progress.OnLog(LogLevel.Error, $"Login failed: {ex.Message}");
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    DisposeOrphanedApi(api);
+                    return;
+                }
                 _isLoggingIn = false;
                 CleanupApiInstance();
                 await BroadcastStatusAsync("awaiting-login", $"Login failed: {ex.Message}");
             }
             finally
             {
-                _loginCts?.Dispose();
-                _loginCts = null;
+                if (loginGeneration == Interlocked.Read(ref _loginGeneration))
+                {
+                    _loginCts?.Dispose();
+                    _loginCts = null;
+                }
             }
-        }, _loginCts.Token);
+        }, loginCts.Token);
 
         // Return immediately - login process continues in background
         return Task.FromResult(new CommandResponse
@@ -234,6 +272,10 @@ public sealed class SocketCommandInterface : IDisposable
 
     private async Task<CommandResponse> HandleLogoutAsync(CommandRequest request)
     {
+        // Bump the generation so any login task still unwinding (or one that never observes
+        // the cancellation below) cannot resurrect _isLoggedIn/_api once it finally settles.
+        Interlocked.Increment(ref _loginGeneration);
+
         // Logout while a login is in progress: cancel it the same way cancel-login does, then
         // fall through to the same cleanup + credential wipe below (cancel-then-forget).
         if (_isLoggingIn)
@@ -246,6 +288,15 @@ public sealed class SocketCommandInterface : IDisposable
                     await _loginCts.CancelAsync();
             }
             catch { /* ignore if already disposed */ }
+
+            // Bounded wait for the login task to unwind. A stuck login must never hang logout -
+            // if it doesn't finish in time we force-cleanup below anyway; the generation bump
+            // above keeps a late finish from resurrecting state.
+            var loginTask = _loginTask;
+            if (loginTask != null)
+            {
+                await Task.WhenAny(loginTask, Task.Delay(LogoutLoginTaskTimeout));
+            }
         }
 
         CleanupApiInstance();
@@ -278,6 +329,11 @@ public sealed class SocketCommandInterface : IDisposable
     private async Task<CommandResponse> HandleCancelLoginAsync(CommandRequest request)
     {
         _progress.OnLog(LogLevel.Info, "Cancelling login...");
+
+        // Bump the generation first, same as logout: a login task that races past this
+        // cancellation (or whose exception is swallowed) must not be able to resurrect
+        // _isLoggedIn/_api once it finally settles, even though this handler isn't a logout.
+        Interlocked.Increment(ref _loginGeneration);
 
         // Cancel any pending credential requests
         _authProvider.CancelPendingRequest();
@@ -578,14 +634,30 @@ public sealed class SocketCommandInterface : IDisposable
             // Create a login-specific cancellation token
             _loginCts?.Dispose();
             _loginCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, cancellationToken);
+            var loginCts = _loginCts;
+            var loginGeneration = Interlocked.Increment(ref _loginGeneration);
 
             // Create API with a static auth provider (refresh token login doesn't need interactive auth)
-            _api = new SteamPrefillApi(_authProvider, _progress);
+            var api = new SteamPrefillApi(_authProvider, _progress);
+            _api = api;
 
             try
             {
                 // Wait for login to complete - auto-login with refresh token should not require credentials
-                await _api.InitializeAsync(_loginCts.Token);
+                await api.InitializeAsync(loginCts.Token);
+
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    _progress.OnLog(LogLevel.Info, "Auto-login superseded by logout - discarding orphaned session");
+                    DisposeOrphanedApi(api);
+                    return new CommandResponse
+                    {
+                        Id = request.Id,
+                        Success = false,
+                        Error = "Auto-login superseded by logout",
+                        CompletedAt = DateTime.UtcNow
+                    };
+                }
 
                 _isLoggedIn = true;
                 _isLoggingIn = false;
@@ -604,9 +676,16 @@ public sealed class SocketCommandInterface : IDisposable
             catch (OperationCanceledException)
             {
                 _progress.OnLog(LogLevel.Info, "Auto-login cancelled");
-                _isLoggingIn = false;
-                CleanupApiInstance();
-                await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    DisposeOrphanedApi(api);
+                }
+                else
+                {
+                    _isLoggingIn = false;
+                    CleanupApiInstance();
+                    await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
+                }
 
                 return new CommandResponse
                 {
@@ -619,9 +698,16 @@ public sealed class SocketCommandInterface : IDisposable
             catch (Exception ex)
             {
                 _progress.OnLog(LogLevel.Error, $"Auto-login failed: {ex.Message}");
-                _isLoggingIn = false;
-                CleanupApiInstance();
-                await BroadcastStatusAsync("awaiting-login", $"Auto-login failed: {ex.Message}");
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    DisposeOrphanedApi(api);
+                }
+                else
+                {
+                    _isLoggingIn = false;
+                    CleanupApiInstance();
+                    await BroadcastStatusAsync("awaiting-login", $"Auto-login failed: {ex.Message}");
+                }
 
                 return new CommandResponse
                 {
@@ -633,8 +719,11 @@ public sealed class SocketCommandInterface : IDisposable
             }
             finally
             {
-                _loginCts?.Dispose();
-                _loginCts = null;
+                if (loginGeneration == Interlocked.Read(ref _loginGeneration))
+                {
+                    _loginCts?.Dispose();
+                    _loginCts = null;
+                }
             }
         }
         catch (Exception ex)
@@ -1060,6 +1149,20 @@ public sealed class SocketCommandInterface : IDisposable
         _api = null;
         _isLoggedIn = false;
         _isLoggingIn = false;
+    }
+
+    /// <summary>
+    /// Tears down an api instance that lost the generation race (superseded by a logout) without
+    /// touching any of the shared fields, since a newer login/logout cycle may already own them.
+    /// </summary>
+    private static void DisposeOrphanedApi(SteamPrefillApi api)
+    {
+        try
+        {
+            api.Shutdown();
+            api.Dispose();
+        }
+        catch { /* ignore cleanup errors for a discarded orphan */ }
     }
 
     private async Task BroadcastStatusAsync(string status, string message)

@@ -348,11 +348,14 @@ public sealed class SteamPrefillApi : IDisposable
     }
 
     /// <summary>
-    /// Disconnects from Steam
+    /// Disconnects from Steam. Unconditional on _isInitialized: _steamManager (and its
+    /// Steam3Session) is constructed synchronously before InitializeAsync's login handshake
+    /// completes, so a logout racing a mid-login task must still be able to tear down the live
+    /// client even though _isInitialized never flipped true.
     /// </summary>
     public void Shutdown()
     {
-        if (_steamManager != null && _isInitialized)
+        if (_steamManager != null)
         {
             _steamManager.Shutdown();
             _isInitialized = false;
