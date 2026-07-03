@@ -112,7 +112,7 @@ public sealed class SocketCommandInterface : IDisposable
             return request.Type.ToLowerInvariant() switch
             {
                 "login" => await HandleLoginAsync(request, cancellationToken),
-                "logout" => HandleLogout(request),
+                "logout" => await HandleLogoutAsync(request),
                 "cancel-login" => await HandleCancelLoginAsync(request),
                 "cancel-prefill" => HandleCancelPrefill(request),
                 "provide-credential" => HandleProvideCredential(request),
@@ -232,9 +232,38 @@ public sealed class SocketCommandInterface : IDisposable
         });
     }
 
-    private CommandResponse HandleLogout(CommandRequest request)
+    private async Task<CommandResponse> HandleLogoutAsync(CommandRequest request)
     {
+        // Logout while a login is in progress: cancel it the same way cancel-login does, then
+        // fall through to the same cleanup + credential wipe below (cancel-then-forget).
+        if (_isLoggingIn)
+        {
+            _authProvider.CancelPendingRequest();
+
+            try
+            {
+                if (_loginCts != null)
+                    await _loginCts.CancelAsync();
+            }
+            catch { /* ignore if already disposed */ }
+        }
+
         CleanupApiInstance();
+
+        // Wipe the persisted account file so the refresh token does not linger on disk after logout.
+        try
+        {
+            if (File.Exists(AppConfig.AccountSettingsStorePath))
+            {
+                File.Delete(AppConfig.AccountSettingsStorePath);
+                _progress.OnLog(LogLevel.Info, "Account credentials removed from disk");
+            }
+        }
+        catch (Exception ex)
+        {
+            _progress.OnLog(LogLevel.Warning, $"Could not remove account credentials from disk: {ex.Message}");
+        }
+
         _progress.OnLog(LogLevel.Info, "Logged out");
 
         return new CommandResponse

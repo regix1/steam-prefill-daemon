@@ -122,5 +122,28 @@ namespace SteamPrefill.Test
             Assert.Null(result.CurrentUsername);
             Assert.False(File.Exists(_accountFilePath));
         }
+
+        /// <summary>
+        /// SocketCommandInterface has no test seam (it owns a live SocketServer/SteamPrefillApi and can't
+        /// be constructed headlessly), so this covers the underlying guarantee HandleLogoutAsync relies
+        /// on: deleting the account file makes a subsequent LoadFromFile() return a fresh, credential-less
+        /// store - i.e. "logout" really forgets the account rather than just tearing down the live API
+        /// instance.
+        /// </summary>
+        [Fact]
+        public void DeletingAccountFile_ThenLoadFromFile_ReturnsFreshStore_WithNoStoredCredentials()
+        {
+            var original = UserAccountStore.LoadFromFile();
+            original.SetCredentialsFromToken("someuser", "some-refresh-token");
+            Assert.True(File.Exists(_accountFilePath));
+
+            // This is exactly what HandleLogoutAsync does on logout: best-effort delete the persisted store.
+            File.Delete(_accountFilePath);
+
+            var reloaded = UserAccountStore.LoadFromFile();
+
+            Assert.Null(reloaded.CurrentUsername);
+            Assert.False(File.Exists(_accountFilePath));
+        }
     }
 }
