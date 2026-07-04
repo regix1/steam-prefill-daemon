@@ -239,6 +239,24 @@ public sealed class SocketCommandInterface : IDisposable
                 CleanupApiInstance();
                 await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
             }
+            catch (InvalidOperationException ex) when (ex.Message.Contains("AcceptDeviceConfirmation returned false", StringComparison.Ordinal))
+            {
+                // Session 20260703-221336-2070027597 (RC1): AcceptDeviceConfirmationAsync now returns
+                // false so SteamKit falls back to 2FA / Steam Guard code entry. When the account offers
+                // ONLY mobile-app confirmation with no code fallback, SteamKit throws this instead of
+                // emitting a code challenge. Surface a clear cause through the same awaiting-login
+                // failure plumbing rather than SteamKit's cryptic internal wording.
+                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
+                {
+                    DisposeOrphanedApi(api);
+                    return;
+                }
+                _isLoggingIn = false;
+                CleanupApiInstance();
+                const string deviceOnlyMessage = "This Steam account only allows sign-in approval through the Steam Mobile App, which this login method does not support. Enable the Steam Guard Mobile Authenticator (2FA code) or email Steam Guard on the account, then try again.";
+                _progress.OnLog(LogLevel.Error, deviceOnlyMessage);
+                await BroadcastStatusAsync("awaiting-login", $"Login failed: {deviceOnlyMessage}");
+            }
             catch (Exception ex)
             {
                 _progress.OnLog(LogLevel.Error, $"Login failed: {ex.Message}");
@@ -302,19 +320,12 @@ public sealed class SocketCommandInterface : IDisposable
 
         CleanupApiInstance();
 
-        // Wipe the persisted account file so the refresh token does not linger on disk after logout.
-        try
-        {
-            if (File.Exists(AppConfig.AccountSettingsStorePath))
-            {
-                File.Delete(AppConfig.AccountSettingsStorePath);
-                _progress.OnLog(LogLevel.Info, "Account credentials removed from disk");
-            }
-        }
-        catch (Exception ex)
-        {
-            _progress.OnLog(LogLevel.Warning, $"Could not remove account credentials from disk: {ex.Message}");
-        }
+        // Wipe the persisted account file AND its storage.key so the refresh token cannot linger
+        // (or be silently re-decrypted by a later login re-using the same key) after logout.
+        // Session 20260703-221336-2070027597 (RC6): logout previously deleted only the account
+        // file, leaving storage.key on disk - any subsequent login re-persisted a token the SAME
+        // key could still decrypt, making the erase-on-stop/clear-logins policy incomplete.
+        EraseAccountStore(_progress);
 
         _progress.OnLog(LogLevel.Info, "Logged out");
 
@@ -418,7 +429,21 @@ public sealed class SocketCommandInterface : IDisposable
             Tag = tag
         };
 
-        _authProvider.ReceiveCredential(response);
+        // Session 20260703-221336-2070027597 (RC4): only report success when the credential actually
+        // matched a live pending challenge. A dropped credential (no pending challenge, or a stale
+        // challenge id from a replaced login session) must surface as a failure so the manager can
+        // detect the desync instead of celebrating a credential the daemon silently discarded.
+        var accepted = _authProvider.ReceiveCredential(response);
+        if (!accepted)
+        {
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = "No matching login challenge is pending for this credential",
+                CompletedAt = DateTime.UtcNow
+            };
+        }
 
         return new CommandResponse
         {
@@ -1155,6 +1180,12 @@ public sealed class SocketCommandInterface : IDisposable
     /// <summary>
     /// Tears down an api instance that lost the generation race (superseded by a logout) without
     /// touching any of the shared fields, since a newer login/logout cycle may already own them.
+    /// Also erases the account store: session 20260703-221336-2070027597 (RC6) confirmed that
+    /// <see cref="Handlers.Steam.Steam3Session.GetAccessTokenAsync"/> calls <c>_userAccountStore.Save()</c>
+    /// as soon as the auth poll returns, BEFORE this generation check runs, so an orphaned login that
+    /// raced past a logout can still persist a fresh token to disk. Erasing here closes that
+    /// resurrection window; the erase is idempotent (both files may already be gone from the logout
+    /// that superseded this task).
     /// </summary>
     private static void DisposeOrphanedApi(SteamPrefillApi api)
     {
@@ -1164,6 +1195,37 @@ public sealed class SocketCommandInterface : IDisposable
             api.Dispose();
         }
         catch { /* ignore cleanup errors for a discarded orphan */ }
+
+        EraseAccountStore();
+    }
+
+    /// <summary>
+    /// Deletes the persisted account file and its storage.key. Shared by <see cref="HandleLogoutAsync"/>
+    /// (explicit logout) and <see cref="DisposeOrphanedApi"/> (superseded-login resurrection guard) -
+    /// session 20260703-221336-2070027597 (RC6). Best-effort: both files may already be absent.
+    /// TokenStorageEncryption self-heals a missing key by regenerating it and forcing a fresh login,
+    /// so removing the key here is safe.
+    /// </summary>
+    private static void EraseAccountStore(IPrefillProgress? progress = null)
+    {
+        TryDeleteAccountStoreFile(AppConfig.AccountSettingsStorePath, "Account credentials", progress);
+        TryDeleteAccountStoreFile(TokenStorageEncryption.KeyFilePath, "Storage key", progress);
+    }
+
+    private static void TryDeleteAccountStoreFile(string path, string label, IPrefillProgress? progress)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+                progress?.OnLog(LogLevel.Info, $"{label} removed from disk");
+            }
+        }
+        catch (Exception ex)
+        {
+            progress?.OnLog(LogLevel.Warning, $"Could not remove {label.ToLowerInvariant()} from disk: {ex.Message}");
+        }
     }
 
     private async Task BroadcastStatusAsync(string status, string message)

@@ -34,24 +34,18 @@ public sealed class SecureSteamAuthenticator : IAuthenticator
     }
 
     /// <summary>
-    /// Called when device confirmation is required (Steam Mobile App approval)
-    /// This is when Steam shows "Use the Steam Mobile App to confirm your sign in"
+    /// Called when Steam offers mobile-app "device confirmation" (approve the sign-in inside the
+    /// Steam Mobile App) as the top-priority confirmation type.
+    ///
+    /// Session 20260703-221336-2070027597 (RC1): returns <c>false</c> so SteamKit2 falls back to the
+    /// next allowed confirmation type (TOTP authenticator code or email Steam Guard) and calls
+    /// <see cref="GetDeviceCodeAsync"/>/<see cref="GetEmailCodeAsync"/>, which emit the code-entry
+    /// challenge the client renders as the 2FA / Steam Guard modal. The previous unconditional
+    /// <c>true</c> (including its catch path) made SteamKit poll for mobile approval and never call the
+    /// code getters, so the modal never appeared for mobile-authenticator accounts. Accounts that offer
+    /// ONLY mobile-app confirmation with no code fallback cause SteamKit to throw
+    /// <see cref="InvalidOperationException"/>; that edge is surfaced as a clear login failure by the
+    /// login task in SocketCommandInterface, not swallowed here.
     /// </summary>
-    public async Task<bool> AcceptDeviceConfirmationAsync()
-    {
-        // Notify the user that they need to approve on their mobile app
-        // We use a special credential type to signal this to the client
-        try
-        {
-            // Request a "device-confirmation" credential which signals the client
-            // to display the mobile app approval message
-            await _authProvider.GetDeviceConfirmationAsync();
-            return true;
-        }
-        catch
-        {
-            // If anything fails, still return true to let SteamKit continue polling
-            return true;
-        }
-    }
+    public Task<bool> AcceptDeviceConfirmationAsync() => Task.FromResult(false);
 }

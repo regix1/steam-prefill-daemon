@@ -38,23 +38,30 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
 
     /// <summary>
     /// Called by the SocketCommandInterface when a provide-credential command is received.
+    ///
+    /// Session 20260703-221336-2070027597 (RC4): returns whether the credential was actually accepted
+    /// (matched a live pending challenge). It returns <c>false</c> when no challenge is pending or the
+    /// challenge id does not match, so the caller can reply <c>Success = false</c> instead of masking a
+    /// dropped credential as a success. A misrouted credential from a stale/replaced login session
+    /// would otherwise be silently discarded here while the client believed it was accepted.
     /// </summary>
-    public void ReceiveCredential(EncryptedCredentialResponse response)
+    public bool ReceiveCredential(EncryptedCredentialResponse response)
     {
         if (_pendingCredential == null || _currentChallengeId == null)
         {
             _progress.OnLog(LogLevel.Warning, "Received credential but no challenge is pending");
-            return;
+            return false;
         }
 
         if (response.ChallengeId != _currentChallengeId)
         {
             _progress.OnLog(LogLevel.Warning, $"Received credential for wrong challenge. Expected: {_currentChallengeId}, Got: {response.ChallengeId}");
-            return;
+            return false;
         }
 
         _progress.OnLog(LogLevel.Debug, "Credential received via socket");
         _pendingCredential.TrySetResult(response);
+        return true;
     }
 
     private async Task<string> RequestSecureCredentialAsync(string credentialType, string? email, CancellationToken cancellationToken)
