@@ -4,33 +4,37 @@ using Xunit;
 namespace SteamPrefill.Test
 {
     /// <summary>
-    /// Regression coverage for RC1 (session 20260703-221336-2070027597): SecureSteamAuthenticator
-    /// unconditionally returned true from AcceptDeviceConfirmationAsync (including its catch path), so
-    /// SteamKit2 3.4.0 polled for Steam Mobile App approval and never called the code getters - the
-    /// 2FA / Steam Guard code modal never appeared for mobile-authenticator accounts.
-    /// AcceptDeviceConfirmationAsync must now return false so SteamKit falls back to code entry, and the
-    /// code getters must route through ISteamAuthProvider and re-request on retry.
-    ///
     /// SecureSteamAuthenticator takes ISteamAuthProvider via constructor injection, so this uses a
     /// hand-rolled fake (project convention: no mocking framework) with no reflection.
     /// </summary>
     public sealed class SecureSteamAuthenticatorTests
     {
         [Fact]
-        public async Task AcceptDeviceConfirmationAsync_ReturnsFalse_ToPreferCodeEntry()
+        public async Task AcceptDeviceConfirmationAsync_AcceptsAndRoutesThroughProvider()
         {
             var provider = new RecordingAuthProvider();
             var authenticator = new SecureSteamAuthenticator(provider);
 
             var accepted = await authenticator.AcceptDeviceConfirmationAsync();
 
-            // Before the fix this returned true (and true again from its catch block), forcing SteamKit
-            // to poll for mobile approval. False makes SteamKit fall back to the code-entry challenge.
-            // The fix removed the try/catch entirely, so there is no longer a separate exception path
-            // that can still return true.
-            Assert.False(accepted);
-            // Must NOT route through the device-confirmation channel that preempted the code getters.
-            Assert.Equal(0, provider.DeviceConfirmationCallCount);
+            // Accepting device confirmation lets SteamKit poll for Steam Mobile App approval, and the
+            // client is notified via the device-confirmation credential channel so it can show the
+            // "check your phone" step.
+            Assert.True(accepted);
+            Assert.Equal(1, provider.DeviceConfirmationCallCount);
+        }
+
+        [Fact]
+        public async Task AcceptDeviceConfirmationAsync_ProviderThrows_StillReturnsTrue()
+        {
+            var provider = new RecordingAuthProvider { ThrowOnDeviceConfirmation = true };
+            var authenticator = new SecureSteamAuthenticator(provider);
+
+            // A failure notifying the client (e.g. the socket briefly disconnected) must not stop
+            // SteamKit from proceeding to poll for the real Steam-side approval.
+            var accepted = await authenticator.AcceptDeviceConfirmationAsync();
+
+            Assert.True(accepted);
         }
 
         [Fact]
@@ -85,6 +89,7 @@ namespace SteamPrefill.Test
             public int TwoFactorCallCount { get; private set; }
             public int SteamGuardCallCount { get; private set; }
             public int DeviceConfirmationCallCount { get; private set; }
+            public bool ThrowOnDeviceConfirmation { get; init; }
             public string? LastSteamGuardEmail { get; private set; }
 
             public Task<string> GetUsernameAsync(CancellationToken cancellationToken = default)
@@ -109,6 +114,10 @@ namespace SteamPrefill.Test
             public Task GetDeviceConfirmationAsync(CancellationToken cancellationToken = default)
             {
                 DeviceConfirmationCallCount++;
+                if (ThrowOnDeviceConfirmation)
+                {
+                    throw new InvalidOperationException("Simulated failure notifying the client");
+                }
                 return Task.CompletedTask;
             }
 

@@ -239,24 +239,6 @@ public sealed class SocketCommandInterface : IDisposable
                 CleanupApiInstance();
                 await BroadcastStatusAsync("awaiting-login", "Login cancelled - ready for new attempt");
             }
-            catch (InvalidOperationException ex) when (ex.Message.Contains("AcceptDeviceConfirmation returned false", StringComparison.Ordinal))
-            {
-                // Session 20260703-221336-2070027597 (RC1): AcceptDeviceConfirmationAsync now returns
-                // false so SteamKit falls back to 2FA / Steam Guard code entry. When the account offers
-                // ONLY mobile-app confirmation with no code fallback, SteamKit throws this instead of
-                // emitting a code challenge. Surface a clear cause through the same awaiting-login
-                // failure plumbing rather than SteamKit's cryptic internal wording.
-                if (loginGeneration != Interlocked.Read(ref _loginGeneration))
-                {
-                    DisposeOrphanedApi(api);
-                    return;
-                }
-                _isLoggingIn = false;
-                CleanupApiInstance();
-                const string deviceOnlyMessage = "This Steam account only allows sign-in approval through the Steam Mobile App, which this login method does not support. Enable the Steam Guard Mobile Authenticator (2FA code) or email Steam Guard on the account, then try again.";
-                _progress.OnLog(LogLevel.Error, deviceOnlyMessage);
-                await BroadcastStatusAsync("awaiting-login", $"Login failed: {deviceOnlyMessage}");
-            }
             catch (Exception ex)
             {
                 _progress.OnLog(LogLevel.Error, $"Login failed: {ex.Message}");
