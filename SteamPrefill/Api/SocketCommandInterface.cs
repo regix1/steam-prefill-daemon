@@ -830,6 +830,7 @@ public sealed class SocketCommandInterface : IDisposable
         // Lancache-manager may send Steam app IDs as numbers or strings.
         // Parse a mixed array safely so string payloads don't throw before fallback logic can run.
         var appIds = new List<uint>();
+        var rawElementCount = 0;
         using (var appIdsDoc = JsonDocument.Parse(appIdsJson))
         {
             if (appIdsDoc.RootElement.ValueKind != JsonValueKind.Array)
@@ -845,6 +846,7 @@ public sealed class SocketCommandInterface : IDisposable
 
             foreach (var element in appIdsDoc.RootElement.EnumerateArray())
             {
+                rawElementCount++;
                 if (element.ValueKind == JsonValueKind.Number && element.TryGetUInt32(out var numericAppId))
                 {
                     appIds.Add(numericAppId);
@@ -859,12 +861,9 @@ public sealed class SocketCommandInterface : IDisposable
             }
         }
 
-        if (appIds.Count > 0)
-        {
-            _api!.SetSelectedApps(appIds);
-            _progress.OnLog(LogLevel.Info, $"Set {appIds.Count} selected apps");
-        }
-        else
+        // An empty array is a valid request: it clears the current selection. Only reject when
+        // the caller sent a non-empty array that contained no parseable Steam app IDs.
+        if (appIds.Count == 0 && rawElementCount > 0)
         {
             return new CommandResponse
             {
@@ -874,6 +873,9 @@ public sealed class SocketCommandInterface : IDisposable
                 CompletedAt = DateTime.UtcNow
             };
         }
+
+        _api!.SetSelectedApps(appIds);
+        _progress.OnLog(LogLevel.Info, $"Set {appIds.Count} selected apps");
 
         return new CommandResponse
         {
