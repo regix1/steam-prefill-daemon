@@ -5,7 +5,7 @@ using Xunit;
 namespace SteamPrefill.Test
 {
     /// <summary>
-    /// Regression coverage for RC4 (session 20260703-221336-2070027597): HandleProvideCredential
+    /// HandleProvideCredential previously
     /// unconditionally returned Success = true "Credential received" even when the daemon had no
     /// matching pending challenge, so a misrouted credential from a stale/replaced login session was
     /// silently dropped while the manager believed it was accepted. A provide-credential with no

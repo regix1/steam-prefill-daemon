@@ -11,7 +11,8 @@ namespace SteamPrefill.Handlers
     {
         private readonly IAnsiConsole _ansiConsole;
         private readonly CdnPool _cdnPool;
-        private readonly Steam3Session _steam3Session;
+        private readonly Func<DepotInfo, Task<ulong>> _requestManifestCodeAsync;
+        private readonly Func<DepotInfo, ulong, Server, Task<DepotManifest>> _downloadManifestAsync;
 
         private const int MaxRetries = 3;
 
@@ -19,7 +20,30 @@ namespace SteamPrefill.Handlers
         {
             _ansiConsole = ansiConsole;
             _cdnPool = cdnPool;
-            _steam3Session = steam3Session;
+            _requestManifestCodeAsync = depot =>
+                steam3Session.SteamContent.GetManifestRequestCode(
+                    depot.DepotId,
+                    depot.ContainingAppId,
+                    depot.ManifestId.Value,
+                    "public");
+            _downloadManifestAsync = (depot, manifestRequestCode, server) =>
+                steam3Session.CdnClient.DownloadManifestAsync(
+                    depot.DepotId,
+                    depot.ManifestId.Value,
+                    manifestRequestCode,
+                    server);
+        }
+
+        internal ManifestHandler(
+            IAnsiConsole ansiConsole,
+            CdnPool cdnPool,
+            Func<DepotInfo, Task<ulong>> requestManifestCodeAsync,
+            Func<DepotInfo, ulong, Server, Task<DepotManifest>> downloadManifestAsync)
+        {
+            _ansiConsole = ansiConsole;
+            _cdnPool = cdnPool;
+            _requestManifestCodeAsync = requestManifestCodeAsync;
+            _downloadManifestAsync = downloadManifestAsync;
         }
 
         /// <summary>
@@ -28,15 +52,18 @@ namespace SteamPrefill.Handlers
         /// If the download for a manifest has failed 3 times, it will skip downloading the current app.
         /// </summary>
         /// <exception cref="ManifestException"></exception>
-        public async Task<List<Manifest>> GetAllManifestsAsync(List<DepotInfo> depots)
+        public async Task<List<Manifest>> GetAllManifestsAsync(
+            List<DepotInfo> depots,
+            CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             _ansiConsole.LogMarkupVerbose($"Downloading manifests for {Magenta(depots.Count)} depots");
 
             var depotManifests = new List<Manifest>();
 
             // Loading manifests already on disk in parallel
             var cachedManifestTasks = depots.Where(e => ManifestIsCached(e))
-                                                        .Select(e => GetSingleManifestAsync(e))
+                                                        .Select(e => GetSingleManifestAsync(e, cancellationToken))
                                                         .ToList();
             var resultManifests = await Task.WhenAll(cachedManifestTasks);
             depotManifests.AddRange(resultManifests);
@@ -44,15 +71,18 @@ namespace SteamPrefill.Handlers
             // Downloading un-cached depots from the internet
             foreach (var depot in depots.Where(e => !ManifestIsCached(e)).ToList())
             {
-                int attempts = 0;
-                Manifest manifest = null;
-                while (manifest == null && attempts < MaxRetries)
+                cancellationToken.ThrowIfCancellationRequested();
+                for (var attempt = 1; attempt <= MaxRetries; attempt++)
                 {
                     try
                     {
-
-                        manifest = await GetSingleManifestAsync(depot);
+                        var manifest = await GetSingleManifestAsync(depot, cancellationToken);
                         depotManifests.Add(manifest);
+                        break;
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception e)
                     {
@@ -75,14 +105,12 @@ namespace SteamPrefill.Handlers
                         FileLogger.LogException("An exception occurred while downloading manifests", e);
                     }
 
-                    // Pausing a short time, in case the error was transient
-                    attempts++;
-                    await Task.Delay(500 * attempts);
-
-                    if (attempts >= MaxRetries)
+                    if (attempt >= MaxRetries)
                     {
                         throw new ManifestException("Unable to download manifests!");
                     }
+
+                    await Task.Delay(500 * attempt, cancellationToken);
                 }
             }
             return depotManifests;
@@ -95,8 +123,11 @@ namespace SteamPrefill.Handlers
         /// <param name="depot">The depot to download a manifest for</param>
         /// <returns>A manifest file</returns>
         /// <exception cref="ManifestException">Throws if no manifest was returned by Steam</exception>
-        private async Task<Manifest> GetSingleManifestAsync(DepotInfo depot)
+        private async Task<Manifest> GetSingleManifestAsync(
+            DepotInfo depot,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (ManifestIsCached(depot))
             {
                 return Manifest.LoadFromFile(depot.ManifestFileName);
@@ -104,15 +135,38 @@ namespace SteamPrefill.Handlers
 
             _ansiConsole.LogMarkupVerbose($"Downloading manifest {LightYellow(depot.ManifestId)} for depot {Cyan(depot.DepotId)}");
 
-            ManifestRequestCode manifestRequestCode = await GetManifestRequestCodeAsync(depot);
+            ManifestRequestCode manifestRequestCode = await GetManifestRequestCodeAsync(
+                depot,
+                cancellationToken);
 
             Server server = _cdnPool.TakeConnection();
-            DepotManifest manifest = await _steam3Session.CdnClient.DownloadManifestAsync(depot.DepotId, depot.ManifestId.Value, manifestRequestCode.Code, server);
-            if (manifest == null)
+            DepotManifest manifest;
+            var downloadTask = _downloadManifestAsync(
+                depot,
+                manifestRequestCode.Code,
+                server);
+            var returnConnectionImmediately = true;
+            try
             {
-                throw new ManifestException($"Unable to download manifest for depot {depot.Name} - {depot.DepotId}.  Manifest request received no response.");
+                manifest = await downloadTask.WaitAsync(cancellationToken);
+                if (manifest == null)
+                {
+                    throw new ManifestException($"Unable to download manifest for depot {depot.Name} - {depot.DepotId}.  Manifest request received no response.");
+                }
             }
-            _cdnPool.ReturnConnection(server);
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                returnConnectionImmediately = false;
+                ReturnConnectionAfterCompletion(downloadTask, server);
+                throw;
+            }
+            finally
+            {
+                if (returnConnectionImmediately)
+                {
+                    _cdnPool.ReturnConnection(server);
+                }
+            }
 
             var protoManifest = new Manifest(manifest, depot);
             if (AppConfig.NoLocalCache)
@@ -122,6 +176,19 @@ namespace SteamPrefill.Handlers
 
             protoManifest.SaveToFile(depot.ManifestFileName);
             return protoManifest;
+        }
+
+        private void ReturnConnectionAfterCompletion(Task downloadTask, Server server)
+        {
+            _ = downloadTask.ContinueWith(
+                completedTask =>
+                {
+                    _ = completedTask.Exception;
+                    _cdnPool.ReturnConnection(server);
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
 
         /// <summary>
@@ -136,12 +203,14 @@ namespace SteamPrefill.Handlers
         /// <param name="depot">The depot to request a manifest code for</param>
         /// <returns>A manifest code valid for 5 minutes.</returns>
         /// <exception cref="ManifestException">Throws if no valid manifest code was found</exception>
-        private async Task<ManifestRequestCode> GetManifestRequestCodeAsync(DepotInfo depot)
+        private async Task<ManifestRequestCode> GetManifestRequestCodeAsync(
+            DepotInfo depot,
+            CancellationToken cancellationToken)
         {
-            ulong manifestRequestCode = await _steam3Session.SteamContent.GetManifestRequestCode(depot.DepotId, depot.ContainingAppId, depot.ManifestId.Value, "public")
-                                                                         // Adding an additional timeout to this SteamKit method.  I have a feeling that this is not properly timing out
-                                                                         // for some users.
-                                                                         .WaitAsync(TimeSpan.FromSeconds(90));
+            // Adding an additional timeout to this SteamKit method.  I have a feeling that this is not properly timing out
+            // for some users.
+            ulong manifestRequestCode = await _requestManifestCodeAsync(depot)
+                .WaitAsync(TimeSpan.FromSeconds(90), cancellationToken);
 
             // If we could not get the manifest code, this is a fatal error, as it we can't download the manifest without it.
             if (manifestRequestCode == 0)

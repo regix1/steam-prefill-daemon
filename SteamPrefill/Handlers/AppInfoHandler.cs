@@ -51,29 +51,34 @@
         /// <summary>
         /// Gets the latest app metadata from steam, for the specified apps, as well as their related DLC apps.
         /// </summary>
-        public async Task RetrieveAppMetadataAsync(List<uint> appIds, bool getRecentlyPlayedMetadata = false)
+        public async Task RetrieveAppMetadataAsync(
+            List<uint> appIds,
+            bool getRecentlyPlayedMetadata = false,
+            CancellationToken cancellationToken = default)
         {
             await _ansiConsole.StatusSpinner().StartAsync("Retrieving latest App metadata...", async _ =>
             {
-                await BulkLoadAppInfoAsync(appIds);
+                await BulkLoadAppInfoAsync(appIds, cancellationToken);
                 // Once we have loaded all the apps we'll know what DLC is owned, so we can then load DLC metadata
-                await FetchDlcAppInfoAsync();
+                await FetchDlcAppInfoAsync(cancellationToken);
 
                 // Populating play time if needed in the case of select-apps or using prefill's --recent flag.
                 // Otherwise we'll skip it to slightly speed things up
                 if (getRecentlyPlayedMetadata)
                 {
-                    foreach (var app in await GetRecentlyPlayedGamesAsync())
+                    foreach (var app in await GetRecentlyPlayedGamesAsync(cancellationToken))
                     {
-                        var appInfo = await GetAppInfoAsync((uint)app.appid);
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var appInfo = await GetAppInfoAsync((uint)app.appid, cancellationToken);
                         appInfo.MinutesPlayed2Weeks = app.playtime_2weeks;
                     }
                 }
             });
         }
 
-        private async Task BulkLoadAppInfoAsync(List<uint> appIds)
+        private async Task BulkLoadAppInfoAsync(List<uint> appIds, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var initialAppIdLoadTimer = Stopwatch.StartNew();
 
             var filteredAppIds = appIds.Where(e => !LoadedAppInfos.ContainsKey(e))
@@ -89,7 +94,7 @@
             var batchJobs = new List<Task>();
             foreach (var batch in batches)
             {
-                batchJobs.Add(AppInfoRequestAsync(batch.ToList()));
+                batchJobs.Add(AppInfoRequestAsync(batch.ToList(), cancellationToken));
             }
 
             await Task.WhenAll(batchJobs);
@@ -101,21 +106,28 @@
         /// than multiple individual requests, as it seems that there is a minimum threshold for how quickly steam will return results.
         /// </summary>
         /// <param name="appIdsToLoad">The list of App Ids to retrieve info for</param>
-        private async Task AppInfoRequestAsync(List<uint> appIdsToLoad)
+        private async Task AppInfoRequestAsync(
+            List<uint> appIdsToLoad,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (appIdsToLoad.Empty())
             {
                 return;
             }
 
             // Some apps will require an additional "access token" in order to retrieve their app metadata
-            var accessTokensResponse = await _steam3Session.SteamAppsApi.PICSGetAccessTokens(appIdsToLoad, new List<uint>()).ToTask();
+            var accessTokensResponse = await _steam3Session.SteamAppsApi
+                .PICSGetAccessTokens(appIdsToLoad, new List<uint>())
+                .ToTask()
+                .WaitAsync(cancellationToken);
             var appTokens = accessTokensResponse.AppTokens;
 
             // Build out the requests
             var requests = new List<PICSRequest>();
             foreach (var appId in appIdsToLoad)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var request = new PICSRequest(appId);
                 if (appTokens.ContainsKey(appId))
                 {
@@ -125,11 +137,15 @@
             }
 
             // Finally request the metadata from steam
-            var resultSet = await _steam3Session.SteamAppsApi.PICSGetProductInfo(requests, new List<PICSRequest>()).ToTask();
+            var resultSet = await _steam3Session.SteamAppsApi
+                .PICSGetProductInfo(requests, new List<PICSRequest>())
+                .ToTask()
+                .WaitAsync(cancellationToken);
 
             List<PicsProductInfo> appInfos = resultSet.Results.SelectMany(e => e.Apps).Select(e => e.Value).ToList();
             foreach (var app in appInfos)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 LoadedAppInfos.TryAdd(app.ID, new AppInfo(_steam3Session, app.ID, app.KeyValues));
 
                 app.KeyValues.WriteSteamMetadataToDisk($@"{AppConfig.DebugOutputDir}\AppInfo\AppInfo_{app.ID}.txt");
@@ -142,7 +158,7 @@
         ///
         /// Once the DLC apps are loaded, the final combined depot list (both the app + dlc apps) will be built.
         /// </summary>
-        private async Task FetchDlcAppInfoAsync()
+        private async Task FetchDlcAppInfoAsync(CancellationToken cancellationToken)
         {
             var dlcAppIds = LoadedAppInfos.Values.SelectMany(e => e.DlcAppIds).ToList();
             var containingAppIds = LoadedAppInfos.Values.Where(e => e.Type == AppType.Game)
@@ -151,15 +167,16 @@
                                                  .ToList();
 
             var idsToLoad = containingAppIds.Union(dlcAppIds).ToList();
-            await BulkLoadAppInfoAsync(idsToLoad);
+            await BulkLoadAppInfoAsync(idsToLoad, cancellationToken);
 
             // Builds out the list of all depots for each game, including depots from all related DLCs
             // DLCs are stored as separate "apps", so their info comes back separately.
             foreach (var app in LoadedAppInfos.Values.Where(e => e.Type == AppType.Game))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 foreach (var dlcApp in app.DlcAppIds)
                 {
-                    app.Depots.AddRange((await GetAppInfoAsync(dlcApp)).Depots);
+                    app.Depots.AddRange((await GetAppInfoAsync(dlcApp, cancellationToken)).Depots);
                 }
 
                 var distinctDepots = app.Depots.DistinctBy(e => e.DepotId).ToList();
@@ -174,22 +191,27 @@
         /// Will return an AppInfo for the specified AppId, that contains various metadata about the app.
         /// If the information for the specified app hasn't already been retrieved, then a request to the Steam network will be made.
         /// </summary>
-        public virtual async Task<AppInfo> GetAppInfoAsync(uint appId)
+        public virtual async Task<AppInfo> GetAppInfoAsync(
+            uint appId,
+            CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (LoadedAppInfos.ContainsKey(appId))
             {
                 return LoadedAppInfos[appId];
             }
 
-            await AppInfoRequestAsync(new List<uint> { appId });
+            await AppInfoRequestAsync(new List<uint> { appId }, cancellationToken);
             return LoadedAppInfos[appId];
         }
 
         /// <summary>
         /// Gets a list of games owned by the user, and filters them down to just the ones that have recent playtime in the last 2 weeks.
         /// </summary>
-        public async Task<List<CPlayer_GetOwnedGames_Response.Game>> GetRecentlyPlayedGamesAsync()
+        public async Task<List<CPlayer_GetOwnedGames_Response.Game>> GetRecentlyPlayedGamesAsync(
+            CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (_recentlyPlayed != null)
             {
                 return _recentlyPlayed;
@@ -203,7 +225,10 @@
                 include_played_free_games = true,
                 skip_unvetted_apps = false
             };
-            var response = await _steam3Session.unifiedPlayerService.GetOwnedGames(request).ToTask();
+            var response = await _steam3Session.unifiedPlayerService
+                .GetOwnedGames(request)
+                .ToTask()
+                .WaitAsync(cancellationToken);
             if (response.Result != EResult.OK)
             {
                 throw new Exception("Unexpected error while requesting owned games!");
@@ -218,13 +243,16 @@
         /// <summary>
         /// Gets a list of available games, filtering out any unavailable, non-Windows games.
         /// </summary>
-        public async Task<List<AppInfo>> GetAvailableGamesByIdAsync(List<uint> appIds)
+        public async Task<List<AppInfo>> GetAvailableGamesByIdAsync(
+            List<uint> appIds,
+            CancellationToken cancellationToken = default)
         {
             //TODO maybe a call to retreive app metadata async here so that you don't need to remember to do it manually
             var appInfos = new List<AppInfo>();
             foreach (var appId in appIds)
             {
-                appInfos.Add(await GetAppInfoAsync(appId));
+                cancellationToken.ThrowIfCancellationRequested();
+                appInfos.Add(await GetAppInfoAsync(appId, cancellationToken));
             }
 
             // We'll filter out some specific non-game appids which would otherwise be included.

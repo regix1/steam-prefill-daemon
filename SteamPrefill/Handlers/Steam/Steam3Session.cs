@@ -107,6 +107,7 @@ namespace SteamPrefill.Handlers.Steam
             // Setting up optional SteamKit2 debug output.  Not enabled by default because it writes out way too much output that isn't useful outside of debugging.
             if (AppConfig.DebugLogs)
             {
+                DebugLog.Enabled = true;
                 DebugLog.AddListener(new SteamKitDebugListener(_ansiConsole));
             }
         }

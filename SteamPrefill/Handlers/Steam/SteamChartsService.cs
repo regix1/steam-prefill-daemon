@@ -5,26 +5,43 @@
         /// <summary>
         /// https://steamapi.xpaw.me/#ISteamChartsService/GetMostPlayedGames
         /// </summary>
-        public static async Task<List<MostPlayedGame>> MostPlayedByDailyPlayersAsync(IAnsiConsole ansiConsole)
+        public static async Task<List<MostPlayedGame>> MostPlayedByDailyPlayersAsync(
+            IAnsiConsole ansiConsole,
+            CancellationToken cancellationToken = default)
+        {
+            using var httpClient = new HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(15)
+            };
+
+            return await MostPlayedByDailyPlayersAsync(ansiConsole, httpClient, cancellationToken);
+        }
+
+        internal static async Task<List<MostPlayedGame>> MostPlayedByDailyPlayersAsync(
+            IAnsiConsole ansiConsole,
+            HttpClient httpClient,
+            CancellationToken cancellationToken)
         {
             try
             {
-                using var httpClient = new HttpClient
-                {
-                    Timeout = TimeSpan.FromSeconds(15)
-                };
-
                 using var request = new HttpRequestMessage(HttpMethod.Get, new Uri("https://api.steampowered.com/ISteamChartsService/GetMostPlayedGames/v1/"));
-                var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+                using var response = await httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
                 response.EnsureSuccessStatusCode();
 
-                var responseContent = await response.Content.ReadAsStringAsync();
+                var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
                 List<MostPlayedGame> topGames = JsonSerializer.Deserialize(responseContent, SerializationContext.Default.GetMostPlayedGamesResponse)
                                                               .response
                                                               .Ranks
                                                               .OrderBy(e => e.Rank)
                                                               .ToList();
                 return topGames;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {

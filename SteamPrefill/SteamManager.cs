@@ -105,12 +105,14 @@ namespace SteamPrefill
             }
             if (prefillRecentGames)
             {
-                var recentGames = await _appInfoHandler.GetRecentlyPlayedGamesAsync();
+                var recentGames = await _appInfoHandler.GetRecentlyPlayedGamesAsync(cancellationToken);
                 appIdsToDownload.AddRange(recentGames.Select(e => (uint)e.appid));
             }
             if (prefillPopularGames != null)
             {
-                var popularGames = (await SteamChartsService.MostPlayedByDailyPlayersAsync(_ansiConsole))
+                var popularGames = (await SteamChartsService.MostPlayedByDailyPlayersAsync(
+                                       _ansiConsole,
+                                       cancellationToken))
                                    .Take(prefillPopularGames.Value)
                                    .Select(e => e.AppId);
                 appIdsToDownload.AddRange(popularGames);
@@ -121,12 +123,15 @@ namespace SteamPrefill
                 appIdsToDownload.AddRange(recentApps);
 
                 // Verbose logging for recently purchased games
-                await _appInfoHandler.RetrieveAppMetadataAsync(recentApps);
+                await _appInfoHandler.RetrieveAppMetadataAsync(
+                    recentApps,
+                    cancellationToken: cancellationToken);
                 _ansiConsole.LogMarkupVerbose("[bold yellow]Recently purchased games (last 2 weeks):[/]");
                 foreach (var appId in recentApps)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var purchaseDate = _steam3.LicenseManager.GetPurchaseDateForApp(appId);
-                    var appInfo = await _appInfoHandler.GetAppInfoAsync(appId);
+                    var appInfo = await _appInfoHandler.GetAppInfoAsync(appId, cancellationToken);
                     _ansiConsole.LogMarkupVerbose($"  {Green(appInfo.Name).PadRight(35)} - Purchased: {LightYellow(purchaseDate.ToLocalTime().ToString("yyyy-MM-dd"))}");
                 }
             }
@@ -136,28 +141,23 @@ namespace SteamPrefill
             
             // Report progress for metadata retrieval (can be slow for large libraries)
             _progress.OnLog(LogLevel.Info, $"Loading metadata for {distinctAppIds.Count} apps...");
-            await _appInfoHandler.RetrieveAppMetadataAsync(distinctAppIds);
+            await _appInfoHandler.RetrieveAppMetadataAsync(
+                distinctAppIds,
+                cancellationToken: cancellationToken);
             _progress.OnLog(LogLevel.Info, $"Metadata loaded for {distinctAppIds.Count} apps");
 
             // Whitespace divider
             _ansiConsole.WriteLine();
 
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(distinctAppIds);
+            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(
+                distinctAppIds,
+                cancellationToken);
             _progress.OnLog(LogLevel.Info, $"Starting prefill of {availableGames.Count} games");
             
-            foreach (var app in availableGames)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    await DownloadSingleAppAsync(app, cancellationToken);
-                }
-                catch (Exception e) when (e is LancacheNotFoundException || e is InfiniteLoopException)
-                {
-                    // We'll want to bomb out the entire process for these exceptions, as they mean we can't prefill any apps at all
-                    throw;
-                }
-                catch (Exception e)
+            await DownloadAppsAsync(
+                availableGames,
+                DownloadSingleAppAsync,
+                (_, e) =>
                 {
                     // Need to catch any exceptions that might happen during a single download, so that the other apps won't be affected
                     _ansiConsole.LogMarkupLine(Red($"Unexpected download error : {e.Message}  Skipping app..."));
@@ -165,14 +165,17 @@ namespace SteamPrefill
                     FileLogger.LogException(e);
 
                     _prefillSummaryResult.FailedApps++;
-                }
-            }
-            await PrintUnownedAppsAsync(distinctAppIds);
+                },
+                cancellationToken);
+            await PrintUnownedAppsAsync(distinctAppIds, cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             _ansiConsole.LogMarkupLine("Prefill complete!");
             _prefillSummaryResult.RenderSummaryTable(_ansiConsole);
 
             // Notify completion via progress interface
+            cancellationToken.ThrowIfCancellationRequested();
             _progress.OnPrefillCompleted(new PrefillSummary
             {
                 TotalApps = _prefillSummaryResult.AlreadyUpToDate + _prefillSummaryResult.Updated + _prefillSummaryResult.FailedApps,
@@ -184,10 +187,41 @@ namespace SteamPrefill
             });
         }
 
+        internal static async Task DownloadAppsAsync<TApp>(
+            IEnumerable<TApp> apps,
+            Func<TApp, CancellationToken, Task> downloadAppAsync,
+            Action<TApp, Exception> onDownloadFailure,
+            CancellationToken cancellationToken)
+        {
+            foreach (var app in apps)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await downloadAppAsync(app, cancellationToken);
+                }
+                catch (Exception e) when (e is LancacheNotFoundException || e is InfiniteLoopException)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception e)
+                {
+                    onDownloadFailure(app, e);
+                }
+            }
+        }
+
         private async Task DownloadSingleAppAsync(AppInfo appInfo, CancellationToken cancellationToken = default)
         {
             // Filter depots based on specified language/OS/cpu architecture/etc
-            var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, appInfo.Depots);
+            var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                _downloadArgs,
+                appInfo.Depots,
+                cancellationToken);
             if (filteredDepots.Empty())
             {
                 _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
@@ -197,14 +231,21 @@ namespace SteamPrefill
                 return;
             }
 
-            await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
+            await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, cancellationToken);
 
             // Get the full file list for each depot, and queue up the required chunks
             // We do this before the up-to-date check so we can report accurate sizes for cached games
-            await _cdnPool.PopulateAvailableServersAsync();
+            await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
 
             List<QueuedRequest> chunkDownloadQueue = null;
-            await _ansiConsole.StatusSpinner().StartAsync("Fetching depot manifests...", async _ => { chunkDownloadQueue = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots); });
+            await _ansiConsole.StatusSpinner().StartAsync(
+                "Fetching depot manifests...",
+                async _ =>
+                {
+                    chunkDownloadQueue = await _depotHandler.BuildChunkDownloadQueueAsync(
+                        filteredDepots,
+                        cancellationToken);
+                });
 
             var totalBytes = ByteSize.FromBytes(chunkDownloadQueue.Sum(e => e.CompressedLength));
 
@@ -331,15 +372,20 @@ namespace SteamPrefill
         /// <summary>
         /// Gets status information for selected apps including download sizes.
         /// </summary>
-        public async Task<List<AppStatus>> GetSelectedAppsStatusAsync(List<uint> appIds, List<CachedDepotInput>? cachedDepots = null)
+        public async Task<List<AppStatus>> GetSelectedAppsStatusAsync(
+            List<uint> appIds,
+            List<CachedDepotInput>? cachedDepots = null,
+            CancellationToken cancellationToken = default)
         {
             // Force-refresh app metadata for these specific apps to ensure accurate size calculations
             _appInfoHandler.InvalidateApps(appIds);
-            await _appInfoHandler.RetrieveAppMetadataAsync(appIds);
-            await _cdnPool.PopulateAvailableServersAsync();
+            await _appInfoHandler.RetrieveAppMetadataAsync(
+                appIds,
+                cancellationToken: cancellationToken);
+            await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
 
             var appStatuses = new ConcurrentBag<AppStatus>();
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds);
+            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
             
             _ansiConsole.LogMarkupVerbose($"Getting status for {Magenta(availableGames.Count)} available games out of {Magenta(appIds.Count)} requested");
 
@@ -356,12 +402,22 @@ namespace SteamPrefill
                 _ansiConsole.LogMarkupVerbose($"Using {cachedDepots.Count} cached depot manifests for isUpToDate calculation");
             }
 
-            await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
+            await Parallel.ForEachAsync(
+                availableGames,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = 5,
+                    CancellationToken = cancellationToken
+                },
+                async (app, loopToken) =>
             {
                 try
                 {
                     _ansiConsole.LogMarkupVerbose($"Processing {Cyan(app.Name)}: {app.Depots.Count} depots");
-                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, app.Depots);
+                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                        _downloadArgs,
+                        app.Depots,
+                        loopToken);
                     _ansiConsole.LogMarkupVerbose($"  Filtered to {filteredDepots.Count} depots");
 
                     // Check if game has no depots for the selected OS
@@ -380,9 +436,11 @@ namespace SteamPrefill
                         return;
                     }
 
-                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
+                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
 
-                    var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(filteredDepots);
+                    var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(
+                        filteredDepots,
+                        loopToken);
                     var downloadSize = allChunksForApp.Sum(e => e.CompressedLength);
 
                     // Determine if app is up to date
@@ -408,6 +466,10 @@ namespace SteamPrefill
                         DownloadSize = downloadSize,
                         IsUpToDate = isUpToDate
                     });
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -435,8 +497,11 @@ namespace SteamPrefill
         /// Checks cache status by comparing cached depot manifests against Steam's current manifests.
         /// This allows accurate detection of which apps are truly up-to-date even when daemon restarts.
         /// </summary>
-        public async Task<CacheStatusResult> CheckCacheStatusAsync(List<CachedDepotInput> cachedDepots)
+        public async Task<CacheStatusResult> CheckCacheStatusAsync(
+            List<CachedDepotInput> cachedDepots,
+            CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (cachedDepots.Count == 0)
             {
                 return new CacheStatusResult
@@ -455,22 +520,34 @@ namespace SteamPrefill
 
             // Force-refresh app metadata for these specific apps to ensure accurate manifest info
             _appInfoHandler.InvalidateApps(appIds);
-            await _appInfoHandler.RetrieveAppMetadataAsync(appIds);
-            await _cdnPool.PopulateAvailableServersAsync();
+            await _appInfoHandler.RetrieveAppMetadataAsync(
+                appIds,
+                cancellationToken: cancellationToken);
+            await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
 
             var appStatuses = new ConcurrentBag<AppCacheStatus>();
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds);
+            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
 
             _ansiConsole.LogMarkupVerbose($"Checking cache status for {Magenta(availableGames.Count)} available games");
 
             // Build OS names string for error messages
             var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
 
-            await Parallel.ForEachAsync(availableGames, new ParallelOptions { MaxDegreeOfParallelism = 5 }, async (app, _) =>
+            await Parallel.ForEachAsync(
+                availableGames,
+                new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = 5,
+                    CancellationToken = cancellationToken
+                },
+                async (app, loopToken) =>
             {
                 try
                 {
-                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(_downloadArgs, app.Depots);
+                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                        _downloadArgs,
+                        app.Depots,
+                        loopToken);
 
                     // Check if game has no depots for the selected OS
                     if (filteredDepots.Count == 0 && app.Depots.Count > 0)
@@ -486,7 +563,7 @@ namespace SteamPrefill
                         return;
                     }
 
-                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots);
+                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
 
                     // Get cached manifests for this app
                     var cachedManifests = cachedByApp.GetValueOrDefault(app.AppId) ?? new Dictionary<uint, ulong>();
@@ -516,7 +593,9 @@ namespace SteamPrefill
                     {
                         var outdatedDepotIds = outdatedDepots.Select(d => d.DepotId).ToHashSet();
                         var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
-                        var chunks = await _depotHandler.BuildChunkDownloadQueueAsync(depotsToDownload);
+                        var chunks = await _depotHandler.BuildChunkDownloadQueueAsync(
+                            depotsToDownload,
+                            loopToken);
                         downloadSize = chunks.Sum(e => e.CompressedLength);
                     }
 
@@ -528,6 +607,10 @@ namespace SteamPrefill
                         DownloadSize = downloadSize,
                         OutdatedDepots = outdatedDepots
                     });
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -558,13 +641,19 @@ namespace SteamPrefill
 
         #endregion
 
-        public async Task<List<AppInfo>> GetAllAvailableAppsAsync()
+        public async Task<List<AppInfo>> GetAllAvailableAppsAsync(
+            CancellationToken cancellationToken = default)
         {
             var ownedGameIds = _steam3.LicenseManager.AllOwnedAppIds;
 
             // Loading app metadata from steam, skipping related DLC apps
-            await _appInfoHandler.RetrieveAppMetadataAsync(ownedGameIds, getRecentlyPlayedMetadata: true);
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(ownedGameIds);
+            await _appInfoHandler.RetrieveAppMetadataAsync(
+                ownedGameIds,
+                getRecentlyPlayedMetadata: true,
+                cancellationToken);
+            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(
+                ownedGameIds,
+                cancellationToken);
 
             return availableGames;
         }
@@ -578,11 +667,13 @@ namespace SteamPrefill
             _appInfoHandler.ClearLoadedAppInfos();
         }
 
-        private async Task PrintUnownedAppsAsync(List<uint> distinctAppIds)
+        private async Task PrintUnownedAppsAsync(
+            List<uint> distinctAppIds,
+            CancellationToken cancellationToken)
         {
             // Write out any apps that can't be downloaded as a warning message, so users can know that they were skipped
             AppInfo[] unownedApps = await Task.WhenAll(distinctAppIds.Where(e => !_steam3.LicenseManager.AccountHasAppAccess(e))
-                                                                     .Select(e => _appInfoHandler.GetAppInfoAsync(e)));
+                                                                     .Select(e => _appInfoHandler.GetAppInfoAsync(e, cancellationToken)));
             _prefillSummaryResult.UnownedAppsSkipped = unownedApps.Length;
 
 

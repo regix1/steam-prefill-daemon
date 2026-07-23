@@ -39,8 +39,7 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
     /// <summary>
     /// Called by the SocketCommandInterface when a provide-credential command is received.
     ///
-    /// Session 20260703-221336-2070027597 (RC4): returns whether the credential was actually accepted
-    /// (matched a live pending challenge). It returns <c>false</c> when no challenge is pending or the
+    /// Returns whether the credential matched a live pending challenge. It returns <c>false</c> when no challenge is pending or the
     /// challenge id does not match, so the caller can reply <c>Success = false</c> instead of masking a
     /// dropped credential as a success. A misrouted credential from a stale/replaced login session
     /// would otherwise be silently discarded here while the client believed it was accepted.

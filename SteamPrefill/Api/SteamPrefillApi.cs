@@ -94,7 +94,7 @@ public sealed class SteamPrefillApi : IDisposable
 
         try
         {
-            var apps = await _steamManager!.GetAllAvailableAppsAsync();
+            var apps = await _steamManager!.GetAllAvailableAppsAsync(cancellationToken);
             var result = apps.Select(a => new OwnedGame
             {
                 AppId = a.AppId,
@@ -105,6 +105,11 @@ public sealed class SteamPrefillApi : IDisposable
 
             _progress.OnOperationCompleted("Fetching owned games", timer.Elapsed);
             return result;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _progress.OnLog(LogLevel.Info, "Fetching owned games cancelled");
+            throw;
         }
         catch (Exception ex)
         {
@@ -158,7 +163,10 @@ public sealed class SteamPrefillApi : IDisposable
 
         try
         {
-            var appStatuses = await _steamManager!.GetSelectedAppsStatusAsync(appIds, cachedDepots);
+            var appStatuses = await _steamManager!.GetSelectedAppsStatusAsync(
+                appIds,
+                cachedDepots,
+                cancellationToken);
             var totalSize = appStatuses.Sum(a => a.DownloadSize);
             var totalSizeFormatted = ByteSize.FromBytes(totalSize);
 
@@ -168,6 +176,11 @@ public sealed class SteamPrefillApi : IDisposable
                 TotalDownloadSize = totalSize,
                 Message = $"{appStatuses.Count} apps selected, {totalSizeFormatted.ToDecimalString()} total"
             };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _progress.OnLog(LogLevel.Info, "Selected apps status request cancelled");
+            throw;
         }
         catch (Exception ex)
         {
@@ -202,7 +215,12 @@ public sealed class SteamPrefillApi : IDisposable
 
         try
         {
-            return await _steamManager!.CheckCacheStatusAsync(cachedDepots);
+            return await _steamManager!.CheckCacheStatusAsync(cachedDepots, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _progress.OnLog(LogLevel.Info, "Cache status request cancelled");
+            throw;
         }
         catch (Exception ex)
         {
@@ -308,15 +326,10 @@ public sealed class SteamPrefillApi : IDisposable
                 TotalTime = timer.Elapsed
             };
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             _progress.OnLog(LogLevel.Info, "Prefill operation cancelled");
-            return new PrefillResult
-            {
-                Success = false,
-                ErrorMessage = "Prefill cancelled",
-                TotalTime = timer.Elapsed
-            };
+            throw;
         }
         catch (Exception ex)
         {
@@ -654,4 +667,3 @@ public class OwnedGame
     public int MinutesPlayedLast2Weeks { get; init; }
     public DateOnly? ReleaseDate { get; init; }
 }
-

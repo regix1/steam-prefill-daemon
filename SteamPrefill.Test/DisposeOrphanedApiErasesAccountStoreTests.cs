@@ -6,7 +6,7 @@ using Xunit;
 namespace SteamPrefill.Test
 {
     /// <summary>
-    /// Regression coverage for the RC6 orphan-resave race (session 20260703-221336-2070027597).
+    /// Covers the orphan-resave race during logout.
     /// HandleLogoutAsync does a BOUNDED wait for an in-flight login task; if that times out it deletes
     /// the account file + storage.key anyway while the login task is still running. Steam3Session
     /// .GetAccessTokenAsync calls _userAccountStore.Save() the instant the auth poll returns, which

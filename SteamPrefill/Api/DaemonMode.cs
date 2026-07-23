@@ -30,24 +30,7 @@ public static class DaemonMode
         string socketPath = "/responses/daemon.sock",
         CancellationToken cancellationToken = default)
     {
-        Console.WriteLine("Starting SteamPrefill daemon...");
-        Console.WriteLine($"Socket path: {socketPath}");
-        Console.WriteLine();
-        Console.WriteLine("┌──────────────────────────────────────────────────────────────┐");
-        Console.WriteLine("│ UNIX SOCKET IPC                                              │");
-        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
-        Console.WriteLine("│ • Reliable bidirectional communication                       │");
-        Console.WriteLine("│ • Low latency (<1ms)                                         │");
-        Console.WriteLine("│ • Works in both host and bridge Docker network modes         │");
-        Console.WriteLine("│ • Real-time progress streaming                               │");
-        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
-        Console.WriteLine("│ SECURITY                                                     │");
-        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
-        Console.WriteLine("│ • Login is REQUIRED before any other commands                │");
-        Console.WriteLine("│ • All credentials are encrypted using ECDH + AES-GCM         │");
-        Console.WriteLine("│ • Challenges expire after 5 minutes                          │");
-        Console.WriteLine("└──────────────────────────────────────────────────────────────┘");
-        Console.WriteLine();
+        Console.WriteLine(GetUnixStartupMessage(socketPath));
 
         using var socketInterface = new SocketCommandInterface(socketPath);
 
@@ -60,7 +43,7 @@ public static class DaemonMode
         {
             await Task.Delay(Timeout.Infinite, cancellationToken);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             Console.WriteLine("Daemon shutdown requested...");
         }
@@ -77,23 +60,7 @@ public static class DaemonMode
         int port,
         CancellationToken cancellationToken = default)
     {
-        Console.WriteLine("Starting SteamPrefill daemon (TCP mode)...");
-        Console.WriteLine($"TCP port: {port}");
-        Console.WriteLine();
-        Console.WriteLine("┌──────────────────────────────────────────────────────────────┐");
-        Console.WriteLine("│ TCP IPC                                                     │");
-        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
-        Console.WriteLine("│ • Reliable bidirectional communication                       │");
-        Console.WriteLine("│ • Useful for Windows Docker Desktop bind mounts              │");
-        Console.WriteLine("│ • Real-time progress streaming                               │");
-        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
-        Console.WriteLine("│ SECURITY                                                     │");
-        Console.WriteLine("├──────────────────────────────────────────────────────────────┤");
-        Console.WriteLine("│ • Login is REQUIRED before any other commands                │");
-        Console.WriteLine("│ • All credentials are encrypted using ECDH + AES-GCM         │");
-        Console.WriteLine("│ • Challenges expire after 5 minutes                          │");
-        Console.WriteLine("└──────────────────────────────────────────────────────────────┘");
-        Console.WriteLine();
+        Console.WriteLine(GetTcpStartupMessage(port));
 
         using var socketInterface = new SocketCommandInterface(port);
 
@@ -105,7 +72,7 @@ public static class DaemonMode
         {
             await Task.Delay(Timeout.Infinite, cancellationToken);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             Console.WriteLine("Daemon shutdown requested...");
         }
@@ -113,6 +80,12 @@ public static class DaemonMode
         await socketInterface.StopAsync();
         Console.WriteLine("Daemon stopped.");
     }
+
+    internal static string GetUnixStartupMessage(string socketPath)
+        => $"Starting SteamPrefill daemon on socket {socketPath}";
+
+    internal static string GetTcpStartupMessage(int port)
+        => $"Starting SteamPrefill daemon on TCP port {port}";
 }
 
 /// <summary>

@@ -22,13 +22,12 @@ public sealed class SocketCommandInterface : IDisposable
     private readonly SocketAuthProvider _authProvider;
     private readonly SocketProgress _progress;
     private readonly CancellationTokenSource _cts = new();
+    private readonly OwnedOperationCoordinator _prefillOperation = new();
     private CancellationTokenSource? _loginCts;
-    private CancellationTokenSource? _prefillCts;
     private SteamPrefillApi? _api;
     private Task? _loginTask;
     private bool _isLoggedIn;
     private bool _isLoggingIn;
-    private bool _isPrefilling;
     private bool _disposed;
 
     // Bumped by logout (and cancel-login) so a login task that is still unwinding (or already
@@ -59,10 +58,11 @@ public sealed class SocketCommandInterface : IDisposable
 
     public SocketCommandInterface(string socketPath)
     {
-        _progress = new SocketProgress();
+        _progress = new SocketProgress(enableDebugLogs: AppConfig.DebugLogs);
         _socketServer = new SocketServer(socketPath, _progress);
         _authProvider = new SocketAuthProvider(_socketServer, _progress);
         _socketServer.OnCommand = HandleCommandAsync;
+        _socketServer.CommandLaneSelector = request => ClassifyCommand(request.Type);
 
         // Wire up progress events to broadcast via socket
         _progress.SocketServer = _socketServer;
@@ -70,10 +70,11 @@ public sealed class SocketCommandInterface : IDisposable
 
     public SocketCommandInterface(int tcpPort)
     {
-        _progress = new SocketProgress();
+        _progress = new SocketProgress(enableDebugLogs: AppConfig.DebugLogs);
         _socketServer = new SocketServer(tcpPort, _progress);
         _authProvider = new SocketAuthProvider(_socketServer, _progress);
         _socketServer.OnCommand = HandleCommandAsync;
+        _socketServer.CommandLaneSelector = request => ClassifyCommand(request.Type);
 
         _progress.SocketServer = _socketServer;
     }
@@ -99,6 +100,7 @@ public sealed class SocketCommandInterface : IDisposable
     public async Task StopAsync()
     {
         _cts.Cancel();
+        await _prefillOperation.CancelAndWaitAsync();
         await _socketServer.StopAsync();
         _progress.OnLog(LogLevel.Info, "Socket command interface stopped");
     }
@@ -125,11 +127,11 @@ public sealed class SocketCommandInterface : IDisposable
             return request.Type.ToLowerInvariant() switch
             {
                 "login" => await HandleLoginAsync(request, cancellationToken),
-                "logout" => await HandleLogoutAsync(request),
+                "logout" => await HandleLogoutAsync(request, cancellationToken),
                 "cancel-login" => await HandleCancelLoginAsync(request),
-                "cancel-prefill" => HandleCancelPrefill(request),
+                "cancel-prefill" => await HandleCancelPrefillAsync(request, cancellationToken),
                 "provide-credential" => HandleProvideCredential(request),
-                "get-auto-login-challenge" => HandleGetAutoLoginChallengeAsync(request),
+                "get-auto-login-challenge" => HandleGetAutoLoginChallenge(request),
                 "provide-auto-login" => await HandleProvideAutoLoginAsync(request, cancellationToken),
                 "status" => HandleStatus(request),
                 "get-owned-games" => await HandleGetOwnedGamesAsync(request, cancellationToken),
@@ -140,7 +142,7 @@ public sealed class SocketCommandInterface : IDisposable
                 "get-cache-info" => HandleGetCacheInfo(request),
                 "get-selected-apps-status" => await HandleGetSelectedAppsStatusAsync(request, cancellationToken),
                 "check-cache-status" => await HandleCheckCacheStatusAsync(request, cancellationToken),
-                "shutdown" => HandleShutdown(request),
+                "shutdown" => await HandleShutdownAsync(request, cancellationToken),
                 _ => new CommandResponse
                 {
                     Id = request.Id,
@@ -149,6 +151,10 @@ public sealed class SocketCommandInterface : IDisposable
                     CompletedAt = DateTime.UtcNow
                 }
             };
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
@@ -271,8 +277,15 @@ public sealed class SocketCommandInterface : IDisposable
         });
     }
 
-    private async Task<CommandResponse> HandleLogoutAsync(CommandRequest request)
+    private async Task<CommandResponse> HandleLogoutAsync(
+        CommandRequest request,
+        CancellationToken cancellationToken)
     {
+        if (_prefillOperation.IsRunning)
+        {
+            await _prefillOperation.CancelAndWaitAsync(cancellationToken);
+        }
+
         // Bump the generation so any login task still unwinding (or one that never observes
         // the cancellation below) cannot resurrect _isLoggedIn/_api once it finally settles.
         Interlocked.Increment(ref _loginGeneration);
@@ -296,7 +309,7 @@ public sealed class SocketCommandInterface : IDisposable
             var loginTask = _loginTask;
             if (loginTask != null)
             {
-                await Task.WhenAny(loginTask, Task.Delay(LogoutLoginTaskTimeout));
+                await Task.WhenAny(loginTask, Task.Delay(LogoutLoginTaskTimeout, cancellationToken));
             }
         }
 
@@ -304,9 +317,6 @@ public sealed class SocketCommandInterface : IDisposable
 
         // Wipe the persisted account file AND its storage.key so the refresh token cannot linger
         // (or be silently re-decrypted by a later login re-using the same key) after logout.
-        // Session 20260703-221336-2070027597 (RC6): logout previously deleted only the account
-        // file, leaving storage.key on disk - any subsequent login re-persisted a token the SAME
-        // key could still decrypt, making the erase-on-stop/clear-logins policy incomplete.
         EraseAccountStore(_progress);
 
         _progress.OnLog(LogLevel.Info, "Logged out");
@@ -352,9 +362,24 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private CommandResponse HandleCancelPrefill(CommandRequest request)
+    internal static DaemonCommandLane ClassifyCommand(string commandType)
     {
-        if (!_isPrefilling)
+        return commandType.ToLowerInvariant() switch
+        {
+            "cancel-login" or "cancel-prefill" or "provide-credential" or "status" or "shutdown"
+                => DaemonCommandLane.Control,
+            "get-owned-games" or "get-selected-apps" or "get-cache-info" or
+                "get-selected-apps-status" or "check-cache-status"
+                => DaemonCommandLane.Concurrent,
+            _ => DaemonCommandLane.Serialized
+        };
+    }
+
+    private async Task<CommandResponse> HandleCancelPrefillAsync(
+        CommandRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (!_prefillOperation.IsRunning)
         {
             return new CommandResponse
             {
@@ -367,17 +392,25 @@ public sealed class SocketCommandInterface : IDisposable
 
         _progress.OnLog(LogLevel.Info, "Cancelling prefill...");
 
-        try
+        var result = await _prefillOperation.CancelAndWaitAsync(cancellationToken);
+        if (result.Status == OwnedOperationStatus.Failed)
         {
-            _prefillCts?.Cancel();
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = false,
+                Error = result.Exception?.Message ?? "Prefill failed while cancellation was requested",
+                CompletedAt = DateTime.UtcNow
+            };
         }
-        catch { /* ignore */ }
 
         return new CommandResponse
         {
             Id = request.Id,
             Success = true,
-            Message = "Prefill cancellation requested",
+            Message = result.Status == OwnedOperationStatus.Cancelled
+                ? "Prefill cancelled"
+                : "No prefill in progress",
             CompletedAt = DateTime.UtcNow
         };
     }
@@ -411,8 +444,8 @@ public sealed class SocketCommandInterface : IDisposable
             Tag = tag
         };
 
-        // Session 20260703-221336-2070027597 (RC4): only report success when the credential actually
-        // matched a live pending challenge. A dropped credential (no pending challenge, or a stale
+        // Only report success when the credential matched a live pending challenge. A dropped
+        // credential (no pending challenge, or a stale
         // challenge id from a replaced login session) must surface as a failure so the manager can
         // detect the desync instead of celebrating a credential the daemon silently discarded.
         var accepted = _authProvider.ReceiveCredential(response);
@@ -436,7 +469,7 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private CommandResponse HandleGetAutoLoginChallengeAsync(CommandRequest request)
+    private CommandResponse HandleGetAutoLoginChallenge(CommandRequest request)
     {
         using var ecdh = System.Security.Cryptography.ECDiffieHellman.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
         var parameters = ecdh.ExportParameters(true);
@@ -886,19 +919,20 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
+    private async Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         EnsureLoggedIn();
 
-        if (_isPrefilling)
+        if (_prefillOperation.IsRunning)
         {
-            return Task.FromResult(new CommandResponse
+            return new CommandResponse
             {
                 Id = request.Id,
                 Success = false,
                 Error = "A prefill is already in progress",
                 CompletedAt = DateTime.UtcNow
-            });
+            };
         }
 
         var options = new PrefillOptions();
@@ -957,60 +991,51 @@ public sealed class SocketCommandInterface : IDisposable
             }
         }
 
-        _prefillCts?.Dispose();
-        _prefillCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        _isPrefilling = true;
+        await _prefillOperation.StartAsync(
+            operationToken => RunPrefillOperationAsync(
+                _api!.PrefillAsync,
+                options,
+                _progress,
+                operationToken),
+            _cts.Token);
 
-        // Run prefill in background task so the command loop isn't blocked
-        // This allows cancel-prefill commands to be processed while prefill is running
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var result = await _api!.PrefillAsync(options, _prefillCts.Token);
-
-                if (result.Success)
-                {
-                    _progress.OnLog(LogLevel.Info, "Prefill completed successfully");
-                }
-                else
-                {
-                    _progress.OnLog(LogLevel.Warning, $"Prefill completed with errors: {result.ErrorMessage}");
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Emit a terminal progress event so the backend clears its own
-                // IsPrefilling flag. PrefillAsync did not emit a terminal event on this
-                // path, and the backend only clears on a terminal socket event or a
-                // disconnect — without this the backend strands IsPrefilling=true and
-                // 409s every future start. SocketProgress exposes no distinct "cancelled"
-                // emitter, so reuse OnError (state:"error"), which the backend treats as
-                // terminal. The backend terminal funnel is idempotent.
-                _progress.OnError("Prefill cancelled by user");
-            }
-            catch (Exception ex)
-            {
-                // Emit a terminal progress event (state:"error") so the backend clears its
-                // IsPrefilling flag; see the cancellation catch above for the rationale.
-                _progress.OnError($"Prefill failed: {ex.Message}", ex);
-            }
-            finally
-            {
-                _isPrefilling = false;
-                _prefillCts?.Dispose();
-                _prefillCts = null;
-            }
-        }, _prefillCts.Token);
-
-        // Return immediately - prefill process continues in background
-        return Task.FromResult(new CommandResponse
+        return new CommandResponse
         {
             Id = request.Id,
             Success = true,
             Message = "Prefill started",
             CompletedAt = DateTime.UtcNow
-        });
+        };
+    }
+
+    internal static async Task RunPrefillOperationAsync(
+        Func<PrefillOptions, CancellationToken, Task<PrefillResult>> prefillAsync,
+        PrefillOptions options,
+        SocketProgress progress,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var result = await prefillAsync(options, cancellationToken);
+            if (result.Success)
+            {
+                progress.OnLog(LogLevel.Info, "Prefill completed successfully");
+            }
+            else
+            {
+                progress.OnLog(LogLevel.Warning, $"Prefill completed with errors: {result.ErrorMessage}");
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            progress.OnCancelled("Prefill cancelled by user");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            progress.OnError($"Prefill failed: {ex.Message}", ex);
+            throw;
+        }
     }
 
     private CommandResponse HandleClearCache(CommandRequest request)
@@ -1129,8 +1154,15 @@ public sealed class SocketCommandInterface : IDisposable
         };
     }
 
-    private CommandResponse HandleShutdown(CommandRequest request)
+    private async Task<CommandResponse> HandleShutdownAsync(
+        CommandRequest request,
+        CancellationToken cancellationToken)
     {
+        if (_prefillOperation.IsRunning)
+        {
+            await _prefillOperation.CancelAndWaitAsync(cancellationToken);
+        }
+
         CleanupApiInstance();
 
         return new CommandResponse
@@ -1164,7 +1196,7 @@ public sealed class SocketCommandInterface : IDisposable
     /// <summary>
     /// Tears down an api instance that lost the generation race (superseded by a logout) without
     /// touching any of the shared fields, since a newer login/logout cycle may already own them.
-    /// Also erases the account store: session 20260703-221336-2070027597 (RC6) confirmed that
+    /// Also erases the account store because
     /// <see cref="Handlers.Steam.Steam3Session.GetAccessTokenAsync"/> calls <c>_userAccountStore.Save()</c>
     /// as soon as the auth poll returns, BEFORE this generation check runs, so an orphaned login that
     /// raced past a logout can still persist a fresh token to disk. Erasing here closes that
@@ -1185,8 +1217,8 @@ public sealed class SocketCommandInterface : IDisposable
 
     /// <summary>
     /// Deletes the persisted account file and its storage.key. Shared by <see cref="HandleLogoutAsync"/>
-    /// (explicit logout) and <see cref="DisposeOrphanedApi"/> (superseded-login resurrection guard) -
-    /// session 20260703-221336-2070027597 (RC6). Best-effort: both files may already be absent.
+    /// (explicit logout) and <see cref="DisposeOrphanedApi"/> (superseded-login resurrection guard).
+    /// Best-effort: both files may already be absent.
     /// TokenStorageEncryption self-heals a missing key by regenerating it and forcing a fresh login,
     /// so removing the key here is safe.
     /// </summary>
@@ -1225,7 +1257,7 @@ public sealed class SocketCommandInterface : IDisposable
 
         _cts.Cancel();
         _loginCts?.Dispose();
-        _prefillCts?.Dispose();
+        _prefillOperation.DisposeAsync().AsTask().GetAwaiter().GetResult();
         _cts.Dispose();
         _api?.Dispose();
         _authProvider.Dispose();
@@ -1238,11 +1270,24 @@ public sealed class SocketCommandInterface : IDisposable
     /// <summary>
     /// Progress implementation that broadcasts updates via socket.
     /// </summary>
-    private sealed class SocketProgress : IPrefillProgress
+    internal sealed class SocketProgress : IPrefillProgress
     {
+        private readonly Action<PrefillProgressUpdate>? _progressObserver;
+        private readonly DaemonLogSink _logSink;
         public SocketServer? SocketServer { get; set; }
         private DateTime _lastProgressBroadcast = DateTime.MinValue;
         private static readonly TimeSpan BroadcastThrottle = TimeSpan.FromMilliseconds(250);
+
+        internal SocketProgress(
+            Action<PrefillProgressUpdate>? progressObserver = null,
+            bool enableDebugLogs = false,
+            Action<string>? logWriter = null)
+        {
+            _progressObserver = progressObserver;
+            _logSink = new DaemonLogSink(
+                logWriter ?? Console.WriteLine,
+                enableDebugLogs ? DaemonLogLevel.Debug : DaemonLogLevel.Info);
+        }
 
         public void OnLog(LogLevel level, string message)
         {
@@ -1254,7 +1299,15 @@ public sealed class SocketCommandInterface : IDisposable
                 LogLevel.Error => "[ERROR]",
                 _ => "[LOG]"
             };
-            Console.WriteLine($"{DateTime.UtcNow:HH:mm:ss} {prefix} {message}");
+            var daemonLevel = level switch
+            {
+                LogLevel.Debug => DaemonLogLevel.Debug,
+                LogLevel.Info => DaemonLogLevel.Info,
+                LogLevel.Warning => DaemonLogLevel.Warning,
+                LogLevel.Error => DaemonLogLevel.Error,
+                _ => DaemonLogLevel.Info
+            };
+            _logSink.Write(daemonLevel, $"{DateTime.UtcNow:HH:mm:ss} {prefix} {message}");
         }
 
         public void OnOperationStarted(string operationName)
@@ -1372,8 +1425,20 @@ public sealed class SocketCommandInterface : IDisposable
             });
         }
 
+        internal void OnCancelled(string message)
+        {
+            OnLog(LogLevel.Info, message);
+            BroadcastProgress(new PrefillProgressUpdate
+            {
+                State = "cancelled",
+                Message = message,
+                UpdatedAt = DateTime.UtcNow
+            });
+        }
+
         private void BroadcastProgress(PrefillProgressUpdate update)
         {
+            _progressObserver?.Invoke(update);
             if (SocketServer == null) return;
 
             var progressEvent = new ProgressEvent(update);

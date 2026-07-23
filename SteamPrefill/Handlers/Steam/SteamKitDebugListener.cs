@@ -6,8 +6,6 @@ namespace SteamPrefill.Handlers.Steam
 
         public SteamKitDebugListener(IAnsiConsole ansiConsole)
         {
-            DebugLog.Enabled = true;
-
             if (ansiConsole == null)
             {
                 throw new ArgumentException("ansiConsole cannot be null");

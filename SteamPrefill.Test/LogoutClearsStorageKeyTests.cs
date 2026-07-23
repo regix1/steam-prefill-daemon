@@ -6,7 +6,7 @@ using Xunit;
 namespace SteamPrefill.Test
 {
     /// <summary>
-    /// Regression coverage for RC6 (session 20260703-221336-2070027597): HandleLogoutAsync deleted only
+    /// HandleLogoutAsync previously deleted only
     /// the account file and left storage.key on the persistent volume, so a subsequent login could
     /// re-save a token the SAME key decrypts, making the volume login sticky across erase-on-stop.
     /// Logout must now delete storage.key alongside the account file.

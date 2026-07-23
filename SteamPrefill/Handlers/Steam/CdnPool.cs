@@ -7,7 +7,7 @@ namespace SteamPrefill.Handlers.Steam
     public sealed class CdnPool
     {
         private readonly IAnsiConsole _ansiConsole;
-        private readonly Steam3Session _steamSession;
+        private readonly Func<Task<Server[]>> _requestServersAsync;
 
         private readonly int _minimumServerCount = 5;
         private readonly int _maxRetries = 3;
@@ -17,7 +17,8 @@ namespace SteamPrefill.Handlers.Steam
         public CdnPool(IAnsiConsole ansiConsole, Steam3Session steamSession)
         {
             _ansiConsole = ansiConsole;
-            _steamSession = steamSession;
+            _requestServersAsync = async () =>
+                (await steamSession.SteamContent.GetServersForSteamPipe()).ToArray();
         }
 
         /// <summary>
@@ -28,6 +29,14 @@ namespace SteamPrefill.Handlers.Steam
         {
             _ansiConsole = ansiConsole;
             AvailableServerEndpoints = availableServers;
+            _requestServersAsync = () => Task.FromException<Server[]>(
+                new InvalidOperationException("The benchmark CDN pool cannot request Steam servers."));
+        }
+
+        internal CdnPool(IAnsiConsole ansiConsole, Func<Task<Server[]>> requestServersAsync)
+        {
+            _ansiConsole = ansiConsole;
+            _requestServersAsync = requestServersAsync;
         }
 
         /// <summary>
@@ -35,8 +44,10 @@ namespace SteamPrefill.Handlers.Steam
         /// Required to be called prior to using the class.
         /// </summary>
         /// <exception cref="CdnExhaustionException">If no servers are available for use, this exception will be thrown.</exception>
-        public async Task PopulateAvailableServersAsync()
+        public async Task PopulateAvailableServersAsync(
+            CancellationToken cancellationToken = default)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (AvailableServerEndpoints.Count >= _minimumServerCount)
             {
                 return;
@@ -51,12 +62,13 @@ namespace SteamPrefill.Handlers.Steam
             {
                 while (AvailableServerEndpoints.Count < _minimumServerCount && retryCount <= _maxRetries)
                 {
-                    await RequestSteamCdnServersAsync();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    await RequestSteamCdnServersAsync(cancellationToken);
 
                     // Condition prevents the retry message from being displayed on the first run.
                     var retryMessage = retryCount > 0 ? LightYellow($"Retrying {retryCount}") : "";
                     task.Status($"{statusMessageBase} {retryMessage}");
-                    await Task.Delay(retryCount * 250);
+                    await Task.Delay(retryCount * 250, cancellationToken);
 
                     retryCount++;
                 }
@@ -78,28 +90,43 @@ namespace SteamPrefill.Handlers.Steam
 
         }
 
-        private async Task RequestSteamCdnServersAsync()
+        private async Task RequestSteamCdnServersAsync(CancellationToken cancellationToken)
         {
+            var requestTask = Task.Run(_requestServersAsync, CancellationToken.None);
             try
             {
                 // GetServersForSteamPipe() sometimes hangs and never times out.  Wrapping the call in another task, so that we can timeout the entire method.
-                await Task.Run(async () =>
-                {
-                    var returnedServers = await _steamSession.SteamContent.GetServersForSteamPipe();
-                    AvailableServerEndpoints.PushRange(returnedServers.ToArray());
+                var returnedServers = await requestTask.WaitAsync(
+                    TimeSpan.FromSeconds(15),
+                    cancellationToken);
+                AvailableServerEndpoints.PushRange(returnedServers);
 
-                    // Filtering out non-cacheable CDNs.  HTTPS servers are included, as they appear to be able to be manually overridden to HTTP.
-                    // SteamCache type servers are Valve run.  CDN type servers appear to be ISP run.
-                    AvailableServerEndpoints = AvailableServerEndpoints
-                                                .Where(e => (e.Type == "SteamCache" || e.Type == "CDN") && e.AllowedAppIds.Length == 0)
-                                                .DistinctBy(e => e.Host)
-                                                .ToConcurrentStack();
-                }).WaitAsync(TimeSpan.FromSeconds(15));
+                // Filtering out non-cacheable CDNs.  HTTPS servers are included, as they appear to be able to be manually overridden to HTTP.
+                // SteamCache type servers are Valve run.  CDN type servers appear to be ISP run.
+                AvailableServerEndpoints = AvailableServerEndpoints
+                                            .Where(e => (e.Type == "SteamCache" || e.Type == "CDN") && e.AllowedAppIds.Length == 0)
+                                            .DistinctBy(e => e.Host)
+                                            .ToConcurrentStack();
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                ObserveFault(requestTask);
+                throw;
             }
             catch (TimeoutException)
             {
+                ObserveFault(requestTask);
                 // Swallowing timeout exceptions, so that we can retry and see if the next attempt succeeds
             }
+        }
+
+        private static void ObserveFault(Task task)
+        {
+            _ = task.ContinueWith(
+                completedTask => _ = completedTask.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
         }
 
         /// <summary>

@@ -94,12 +94,16 @@
         /// <summary>
         /// Filters depots based on the language/operating system/cpu architecture specified in the DownloadArguments
         /// </summary>
-        public async Task<List<DepotInfo>> FilterDepotsToDownloadAsync(DownloadArguments downloadArgs, List<DepotInfo> allDepots)
+        public async Task<List<DepotInfo>> FilterDepotsToDownloadAsync(
+            DownloadArguments downloadArgs,
+            List<DepotInfo> allDepots,
+            CancellationToken cancellationToken = default)
         {
             var filteredDepots = new List<DepotInfo>();
 
             foreach (var depot in allDepots)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (ExcludedDepots.Ids.Contains(depot.DepotId))
                 {
                     continue;
@@ -116,7 +120,9 @@
                     continue;
                 }
 
-                AppInfo containingApp = await _appInfoHandler.GetAppInfoAsync(depot.ContainingAppId);
+                AppInfo containingApp = await _appInfoHandler.GetAppInfoAsync(
+                    depot.ContainingAppId,
+                    cancellationToken);
                 if (containingApp.IsInvalidApp)
                 {
                     continue;
@@ -153,12 +159,17 @@
 
         //TODO document how this works, and why its needed
         //TODO I don't like the fact that this has to be manually called in order to have things work correctly
-        public async Task BuildLinkedDepotInfoAsync(List<DepotInfo> depots)
+        public async Task BuildLinkedDepotInfoAsync(
+            List<DepotInfo> depots,
+            CancellationToken cancellationToken = default)
         {
             foreach (var depotInfo in depots.Where(e => e.ManifestId == null))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 // Shared depots will have to go get the manifest id from the original app's depot
-                var linkedApp = await _appInfoHandler.GetAppInfoAsync(depotInfo.DepotFromApp.Value);
+                var linkedApp = await _appInfoHandler.GetAppInfoAsync(
+                    depotInfo.DepotFromApp.Value,
+                    cancellationToken);
                 var linkedDepot = linkedApp.Depots.First(e => e.DepotId == depotInfo.DepotId);
                 depotInfo.ManifestId = linkedDepot.ManifestId;
             }
@@ -168,14 +179,17 @@
         /// Downloads all of the required manifests for a game, and then combines all of the required chunk requests into a single queue.
         /// </summary>
         /// <returns></returns>
-        public async Task<List<QueuedRequest>> BuildChunkDownloadQueueAsync(List<DepotInfo> depots)
+        public async Task<List<QueuedRequest>> BuildChunkDownloadQueueAsync(
+            List<DepotInfo> depots,
+            CancellationToken cancellationToken = default)
         {
-            var depotManifests = await _manifestHandler.GetAllManifestsAsync(depots);
+            var depotManifests = await _manifestHandler.GetAllManifestsAsync(depots, cancellationToken);
 
             // Queueing up chunks for each depot
             var chunkQueue = new List<QueuedRequest>();
             foreach (var depotManifest in depotManifests)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 // A depot will contain multiple files, that are broken up into 1MB chunks
                 var dedupedChunks = depotManifest.Files
                                                  .SelectMany(e => e.Chunks)
@@ -185,6 +199,7 @@
 
                 foreach (ChunkData chunk in dedupedChunks)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     chunkQueue.Add(new QueuedRequest(depotManifest, chunk));
                 }
             }

@@ -14,6 +14,7 @@ namespace SteamPrefill.Test
     public sealed class DepotHandlerTests
     {
         private readonly DepotHandler _depotHandler;
+        private readonly Mock<AppInfoHandler> _appInfoHandlerMock;
 
         public DepotHandlerTests()
         {
@@ -34,11 +35,13 @@ namespace SteamPrefill.Test
                     }
                 }
             };
-            var appInfoHandlerMock = new Mock<AppInfoHandler>(null, null, null);
-            appInfoHandlerMock.Setup(e => e.GetAppInfoAsync(It.IsAny<uint>()))
-                          .Returns(Task.FromResult(new AppInfo(steam3, 222, appKeyValues)));
+            _appInfoHandlerMock = new Mock<AppInfoHandler>(null, null, null);
+            _appInfoHandlerMock.Setup(e => e.GetAppInfoAsync(
+                                   It.IsAny<uint>(),
+                                   It.IsAny<CancellationToken>()))
+                               .Returns(Task.FromResult(new AppInfo(steam3, 222, appKeyValues)));
 
-            _depotHandler = new DepotHandler(new TestConsole(), steam3, appInfoHandlerMock.Object, null);
+            _depotHandler = new DepotHandler(new TestConsole(), steam3, _appInfoHandlerMock.Object, null);
         }
 
         [Fact]
@@ -181,6 +184,35 @@ namespace SteamPrefill.Test
             var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(new DownloadArguments(), depotList);
             // Low violence depots should be expected to be filtered.
             Assert.Empty(filteredDepots);
+        }
+
+        [Fact]
+        public async Task FilteringDepots_PropagatesCallerCancellation()
+        {
+            var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _appInfoHandlerMock.Setup(e => e.GetAppInfoAsync(
+                                   It.IsAny<uint>(),
+                                   It.IsAny<CancellationToken>()))
+                               .Returns(async (uint _, CancellationToken token) =>
+                               {
+                                   requestStarted.TrySetResult();
+                                   await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                                   throw new InvalidOperationException("The cancelled app-info request unexpectedly resumed.");
+                               });
+            using var cancellation = new CancellationTokenSource();
+
+            var filterTask = _depotHandler.FilterDepotsToDownloadAsync(
+                new DownloadArguments(),
+                new List<DepotInfo>
+                {
+                    new(new KeyValue("0"), 222) { DepotId = 123, ManifestId = 5555 }
+                },
+                cancellation.Token);
+            await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            cancellation.Cancel();
+
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => filterTask);
         }
     }
 }
