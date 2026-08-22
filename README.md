@@ -52,6 +52,13 @@ Sign in once before prefilling — every command runs after login.
 3. **Resolve** — each app's manifest and CDN URLs are looked up from Steam's content system.
 4. **Prefill** — each app's content is fetched through the lancache and discarded, warming the cache.
 
+## DLC and incomplete depots
+
+Owned DLC is included with the parent game. Manifests are requested under the
+DLC's own AppID unless Steam points the depot at a shared app. Depots with no
+downloadable content are skipped. If one depot fails, the rest of the game still
+prefills, and the app is not treated as up to date until every depot succeeds.
+
 ## Requirements
 
 - A running [LANCache](https://lancache.net/) with the **`steam`** cache-domain
