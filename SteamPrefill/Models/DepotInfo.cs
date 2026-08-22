@@ -28,8 +28,8 @@
                     return fromApp;
                 }
                 return SourceAppId;
-                }
             }
+        }
 
         /// <summary>
         /// App the account must own to access this depot.

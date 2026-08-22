@@ -162,9 +162,9 @@
         {
             var dlcAppIds = LoadedAppInfos.Values.SelectMany(e => e.DlcAppIds).ToList();
             var manifestAppIds = LoadedAppInfos.Values.Where(e => e.Type == AppType.Game)
-                                                 .SelectMany(e => e.Depots)
+                                               .SelectMany(e => e.Depots)
                                                .Select(e => e.ManifestRequestAppId)
-                                                 .ToList();
+                                               .ToList();
 
             var idsToLoad = manifestAppIds.Union(dlcAppIds).ToList();
             await BulkLoadAppInfoAsync(idsToLoad, cancellationToken);

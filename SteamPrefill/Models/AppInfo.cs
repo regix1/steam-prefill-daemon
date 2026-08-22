@@ -92,7 +92,7 @@ namespace SteamPrefill.Models
             DlcAppIds =
             [
                 .. new[]
-            {
+                    {
                         rootKeyValue["common"]["listofdlc"].Value,
                         rootKeyValue["extended"]["listofdlc"].Value
                     }
@@ -102,8 +102,8 @@ namespace SteamPrefill.Models
                     .Where(e => e.HasValue)
                     .Select(e => e.Value)
                     .Distinct()
-                                     // Only including DLC that we own
-                                     .Where(e => steamSession.LicenseManager.AccountHasAppAccess(e))
+                    // Only including DLC that we own
+                    .Where(e => steamSession.LicenseManager.AccountHasAppAccess(e))
             ];
 
             Categories = rootKeyValue["common"]["category"]

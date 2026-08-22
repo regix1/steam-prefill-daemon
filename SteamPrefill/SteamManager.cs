@@ -361,13 +361,13 @@
                 }
                 else
                 {
-                _prefillSummaryResult.Updated++;
-                _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
+                    _prefillSummaryResult.Updated++;
+                    _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
 
-                // Logging some metrics about the download
-                _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
-                _ansiConsole.WriteLine();
-            }
+                    // Logging some metrics about the download
+                    _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
+                    _ansiConsole.WriteLine();
+                }
             }
             else
             {
