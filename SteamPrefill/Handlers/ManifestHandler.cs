@@ -23,7 +23,7 @@ namespace SteamPrefill.Handlers
             _requestManifestCodeAsync = depot =>
                 steam3Session.SteamContent.GetManifestRequestCode(
                     depot.DepotId,
-                    depot.ContainingAppId,
+                    depot.ManifestRequestAppId,
                     depot.ManifestId.Value,
                     "public");
             _downloadManifestAsync = (depot, manifestRequestCode, server) =>
@@ -49,10 +49,10 @@ namespace SteamPrefill.Handlers
         /// <summary>
         /// Downloads all of the manifests for a list of specified depots.
         /// Will retry up to 3 times, in the case of transient errors.
-        /// If the download for a manifest has failed 3 times, it will skip downloading the current app.
+        /// If the download for a manifest has failed 3 times, the depot is removed from <paramref name="depots"/> and
+        /// returned as skipped, so that the caller can tell that the app was not fully downloaded.
         /// </summary>
-        /// <exception cref="ManifestException"></exception>
-        public async Task<List<Manifest>> GetAllManifestsAsync(
+        public async Task<(List<Manifest> Manifests, List<DepotInfo> SkippedDepots)> GetAllManifestsAsync(
             List<DepotInfo> depots,
             CancellationToken cancellationToken = default)
         {
@@ -60,13 +60,14 @@ namespace SteamPrefill.Handlers
             _ansiConsole.LogMarkupVerbose($"Downloading manifests for {Magenta(depots.Count)} depots");
 
             var depotManifests = new List<Manifest>();
+            var skippedDepots = new List<DepotInfo>();
 
             // Loading manifests already on disk in parallel
             var cachedManifestTasks = depots.Where(e => ManifestIsCached(e))
-                                                        .Select(e => GetSingleManifestAsync(e, cancellationToken))
+                                                        .Select(e => LoadCachedManifestAsync(e, cancellationToken))
                                                         .ToList();
             var resultManifests = await Task.WhenAll(cachedManifestTasks);
-            depotManifests.AddRange(resultManifests);
+            depotManifests.AddRange(resultManifests.Where(e => e != null));
 
             // Downloading un-cached depots from the internet
             foreach (var depot in depots.Where(e => !ManifestIsCached(e)).ToList())
@@ -107,13 +108,42 @@ namespace SteamPrefill.Handlers
 
                     if (attempt >= MaxRetries)
                     {
-                        throw new ManifestException("Unable to download manifests!");
+                        // Every remaining failure costs a single depot.  Cancellation and the 508 infinite loop are
+                        // rethrown above instead, as neither is fixed by moving on to the next depot.
+                        _ansiConsole.LogMarkupError(
+                            $"Unable to download manifest for depot {LightYellow(depot.DepotId)} after {MaxRetries} attempts.  Skipping this depot...");
+                        depots.Remove(depot);
+                        skippedDepots.Add(depot);
+                        break;
                     }
 
                     await Task.Delay(500 * attempt, cancellationToken);
                 }
             }
-            return depotManifests;
+            return (depotManifests, skippedDepots);
+        }
+
+        /// <summary>
+        /// Loads a manifest that was previously saved to disk.  A manifest file that can no longer be read is deleted,
+        /// so that the depot falls through to the download path below.
+        /// </summary>
+        private async Task<Manifest> LoadCachedManifestAsync(DepotInfo depot, CancellationToken cancellationToken)
+        {
+            try
+            {
+                return await GetSingleManifestAsync(depot, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception e)
+            {
+                _ansiConsole.LogMarkupError($"Unable to read the saved manifest for depot {LightYellow(depot.DepotId)}.  Downloading it again...");
+                FileLogger.LogException("An exception occurred while loading a saved manifest", e);
+                File.Delete(depot.ManifestFileName);
+                return null;
+            }
         }
 
         /// <summary>

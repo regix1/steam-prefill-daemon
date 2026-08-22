@@ -1,6 +1,4 @@
-﻿using SteamPrefill.Api;
-
-namespace SteamPrefill
+﻿namespace SteamPrefill
 {
     public sealed class SteamManager : IDisposable
     {
@@ -18,16 +16,32 @@ namespace SteamPrefill
         private readonly IPrefillProgress _progress;
 
         public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null)
+            : this(ansiConsole, downloadArgs, new Steam3Session(ansiConsole, authProvider), progress)
+        {
+        }
+
+        /// <summary>
+        /// Takes the Steam session and the handlers built on top of it, so that a caller can supply handlers that
+        /// don't need a connection to Steam.  Anything not supplied is built the same way the public constructor builds it.
+        /// </summary>
+        internal SteamManager(
+            IAnsiConsole ansiConsole,
+            DownloadArguments downloadArgs,
+            Steam3Session steam3,
+            IPrefillProgress progress = null,
+            CdnPool cdnPool = null,
+            AppInfoHandler appInfoHandler = null,
+            DepotHandler depotHandler = null)
         {
             _ansiConsole = ansiConsole;
             _downloadArgs = downloadArgs;
             _progress = progress ?? NullProgress.Instance;
 
-            _steam3 = new Steam3Session(_ansiConsole, authProvider);
-            _cdnPool = new CdnPool(_ansiConsole, _steam3);
-            _appInfoHandler = new AppInfoHandler(_ansiConsole, _steam3, _steam3.LicenseManager);
+            _steam3 = steam3;
+            _cdnPool = cdnPool ?? new CdnPool(_ansiConsole, _steam3);
+            _appInfoHandler = appInfoHandler ?? new AppInfoHandler(_ansiConsole, _steam3, _steam3.LicenseManager);
             _downloadHandler = new DownloadHandler(_ansiConsole, _cdnPool, _progress);
-            _depotHandler = new DepotHandler(_ansiConsole, _steam3, _appInfoHandler, _cdnPool);
+            _depotHandler = depotHandler ?? new DepotHandler(_ansiConsole, _steam3, _appInfoHandler, _cdnPool);
         }
 
         #region Startup + Shutdown
@@ -232,20 +246,52 @@ namespace SteamPrefill
             }
 
             await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, cancellationToken);
+            if (filteredDepots.Empty())
+            {
+                _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
+                _progress.OnAppCompleted(
+                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                    AppDownloadResult.NoDepotsToDownload);
+                return;
+            }
 
             // Get the full file list for each depot, and queue up the required chunks
             // We do this before the up-to-date check so we can report accurate sizes for cached games
             await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
 
             List<QueuedRequest> chunkDownloadQueue = null;
+            List<DepotInfo> skippedDepots = null;
             await _ansiConsole.StatusSpinner().StartAsync(
                 "Fetching depot manifests...",
                 async _ =>
                 {
-                    chunkDownloadQueue = await _depotHandler.BuildChunkDownloadQueueAsync(
+                    (chunkDownloadQueue, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
                         filteredDepots,
                         cancellationToken);
                 });
+            if (skippedDepots.Any())
+            {
+                _ansiConsole.LogMarkupError(
+                    $"{LightYellow(skippedDepots.Count)} depots for {Cyan(appInfo)} could not be downloaded");
+                // Every depot failed — nothing left to queue. That is a manifest failure, not a filter exclusion.
+                if (filteredDepots.Empty())
+                {
+                    _prefillSummaryResult.FailedApps++;
+                    _progress.OnAppCompleted(
+                        new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                        AppDownloadResult.Failed);
+                    return;
+                }
+            }
+
+            if (filteredDepots.Empty())
+            {
+                _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
+                _progress.OnAppCompleted(
+                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                    AppDownloadResult.NoDepotsToDownload);
+                return;
+            }
 
             var totalBytes = ByteSize.FromBytes(chunkDownloadQueue.Sum(e => e.CompressedLength));
 
@@ -261,7 +307,7 @@ namespace SteamPrefill
                 .ToList();
 
             // We will want to re-download the entire app, if any of the depots have been updated
-            if (_downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots))
+            if (_downloadArgs.Force == false && !skippedDepots.Any() && _depotHandler.AppIsUpToDate(filteredDepots))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
                 var cachedAppInfo = new AppDownloadInfo
@@ -307,12 +353,21 @@ namespace SteamPrefill
             if (downloadSuccessful)
             {
                 _depotHandler.MarkDownloadAsSuccessful(filteredDepots);
+                if (skippedDepots.Any())
+                {
+                    // Sibling depots were cached, but the app is still incomplete.
+                    _prefillSummaryResult.FailedApps++;
+                    _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Failed);
+                }
+                else
+                {
                 _prefillSummaryResult.Updated++;
                 _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
 
                 // Logging some metrics about the download
                 _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
                 _ansiConsole.WriteLine();
+            }
             }
             else
             {
@@ -437,10 +492,37 @@ namespace SteamPrefill
                     }
 
                     await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
+                    if (filteredDepots.Count == 0)
+                    {
+                        appStatuses.Add(new AppStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            UnavailableReason = "No downloadable depots"
+                        });
+                        return;
+                    }
 
-                    var allChunksForApp = await _depotHandler.BuildChunkDownloadQueueAsync(
+                    var (allChunksForApp, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
                         filteredDepots,
                         loopToken);
+                    // Every depot can be dropped while fetching manifests, and an empty list would otherwise
+                    // report the app as up to date with nothing left to download
+                    if (filteredDepots.Count == 0)
+                    {
+                        appStatuses.Add(new AppStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            UnavailableReason = "No downloadable depots"
+                        });
+                        return;
+                    }
+
                     var downloadSize = allChunksForApp.Sum(e => e.CompressedLength);
 
                     // Determine if app is up to date
@@ -457,6 +539,14 @@ namespace SteamPrefill
                     {
                         // Fall back to daemon's internal cache (will be empty on fresh session)
                         isUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots);
+                    }
+
+                    // A depot that couldn't be fetched is removed from the list, so the depots left behind can all be
+                    // cached and still leave the app incomplete.  A prefill counts this app as failed, so the status
+                    // has to report it as needing a download instead of up to date.
+                    if (skippedDepots.Any())
+                    {
+                        isUpToDate = false;
                     }
 
                     appStatuses.Add(new AppStatus
@@ -564,6 +654,18 @@ namespace SteamPrefill
                     }
 
                     await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
+                    if (filteredDepots.Count == 0)
+                    {
+                        appStatuses.Add(new AppCacheStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            OutdatedDepots = new List<OutdatedDepot>()
+                        });
+                        return;
+                    }
 
                     // Get cached manifests for this app
                     var cachedManifests = cachedByApp.GetValueOrDefault(app.AppId) ?? new Dictionary<uint, ulong>();
@@ -593,10 +695,17 @@ namespace SteamPrefill
                     {
                         var outdatedDepotIds = outdatedDepots.Select(d => d.DepotId).ToHashSet();
                         var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
-                        var chunks = await _depotHandler.BuildChunkDownloadQueueAsync(
+                        var (chunks, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
                             depotsToDownload,
                             loopToken);
                         downloadSize = chunks.Sum(e => e.CompressedLength);
+
+                        // The depots stay listed as outdated, they just have no size to add, so say so rather than
+                        // letting the total quietly come up short
+                        if (skippedDepots.Any())
+                        {
+                            _ansiConsole.LogMarkupError($"Could not size {skippedDepots.Count} depots for {app.Name} ({app.AppId}), the download size is incomplete");
+                        }
                     }
 
                     appStatuses.Add(new AppCacheStatus

@@ -214,5 +214,233 @@ namespace SteamPrefill.Test
 
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => filterTask);
         }
+
+        [Fact]
+        public void EmptyDepotList_ReportsUpToDate()
+        {
+            // All() over an empty list is true, so a list that emptied out while fetching manifests reports the app
+            // as up to date with nothing to download.  Every caller has to check for an empty list before trusting this.
+            Assert.True(_depotHandler.AppIsUpToDate(new List<DepotInfo>()));
+        }
+
+        [Fact]
+        public void ManifestlessSelfLinkedDepot_IsInvalid()
+        {
+            var depotKey = new KeyValue("123")
+            {
+                Children = { new KeyValue("depotfromapp", "123") }
+            };
+
+            Assert.True(new DepotInfo(depotKey, 222).IsInvalidDepot);
+        }
+
+        [Fact]
+        public void ExplicitlyEmptyPublicManifest_IsInvalid()
+        {
+            var depotKey = new KeyValue("1770480")
+            {
+                Children =
+                {
+                    new KeyValue("dlcappid", "1770480"),
+                    new KeyValue("manifests")
+                    {
+                        Children =
+                        {
+                            new KeyValue("public")
+                            {
+                                Children =
+                                {
+                                    new KeyValue("gid", "2836902461265788005"),
+                                    new KeyValue("size", "0"),
+                                    new KeyValue("download", "0")
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            Assert.True(new DepotInfo(depotKey, 1770480).IsInvalidDepot);
+        }
+
+        [Fact]
+        public void VtolDlcDepot_UsesDlcAppForManifestAndLicense()
+        {
+            var depotKey = new KeyValue("1770480")
+            {
+                Children =
+                {
+                    new KeyValue("dlcappid", "1770480"),
+                    new KeyValue("manifests")
+                    {
+                        Children = { new KeyValue("public", "2836902461265788005") }
+                    }
+                }
+            };
+            var depot = new DepotInfo(depotKey, 1770480);
+            depot.AttachToParentApp(667970, 1770480);
+
+            Assert.False(depot.IsInvalidDepot);
+            Assert.Equal(1770480U, depot.SourceAppId);
+            Assert.Equal(1770480U, depot.ManifestRequestAppId);
+            Assert.Equal(1770480U, depot.LicenseAppId);
+            Assert.Equal(667970U, depot.ParentAppId);
+            Assert.DoesNotContain(1770480UL, ExcludedDepots.Ids);
+        }
+
+        [Fact]
+        public async Task DlcDepotWithSelfLinkedDepotFromApp_IsAttachedToTheBaseGame()
+        {
+            var steam3 = new Steam3Session(null);
+            steam3.LicenseManager._userLicenses.OwnedAppIds.Add(1770480);
+            var baseGameKeyValues = new KeyValue
+            {
+                Children =
+                {
+                    new KeyValue("common")
+                    {
+                        Children =
+                        {
+                            new KeyValue("type", "game"),
+                            new KeyValue("listofdlc", "1770480")
+                        }
+                    }
+                }
+            };
+            var dlcKeyValues = new KeyValue
+            {
+                Children =
+                {
+                    new KeyValue("common") { Children = { new KeyValue("type", "dlc") } },
+                    new KeyValue("depots")
+                    {
+                        Children =
+                        {
+                            new KeyValue("1770480")
+                            {
+                                Children =
+                                {
+                                    new KeyValue("depotfromapp", "1770480"),
+                                    new KeyValue("dlcappid", "1770480"),
+                                    new KeyValue("manifests")
+                                    {
+                                        Children = { new KeyValue("public", "2836902461265788005") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            var appInfoHandler = new AppInfoHandler(new TestConsole(), steam3, steam3.LicenseManager);
+            var baseGame = new AppInfo(steam3, 667970, baseGameKeyValues);
+            appInfoHandler.LoadedAppInfos.TryAdd(667970, baseGame);
+            appInfoHandler.LoadedAppInfos.TryAdd(1770480, new AppInfo(steam3, 1770480, dlcKeyValues));
+
+            await appInfoHandler.FetchDlcAppInfoAsync(CancellationToken.None);
+
+            var attachedDepot = Assert.Single(baseGame.Depots);
+            Assert.Equal(1770480u, attachedDepot.ManifestRequestAppId);
+            Assert.Equal(1770480u, attachedDepot.LicenseAppId);
+        }
+
+        [Fact]
+        public async Task DlcDepotFromSteamMetadata_IsAttachedToTheBaseGame()
+        {
+            var steam3 = new Steam3Session(null);
+            steam3.LicenseManager._userLicenses.OwnedAppIds.Add(1770480);
+            var baseGameKeyValues = new KeyValue
+            {
+                Children =
+                {
+                    new KeyValue("common") { Children = { new KeyValue("type", "game") } },
+                    new KeyValue("extended") { Children = { new KeyValue("listofdlc", "1770480") } }
+                }
+            };
+            var dlcKeyValues = new KeyValue
+            {
+                Children =
+                {
+                    new KeyValue("common") { Children = { new KeyValue("type", "dlc") } },
+                    new KeyValue("depots")
+                    {
+                        Children =
+                        {
+                            new KeyValue("1770480")
+                            {
+                                Children =
+                                {
+                                    new KeyValue("dlcappid", "1770480"),
+                                    new KeyValue("manifests")
+                                    {
+                                        Children = { new KeyValue("public", "2836902461265788005") }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            var appInfoHandler = new AppInfoHandler(new TestConsole(), steam3, steam3.LicenseManager);
+            var baseGame = new AppInfo(steam3, 667970, baseGameKeyValues);
+            appInfoHandler.LoadedAppInfos.TryAdd(667970, baseGame);
+            appInfoHandler.LoadedAppInfos.TryAdd(1770480, new AppInfo(steam3, 1770480, dlcKeyValues));
+
+            await appInfoHandler.FetchDlcAppInfoAsync(CancellationToken.None);
+
+            // The base game is found through the DLC list, none of these ids are handed to the depot by the test
+            var attachedDepot = Assert.Single(baseGame.Depots);
+            Assert.Equal(1770480U, attachedDepot.DepotId);
+            Assert.Equal(1770480U, attachedDepot.SourceAppId);
+            Assert.Equal(1770480U, attachedDepot.ManifestRequestAppId);
+            Assert.Equal(1770480U, attachedDepot.LicenseAppId);
+        }
+
+        [Fact]
+        public void SharedDlcDepot_UsesLinkedAppForManifestAndDlcAppForLicense()
+        {
+            var depotKey = new KeyValue("123")
+            {
+                Children =
+                {
+                    new KeyValue("depotfromapp", "333"),
+                    new KeyValue("dlcappid", "444")
+                }
+            };
+            var depot = new DepotInfo(depotKey, 222) { ManifestId = 555 };
+
+            Assert.Equal(333U, depot.ManifestRequestAppId);
+            Assert.Equal(444U, depot.LicenseAppId);
+        }
+
+        [Fact]
+        public async Task UserDoesNotOwnDlcApp_DepotIsFiltered()
+        {
+            var depotKey = new KeyValue("123")
+            {
+                Children = { new KeyValue("dlcappid", "444") }
+            };
+            var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                new DownloadArguments(),
+                new List<DepotInfo> { new DepotInfo(depotKey, 222) { ManifestId = 5555 } });
+
+            Assert.Empty(filteredDepots);
+        }
+
+        [Fact]
+        public async Task LinkedDepotWithoutMatchingManifest_IsRemovedWithoutDroppingValidDepots()
+        {
+            var depotKey = new KeyValue("123")
+            {
+                Children = { new KeyValue("depotfromapp", "333") }
+            };
+            var validDepot = new DepotInfo(new KeyValue("0"), 222) { DepotId = 456, ManifestId = 789 };
+            var depots = new List<DepotInfo> { validDepot, new DepotInfo(depotKey, 222) };
+
+            await _depotHandler.BuildLinkedDepotInfoAsync(depots);
+
+            Assert.Single(depots);
+            Assert.Same(validDepot, depots[0]);
+        }
     }
 }

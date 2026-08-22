@@ -6,39 +6,49 @@
         public string Name { get; }
 
         public ulong? ManifestId { get; set; }
+        public bool HasExplicitlyEmptyPublicManifest { get; }
 
-        public string ManifestFileName => $"{AppConfig.TempDir}/{_originalAppId}_{ContainingAppId}_{DepotId}_{ManifestId}.bin";
+        public string ManifestFileName => $"{AppConfig.TempDir}/{SourceAppId}_{ManifestRequestAppId}_{DepotId}_{ManifestId}.bin";
 
         /// <summary>
-        /// Determines what app actually owns the depot, by default it is the current app.
-        /// However in the case of a linked/DLC app, the depot will need to be downloaded using the referenced app's id
+        /// The app whose PICS record contained this depot.
         /// </summary>
-        public uint ContainingAppId
+        public uint SourceAppId { get; private set; }
+
+        /// <summary>
+        /// AppID Steam expects when requesting metadata and manifest authorization.
+        /// This is the app whose PICS record supplied the depot unless depotfromapp points to another usable app.
+        /// </summary>
+        public uint ManifestRequestAppId
         {
             get
             {
-                if (DlcAppId != null)
+                if (DepotFromApp is uint fromApp && fromApp != DepotId && fromApp != DlcAppId)
                 {
-                    return DlcAppId.Value;
+                    return fromApp;
                 }
-                if (DepotFromApp != null)
-                {
-                    return DepotFromApp.Value;
+                return SourceAppId;
                 }
-                return _originalAppId;
             }
-        }
-        private readonly uint _originalAppId;
+
+        /// <summary>
+        /// App the account must own to access this depot.
+        /// </summary>
+        public uint LicenseAppId => DlcAppId ?? ManifestRequestAppId;
 
         /// <summary>
         /// Determines if a depot is a "linked" depot.  If the current depot is linked, it won't actually have a manifest to download under the current app.
         /// Instead, the depot will need to be downloaded from the linked app.
         /// </summary>
         public uint? DepotFromApp { get; }
-        private uint? DlcAppId { get; }
+        public uint? DlcAppId { get; private set; }
+        public uint? ParentAppId { get; private set; }
 
-        // If there is no manifest we can't download this depot, and if there is no shared depot then we can't look up a related manifest we could use
-        public bool IsInvalidDepot => ManifestId == null && DepotFromApp == null;
+        // If there is no manifest we can't download this depot, and if there is no valid shared depot then
+        // we can't look up a related manifest we could use. Some DLC depots incorrectly link to themselves.
+        public bool IsInvalidDepot =>
+            HasExplicitlyEmptyPublicManifest ||
+            (ManifestId == null && (DepotFromApp == null || DepotFromApp.Value == DepotId));
 
         public List<OperatingSystem> SupportedOperatingSystems { get; init; } = new List<OperatingSystem>();
         public Architecture Architecture { get; init; }
@@ -49,14 +59,21 @@
         {
             DepotId = uint.Parse(rootKey.Name);
             Name = rootKey["name"].Value;
-            _originalAppId = appId;
+            SourceAppId = appId;
 
-            ManifestId = rootKey["manifests"]["public"]["gid"].AsUnsignedLongNullable();
+            var publicManifest = rootKey["manifests"]["public"];
+            ManifestId = publicManifest["gid"].AsUnsignedLongNullable();
             // Legacy key where the manifest id was previously stored.  Not all depots have migrated to the new "gid" key, so this is still necessary.
             if (ManifestId == null)
             {
-                ManifestId = rootKey["manifests"]["public"].AsUnsignedLongNullable();
+                ManifestId = publicManifest.AsUnsignedLongNullable();
             }
+            var manifestSize = publicManifest["size"].AsUnsignedLongNullable();
+            var manifestDownloadSize = publicManifest["download"].AsUnsignedLongNullable();
+            HasExplicitlyEmptyPublicManifest =
+                ManifestId.HasValue &&
+                manifestSize == 0 &&
+                manifestDownloadSize == 0;
 
             DepotFromApp = rootKey["depotfromapp"].AsUnsignedIntNullable();
             DlcAppId = rootKey["dlcappid"].AsUnsignedIntNullable();
@@ -81,6 +98,16 @@
             {
                 LowViolence = true;
             }
+        }
+
+        /// <summary>
+        /// Attaches a DLC depot to the game being processed without changing its Steam manifest context.
+        /// The DLC source AppID remains both the manifest request context and entitlement check.
+        /// </summary>
+        public void AttachToParentApp(uint parentAppId, uint dlcAppId)
+        {
+            ParentAppId = parentAppId;
+            DlcAppId ??= dlcAppId;
         }
 
         public override string ToString()

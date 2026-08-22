@@ -13,10 +13,15 @@
         private readonly Dictionary<uint, HashSet<ulong>> _downloadedDepots = new Dictionary<uint, HashSet<ulong>>();
 
         public DepotHandler(IAnsiConsole ansiConsole, Steam3Session steam3Session, AppInfoHandler appInfoHandler, CdnPool cdnPool)
+            : this(steam3Session, appInfoHandler, new ManifestHandler(ansiConsole, cdnPool, steam3Session))
+        {
+        }
+
+        internal DepotHandler(Steam3Session steam3Session, AppInfoHandler appInfoHandler, ManifestHandler manifestHandler)
         {
             _steam3Session = steam3Session;
             _appInfoHandler = appInfoHandler;
-            _manifestHandler = new ManifestHandler(ansiConsole, cdnPool, steam3Session);
+            _manifestHandler = manifestHandler;
 
             if (File.Exists(AppConfig.SuccessfullyDownloadedDepotsPath))
             {
@@ -115,13 +120,13 @@
                     continue;
                 }
                 // Sometimes a linked ID can be an unowned app
-                if (!_steam3Session.LicenseManager.AccountHasAppAccess(depot.ContainingAppId))
+                if (!_steam3Session.LicenseManager.AccountHasAppAccess(depot.LicenseAppId))
                 {
                     continue;
                 }
 
                 AppInfo containingApp = await _appInfoHandler.GetAppInfoAsync(
-                    depot.ContainingAppId,
+                    depot.ManifestRequestAppId,
                     cancellationToken);
                 if (containingApp.IsInvalidApp)
                 {
@@ -163,27 +168,33 @@
             List<DepotInfo> depots,
             CancellationToken cancellationToken = default)
         {
-            foreach (var depotInfo in depots.Where(e => e.ManifestId == null))
+            foreach (var depotInfo in depots.Where(e => e.ManifestId == null).ToList())
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 // Shared depots will have to go get the manifest id from the original app's depot
                 var linkedApp = await _appInfoHandler.GetAppInfoAsync(
                     depotInfo.DepotFromApp.Value,
                     cancellationToken);
-                var linkedDepot = linkedApp.Depots.First(e => e.DepotId == depotInfo.DepotId);
+                var linkedDepot = linkedApp.Depots.FirstOrDefault(e => e.DepotId == depotInfo.DepotId);
+                if (linkedDepot?.ManifestId == null)
+                {
+                    depots.Remove(depotInfo);
+                    continue;
+                }
                 depotInfo.ManifestId = linkedDepot.ManifestId;
             }
         }
 
         /// <summary>
         /// Downloads all of the required manifests for a game, and then combines all of the required chunk requests into a single queue.
+        /// Depots whose manifests could not be downloaded are removed from <paramref name="depots"/> and returned as skipped.
         /// </summary>
         /// <returns></returns>
-        public async Task<List<QueuedRequest>> BuildChunkDownloadQueueAsync(
+        public async Task<(List<QueuedRequest> Chunks, List<DepotInfo> SkippedDepots)> BuildChunkDownloadQueueAsync(
             List<DepotInfo> depots,
             CancellationToken cancellationToken = default)
         {
-            var depotManifests = await _manifestHandler.GetAllManifestsAsync(depots, cancellationToken);
+            var (depotManifests, skippedDepots) = await _manifestHandler.GetAllManifestsAsync(depots, cancellationToken);
 
             // Queueing up chunks for each depot
             var chunkQueue = new List<QueuedRequest>();
@@ -203,7 +214,7 @@
                     chunkQueue.Add(new QueuedRequest(depotManifest, chunk));
                 }
             }
-            return chunkQueue;
+            return (chunkQueue, skippedDepots);
         }
     }
 }

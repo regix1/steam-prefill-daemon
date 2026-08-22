@@ -88,16 +88,23 @@ namespace SteamPrefill.Models
                                                        .ToList();
             }
 
-            // Extended Section
-            var listOfDlc = rootKeyValue["extended"]["listofdlc"].Value;
-            if (listOfDlc != null)
+            // Steam publishes listofdlc under either common or extended depending on the app metadata shape.
+            DlcAppIds =
+            [
+                .. new[]
             {
-                DlcAppIds = listOfDlc.Split(",")
-                                     .Select(e => uint.Parse(e))
+                        rootKeyValue["common"]["listofdlc"].Value,
+                        rootKeyValue["extended"]["listofdlc"].Value
+                    }
+                    .Where(e => !string.IsNullOrWhiteSpace(e))
+                    .SelectMany(e => e.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    .Select(e => uint.TryParse(e, out var appId) ? (uint?)appId : null)
+                    .Where(e => e.HasValue)
+                    .Select(e => e.Value)
+                    .Distinct()
                                      // Only including DLC that we own
                                      .Where(e => steamSession.LicenseManager.AccountHasAppAccess(e))
-                                     .ToList();
-            }
+            ];
 
             Categories = rootKeyValue["common"]["category"]
                          .Children

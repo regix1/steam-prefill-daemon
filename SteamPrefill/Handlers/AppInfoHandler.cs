@@ -14,7 +14,7 @@
         /// <summary>
         /// A dictionary of all app metadata currently retrieved from Steam
         /// </summary>
-        private ConcurrentDictionary<uint, AppInfo> LoadedAppInfos { get; } = new ConcurrentDictionary<uint, AppInfo>();
+        internal ConcurrentDictionary<uint, AppInfo> LoadedAppInfos { get; } = new ConcurrentDictionary<uint, AppInfo>();
 
         public AppInfoHandler(IAnsiConsole ansiConsole, Steam3Session steam3Session, LicenseManager licenseManager)
         {
@@ -51,7 +51,7 @@
         /// <summary>
         /// Gets the latest app metadata from steam, for the specified apps, as well as their related DLC apps.
         /// </summary>
-        public async Task RetrieveAppMetadataAsync(
+        public virtual async Task RetrieveAppMetadataAsync(
             List<uint> appIds,
             bool getRecentlyPlayedMetadata = false,
             CancellationToken cancellationToken = default)
@@ -158,15 +158,15 @@
         ///
         /// Once the DLC apps are loaded, the final combined depot list (both the app + dlc apps) will be built.
         /// </summary>
-        private async Task FetchDlcAppInfoAsync(CancellationToken cancellationToken)
+        internal async Task FetchDlcAppInfoAsync(CancellationToken cancellationToken)
         {
             var dlcAppIds = LoadedAppInfos.Values.SelectMany(e => e.DlcAppIds).ToList();
-            var containingAppIds = LoadedAppInfos.Values.Where(e => e.Type == AppType.Game)
+            var manifestAppIds = LoadedAppInfos.Values.Where(e => e.Type == AppType.Game)
                                                  .SelectMany(e => e.Depots)
-                                                 .Select(e => e.ContainingAppId)
+                                               .Select(e => e.ManifestRequestAppId)
                                                  .ToList();
 
-            var idsToLoad = containingAppIds.Union(dlcAppIds).ToList();
+            var idsToLoad = manifestAppIds.Union(dlcAppIds).ToList();
             await BulkLoadAppInfoAsync(idsToLoad, cancellationToken);
 
             // Builds out the list of all depots for each game, including depots from all related DLCs
@@ -174,9 +174,23 @@
             foreach (var app in LoadedAppInfos.Values.Where(e => e.Type == AppType.Game))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                foreach (var dlcApp in app.DlcAppIds)
+                foreach (var dlcAppId in app.DlcAppIds)
                 {
-                    app.Depots.AddRange((await GetAppInfoAsync(dlcApp, cancellationToken)).Depots);
+                    var dlcApp = await GetAppInfoAsync(dlcAppId, cancellationToken);
+                    foreach (var depot in dlcApp.Depots)
+                    {
+                        // The game already lists this depot itself, so there is no parent app to re-point it at.  Leaving
+                        // DlcAppId unset keeps the license check on the base game, which is the package that actually grants
+                        // a depot the game's own record contains.  Ownership of the depot itself is still checked first, in
+                        // DepotHandler.FilterDepotsToDownloadAsync, so an unowned depot never reaches a download.
+                        if (app.Depots.Any(e => e.DepotId == depot.DepotId))
+                        {
+                            continue;
+                        }
+
+                        depot.AttachToParentApp(app.AppId, dlcAppId);
+                        app.Depots.Add(depot);
+                    }
                 }
 
                 var distinctDepots = app.Depots.DistinctBy(e => e.DepotId).ToList();
@@ -243,7 +257,7 @@
         /// <summary>
         /// Gets a list of available games, filtering out any unavailable, non-Windows games.
         /// </summary>
-        public async Task<List<AppInfo>> GetAvailableGamesByIdAsync(
+        public virtual async Task<List<AppInfo>> GetAvailableGamesByIdAsync(
             List<uint> appIds,
             CancellationToken cancellationToken = default)
         {

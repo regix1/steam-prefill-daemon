@@ -1,10 +1,10 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
-using System.Net.Http;
 using System.Net.Sockets;
 using System.Text.Json;
 using LancachePrefill.Common;
+using Moq;
 using Spectre.Console.Testing;
 using SteamKit2;
 using SteamKit2.CDN;
@@ -287,6 +287,171 @@ public sealed class DaemonReliabilityTests
     }
 
     [Fact]
+    public async Task ManifestRequestCodeFailure_RemovesOnlyBrokenDepot()
+    {
+        var attempts = 0;
+        var console = new TestConsole();
+        var handler = new ManifestHandler(
+            console,
+            new CdnPool(console, new ConcurrentStack<Server>()),
+            _ =>
+            {
+                attempts++;
+                return Task.FromResult(0UL);
+            },
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var healthyDepot = CreateCachedDepot();
+        var brokenDepot = CreateUncachedDepot();
+        var depots = new List<DepotInfo> { healthyDepot, brokenDepot };
+
+        var (manifests, skippedDepots) = await handler.GetAllManifestsAsync(depots);
+
+        Assert.Single(manifests);
+        Assert.Same(healthyDepot, Assert.Single(depots));
+        Assert.Same(brokenDepot, Assert.Single(skippedDepots));
+        Assert.Equal(3, attempts);
+
+        File.Delete(healthyDepot.ManifestFileName);
+    }
+
+    [Fact]
+    public async Task EveryManifestFailing_LeavesNoDepotsAndReportsEverySkip()
+    {
+        var console = new TestConsole();
+        var handler = new ManifestHandler(
+            console,
+            new CdnPool(console, new ConcurrentStack<Server>()),
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var depots = new List<DepotInfo> { CreateUncachedDepot(), CreateUncachedDepot() };
+
+        var (manifests, skippedDepots) = await handler.GetAllManifestsAsync(depots);
+
+        // This is the state the status path guards against, an app whose depot list emptied out while
+        // fetching manifests has nothing left to compare and would otherwise read as up to date
+        Assert.Empty(manifests);
+        Assert.Empty(depots);
+        Assert.Equal(2, skippedDepots.Count);
+    }
+
+    [Fact]
+    public async Task ManifestFailureForOneDepot_KeepsTheAppFromReportingUpToDate()
+    {
+        var console = new TestConsole();
+        var handler = new ManifestHandler(
+            console,
+            new CdnPool(console, new ConcurrentStack<Server>()),
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var cachedDepot = CreateCachedDepot();
+        var secondCachedDepot = CreateCachedDepot();
+        var updatedDepot = CreateUncachedDepot();
+        var depots = new List<DepotInfo> { cachedDepot, secondCachedDepot, updatedDepot };
+        var depotHandler = new DepotHandler(console, new Steam3Session(null), null, null);
+        depotHandler.SetCachedManifests(new[]
+        {
+            (cachedDepot.DepotId, cachedDepot.ManifestId!.Value),
+            (secondCachedDepot.DepotId, secondCachedDepot.ManifestId!.Value)
+        });
+
+        var (_, skippedDepots) = await handler.GetAllManifestsAsync(depots);
+
+        // Everything left in the list is cached, so the list on its own says the app is up to date.
+        // The skipped depot is the only thing that keeps the app from being counted that way.
+        Assert.True(depotHandler.AppIsUpToDate(depots));
+        Assert.Same(updatedDepot, Assert.Single(skippedDepots));
+
+        File.Delete(cachedDepot.ManifestFileName);
+        File.Delete(secondCachedDepot.ManifestFileName);
+    }
+
+    [Fact]
+    public async Task ManifestTransportFailure_SkipsOnlyTheBrokenDepot()
+    {
+        var console = new TestConsole();
+        var handler = new ManifestHandler(
+            console,
+            new CdnPool(console, new ConcurrentStack<Server>()),
+            _ => throw new SteamKitWebRequestException("404 Not Found", new HttpResponseMessage(HttpStatusCode.NotFound)),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var healthyDepot = CreateCachedDepot();
+        var brokenDepot = CreateUncachedDepot();
+        var depots = new List<DepotInfo> { healthyDepot, brokenDepot };
+
+        var (manifests, skippedDepots) = await handler.GetAllManifestsAsync(depots);
+
+        Assert.Single(manifests);
+        Assert.Same(healthyDepot, Assert.Single(depots));
+        Assert.Same(brokenDepot, Assert.Single(skippedDepots));
+
+        File.Delete(healthyDepot.ManifestFileName);
+    }
+
+    [Fact]
+    public async Task UnreadableCachedManifest_IsDeletedAndRequestedAgain()
+    {
+        var attempts = 0;
+        var console = new TestConsole();
+        var handler = new ManifestHandler(
+            console,
+            new CdnPool(console, new ConcurrentStack<Server>()),
+            _ =>
+            {
+                attempts++;
+                return Task.FromResult(0UL);
+            },
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var depot = CreateUncachedDepot();
+        File.WriteAllBytes(depot.ManifestFileName, new byte[] { 0xFF, 0xFF, 0xFF, 0xFF });
+        var depots = new List<DepotInfo> { depot };
+
+        var (manifests, skippedDepots) = await handler.GetAllManifestsAsync(depots);
+
+        Assert.False(File.Exists(depot.ManifestFileName));
+        Assert.Equal(3, attempts);
+        Assert.Empty(manifests);
+        Assert.Same(depot, Assert.Single(skippedDepots));
+    }
+
+    [Fact]
+    public async Task VtolDlcDepot_RequestsManifestWithDlcAppId()
+    {
+        uint requestedAppId = 0;
+        uint requestedDepotId = 0;
+        var console = new TestConsole();
+        var handler = new ManifestHandler(
+            console,
+            new CdnPool(console, new ConcurrentStack<Server>()),
+            depot =>
+            {
+                requestedAppId = depot.ManifestRequestAppId;
+                requestedDepotId = depot.DepotId;
+                return Task.FromResult(0UL);
+            },
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var depotKey = new KeyValue("1770480")
+        {
+            Children =
+            {
+                new KeyValue("dlcappid", "1770480"),
+                new KeyValue("manifests")
+                {
+                    Children = { new KeyValue("public", "2836902461265788005") }
+                }
+            }
+        };
+        var depot = new DepotInfo(depotKey, 1770480);
+        depot.AttachToParentApp(667970, 1770480);
+        var depots = new List<DepotInfo> { depot };
+
+        await handler.GetAllManifestsAsync(depots);
+
+        Assert.Equal(1770480U, requestedAppId);
+        Assert.Equal(1770480U, requestedDepotId);
+        Assert.Equal(1770480U, depot.LicenseAppId);
+    }
+
+    [Fact]
     public async Task ManifestDownload_PropagatesCallerCancellation_AndDefersConnectionReuse()
     {
         var downloadStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -316,7 +481,297 @@ public sealed class DaemonReliabilityTests
         Assert.Empty(pool.AvailableServerEndpoints);
 
         response.TrySetCanceled();
+
+        // The connection comes back from a continuation on the download task, so it is not returned on this thread
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (pool.AvailableServerEndpoints.IsEmpty && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
         Assert.Single(pool.AvailableServerEndpoints);
+    }
+
+    [Fact]
+    public async Task AppStatus_WhenEveryManifestFails_IsNotReportedUpToDate()
+    {
+        var console = new TestConsole();
+        var steam3 = new Steam3Session(null);
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        steam3.LicenseManager._userLicenses.OwnedDepotIds.Add(123);
+
+        var appKeyValues = new KeyValue
+        {
+            Children =
+            {
+                new KeyValue("common")
+                {
+                    Children = { new KeyValue("type", "game") }
+                }
+            }
+        };
+        var app = new AppInfo(steam3, 222, appKeyValues);
+        app.Depots.Add(new DepotInfo(new KeyValue("0"), 222)
+        {
+            DepotId = 123,
+            ManifestId = unchecked((ulong)Random.Shared.NextInt64(1, long.MaxValue))
+        });
+
+        var appInfoHandler = new Mock<AppInfoHandler>(console, steam3, steam3.LicenseManager);
+        appInfoHandler.Setup(e => e.RetrieveAppMetadataAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<bool>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.CompletedTask);
+        appInfoHandler.Setup(e => e.GetAvailableGamesByIdAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(new List<AppInfo> { app }));
+        appInfoHandler.Setup(e => e.GetAppInfoAsync(
+                          It.IsAny<uint>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(app));
+
+        // A pool holding the minimum server count keeps the status path from requesting CDNs from Steam
+        var cdnPool = new CdnPool(console, new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manifestHandler = new ManifestHandler(
+            console,
+            cdnPool,
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var steamManager = new SteamManager(
+            console,
+            new DownloadArguments(),
+            steam3,
+            cdnPool: cdnPool,
+            appInfoHandler: appInfoHandler.Object,
+            depotHandler: new DepotHandler(steam3, appInfoHandler.Object, manifestHandler));
+
+        var appStatuses = await steamManager.GetSelectedAppsStatusAsync(new List<uint> { 222 });
+
+        var status = Assert.Single(appStatuses);
+        Assert.False(status.IsUpToDate);
+        Assert.Equal("No downloadable depots", status.UnavailableReason);
+    }
+
+    [Fact]
+    public async Task AppStatus_WhenOneManifestFails_IsNotReportedUpToDate()
+    {
+        var console = new TestConsole();
+        var steam3 = new Steam3Session(null);
+        var cachedDepot = CreateCachedDepot();
+        var brokenDepot = CreateUncachedDepot();
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        foreach (var depot in new[] { cachedDepot, brokenDepot })
+        {
+            steam3.LicenseManager._userLicenses.OwnedAppIds.Add(depot.LicenseAppId);
+            steam3.LicenseManager._userLicenses.OwnedDepotIds.Add(depot.DepotId);
+        }
+
+        var appKeyValues = new KeyValue
+        {
+            Children =
+            {
+                new KeyValue("common")
+                {
+                    Children = { new KeyValue("type", "game") }
+                }
+            }
+        };
+        var app = new AppInfo(steam3, 222, appKeyValues);
+        app.Depots.Add(cachedDepot);
+        app.Depots.Add(brokenDepot);
+
+        var appInfoHandler = new Mock<AppInfoHandler>(console, steam3, steam3.LicenseManager);
+        appInfoHandler.Setup(e => e.RetrieveAppMetadataAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<bool>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.CompletedTask);
+        appInfoHandler.Setup(e => e.GetAvailableGamesByIdAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(new List<AppInfo> { app }));
+        appInfoHandler.Setup(e => e.GetAppInfoAsync(
+                          It.IsAny<uint>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(app));
+
+        var cdnPool = new CdnPool(console, new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manifestHandler = new ManifestHandler(
+            console,
+            cdnPool,
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var depotHandler = new DepotHandler(steam3, appInfoHandler.Object, manifestHandler);
+        // The depot that keeps its manifest is already cached, so the depots left in the list say the app is up to date
+        depotHandler.SetCachedManifests(new[] { (cachedDepot.DepotId, cachedDepot.ManifestId!.Value) });
+        var steamManager = new SteamManager(
+            console,
+            new DownloadArguments(),
+            steam3,
+            cdnPool: cdnPool,
+            appInfoHandler: appInfoHandler.Object,
+            depotHandler: depotHandler);
+
+        var appStatuses = await steamManager.GetSelectedAppsStatusAsync(new List<uint> { 222 });
+
+        // One depot could not be fetched, so the app is incomplete and a prefill would have to run again
+        var status = Assert.Single(appStatuses);
+        Assert.False(status.IsUpToDate);
+
+        File.Delete(cachedDepot.ManifestFileName);
+    }
+
+    [Fact]
+    public async Task PrefillWhenEveryManifestFails_CountsTheAppAsFailed()
+    {
+        var console = new TestConsole();
+        var steam3 = new Steam3Session(null);
+        var brokenDepot = CreateUncachedDepot();
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(brokenDepot.LicenseAppId);
+        steam3.LicenseManager._userLicenses.OwnedDepotIds.Add(brokenDepot.DepotId);
+
+        var appKeyValues = new KeyValue
+        {
+            Children =
+            {
+                new KeyValue("common")
+                {
+                    Children = { new KeyValue("type", "game") }
+                }
+            }
+        };
+        var app = new AppInfo(steam3, 222, appKeyValues);
+        app.Depots.Add(brokenDepot);
+
+        var appInfoHandler = new Mock<AppInfoHandler>(console, steam3, steam3.LicenseManager);
+        appInfoHandler.Setup(e => e.RetrieveAppMetadataAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<bool>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.CompletedTask);
+        appInfoHandler.Setup(e => e.GetAvailableGamesByIdAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(new List<AppInfo> { app }));
+        appInfoHandler.Setup(e => e.GetAppInfoAsync(
+                          It.IsAny<uint>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(app));
+
+        var cdnPool = new CdnPool(console, new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manifestHandler = new ManifestHandler(
+            console,
+            cdnPool,
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+
+        var progress = new CallbackProgress();
+        AppDownloadResult? appResult = null;
+        PrefillSummary? summary = null;
+        progress.AppCompleted += (_, result) => appResult = result;
+        progress.PrefillCompleted += completed => summary = completed;
+
+        var steamManager = new SteamManager(
+            console,
+            new DownloadArguments(),
+            steam3,
+            progress,
+            cdnPool: cdnPool,
+            appInfoHandler: appInfoHandler.Object,
+            depotHandler: new DepotHandler(steam3, appInfoHandler.Object, manifestHandler));
+
+        await steamManager.DownloadMultipleAppsAsync(false, false, null, true);
+
+        // The only depot was dropped while fetching manifests, which empties the list.  That empty list is a
+        // manifest failure and not a filter that excluded everything, so the app has to be counted as failed
+        Assert.Equal(AppDownloadResult.Failed, appResult);
+        Assert.NotNull(summary);
+        Assert.Equal(1, summary!.FailedApps);
+    }
+
+    [Fact]
+    public async Task PrefillWhenOneManifestFails_CountsTheAppAsFailed()
+    {
+        var console = new TestConsole();
+        var steam3 = new Steam3Session(null);
+        var cachedDepot = CreateCachedDepot();
+        var brokenDepot = CreateUncachedDepot();
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        foreach (var depot in new[] { cachedDepot, brokenDepot })
+        {
+            steam3.LicenseManager._userLicenses.OwnedAppIds.Add(depot.LicenseAppId);
+            steam3.LicenseManager._userLicenses.OwnedDepotIds.Add(depot.DepotId);
+        }
+
+        var appKeyValues = new KeyValue
+        {
+            Children =
+            {
+                new KeyValue("common")
+                {
+                    Children = { new KeyValue("type", "game") }
+                }
+            }
+        };
+        var app = new AppInfo(steam3, 222, appKeyValues);
+        app.Depots.Add(cachedDepot);
+        app.Depots.Add(brokenDepot);
+
+        var appInfoHandler = new Mock<AppInfoHandler>(console, steam3, steam3.LicenseManager);
+        appInfoHandler.Setup(e => e.RetrieveAppMetadataAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<bool>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.CompletedTask);
+        appInfoHandler.Setup(e => e.GetAvailableGamesByIdAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(new List<AppInfo> { app }));
+        appInfoHandler.Setup(e => e.GetAppInfoAsync(
+                          It.IsAny<uint>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(app));
+
+        var cdnPool = new CdnPool(console, new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manifestHandler = new ManifestHandler(
+            console,
+            cdnPool,
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+        var depotHandler = new DepotHandler(steam3, appInfoHandler.Object, manifestHandler);
+        // The surviving depot is already cached, so the up to date check would claim the whole app is done
+        depotHandler.SetCachedManifests(new[] { (cachedDepot.DepotId, cachedDepot.ManifestId!.Value) });
+
+        var progress = new CallbackProgress();
+        AppDownloadResult? appResult = null;
+        PrefillSummary? summary = null;
+        bool appStarted = false;
+        progress.AppCompleted += (_, result) => appResult = result;
+        progress.PrefillCompleted += completed => summary = completed;
+        progress.AppStarted += _ => appStarted = true;
+
+        var steamManager = new SteamManager(
+            console,
+            new DownloadArguments(),
+            steam3,
+            progress,
+            cdnPool: cdnPool,
+            appInfoHandler: appInfoHandler.Object,
+            depotHandler: depotHandler);
+
+        await steamManager.DownloadMultipleAppsAsync(false, false, null, true);
+
+        // One depot of two could not be fetched, so the app is incomplete no matter how cached its siblings are
+        Assert.True(appStarted);
+        Assert.Equal(AppDownloadResult.Failed, appResult);
+        Assert.NotNull(summary);
+        Assert.Equal(1, summary!.FailedApps);
+        Assert.Equal(0, summary.AlreadyUpToDate);
+        Assert.Equal(0, summary.UpdatedApps);
+
+        File.Delete(cachedDepot.ManifestFileName);
     }
 
     [Fact]
@@ -367,6 +822,14 @@ public sealed class DaemonReliabilityTests
         }
         while (File.Exists(depot.ManifestFileName));
 
+        return depot;
+    }
+
+    private static DepotInfo CreateCachedDepot()
+    {
+        var depot = CreateUncachedDepot();
+        // An empty manifest is all the cached path needs, these tests only care that the load succeeds
+        File.WriteAllBytes(depot.ManifestFileName, Array.Empty<byte>());
         return depot;
     }
 
