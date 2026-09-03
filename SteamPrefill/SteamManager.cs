@@ -291,6 +291,15 @@
             {
                 _ansiConsole.LogMarkupError(
                     $"{LightYellow(skippedDepots.Count)} depots for {Cyan(appInfo)} could not be downloaded");
+
+                // Also report it through the progress channel. This path does not throw, so nothing
+                // writes it to the log file either, and the console line above is the only record. A
+                // caller driving the daemon over its socket therefore saw an app counted as failed
+                // with no reason anywhere, which is the most common way a prefill "does nothing".
+                _progress.OnLog(
+                    LogLevel.Warning,
+                    $"{skippedDepots.Count} of {filteredDepots.Count + skippedDepots.Count} depots for {appInfo.Name} "
+                        + "could not be downloaded: their manifests could not be fetched.");
                 // Every depot failed — nothing left to queue. That is a manifest failure, not a filter exclusion.
                 if (filteredDepots.Empty())
                 {
