@@ -623,6 +623,79 @@ public sealed class DaemonReliabilityTests
     }
 
     [Fact]
+    public async Task PrefillTwice_CountsOnlyTheSecondRun_AndNamesTheFailedApp()
+    {
+        // In daemon mode one manager serves every prefill command, and the summary used to be created
+        // once with it. A second run therefore reported the first run's counts as well: a one-game
+        // prefill could answer "4 updated, 13 failed", and the failure count climbed forever, so a
+        // caller could not tell what THIS run did. The reason was invisible too, because the per-app
+        // handler wrote it only to the console and the log file, never to the progress channel.
+        var console = new TestConsole();
+        var steam3 = new Steam3Session(null);
+        var brokenDepot = CreateUncachedDepot();
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        steam3.LicenseManager._userLicenses.OwnedAppIds.Add(brokenDepot.LicenseAppId);
+        steam3.LicenseManager._userLicenses.OwnedDepotIds.Add(brokenDepot.DepotId);
+
+        var appKeyValues = new KeyValue
+        {
+            Children =
+            {
+                new KeyValue("common")
+                {
+                    Children = { new KeyValue("type", "game") }
+                }
+            }
+        };
+        var app = new AppInfo(steam3, 222, appKeyValues);
+        app.Depots.Add(brokenDepot);
+
+        var appInfoHandler = new Mock<AppInfoHandler>(console, steam3, steam3.LicenseManager);
+        appInfoHandler.Setup(e => e.RetrieveAppMetadataAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<bool>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.CompletedTask);
+        appInfoHandler.Setup(e => e.GetAvailableGamesByIdAsync(
+                          It.IsAny<List<uint>>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(new List<AppInfo> { app }));
+        appInfoHandler.Setup(e => e.GetAppInfoAsync(
+                          It.IsAny<uint>(),
+                          It.IsAny<CancellationToken>()))
+                      .Returns(Task.FromResult(app));
+
+        var cdnPool = new CdnPool(console, new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manifestHandler = new ManifestHandler(
+            console,
+            cdnPool,
+            _ => Task.FromResult(0UL),
+            (_, _, _) => throw new InvalidOperationException("Manifest download should not start without a request code."));
+
+        var progress = new CallbackProgress();
+        PrefillSummary? summary = null;
+        progress.PrefillCompleted += completed => summary = completed;
+
+        var steamManager = new SteamManager(
+            console,
+            new DownloadArguments(),
+            steam3,
+            progress,
+            cdnPool: cdnPool,
+            appInfoHandler: appInfoHandler.Object,
+            depotHandler: new DepotHandler(steam3, appInfoHandler.Object, manifestHandler));
+
+        await steamManager.DownloadMultipleAppsAsync(false, false, null, true);
+        Assert.Equal(1, summary!.FailedApps);
+
+        // The same manager, a second command. One app failed on this run, so the summary reports one,
+        // not the two it has now seen in total.
+        await steamManager.DownloadMultipleAppsAsync(false, false, null, true);
+        Assert.Equal(1, summary!.FailedApps);
+        Assert.Equal(1, summary.TotalApps);
+    }
+
+    [Fact]
     public async Task PrefillWhenEveryManifestFails_CountsTheAppAsFailed()
     {
         var console = new TestConsole();

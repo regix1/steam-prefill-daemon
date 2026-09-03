@@ -12,7 +12,12 @@
         private readonly DepotHandler _depotHandler;
         private readonly AppInfoHandler _appInfoHandler;
 
-        private readonly PrefillSummaryResult _prefillSummaryResult = new PrefillSummaryResult();
+        // Replaced at the start of every prefill rather than created once. In daemon mode one manager
+        // serves many prefill commands, so a single instance accumulated across all of them: the
+        // summary reported the container's whole lifetime, and its stopwatch measured from process
+        // start. A one-game run could report "4 updated, 13 failed" and the failure count climbed by
+        // one on every run forever, which made a caller unable to tell what THIS run did.
+        private PrefillSummaryResult _prefillSummaryResult = new PrefillSummaryResult();
         private readonly IPrefillProgress _progress;
 
         public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null)
@@ -108,6 +113,10 @@
                                                     int? prefillPopularGames, bool prefillRecentlyPurchasedGames,
                                                     CancellationToken cancellationToken = default)
         {
+            // This run's counters and its own elapsed clock. Without this the summary carries every
+            // earlier prefill in the same daemon process.
+            _prefillSummaryResult = new PrefillSummaryResult();
+
             // Building out the list of AppIds to download
             // Only include previously selected apps if no specific filter is being used
             // When using filters like "recently purchased" or "recent games", users expect ONLY those games
@@ -171,12 +180,21 @@
             await DownloadAppsAsync(
                 availableGames,
                 DownloadSingleAppAsync,
-                (_, e) =>
+                (app, e) =>
                 {
                     // Need to catch any exceptions that might happen during a single download, so that the other apps won't be affected
                     _ansiConsole.LogMarkupLine(Red($"Unexpected download error : {e.Message}  Skipping app..."));
                     _ansiConsole.MarkupLine("");
                     FileLogger.LogException(e);
+
+                    // Also report it through the progress channel. The two lines above reach the
+                    // console and app.log only, so a caller driving this over the daemon socket saw
+                    // an app fail with no reason for it anywhere, and the run still summarised as a
+                    // completion. Named app and exception type, because "Skipping app..." on its own
+                    // does not say which app or why.
+                    _progress.OnLog(
+                        LogLevel.Error,
+                        $"Prefill failed for {app}: {e.GetType().Name} - {e.Message}");
 
                     _prefillSummaryResult.FailedApps++;
                 },
