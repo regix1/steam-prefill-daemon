@@ -333,7 +333,9 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (Exception ex)
         {
-            _progress.OnError("Prefill operation failed", ex);
+            // Only the message is broadcast to the caller; the exception argument goes to the local log.
+            // Without the reason in the message the caller is told the prefill failed and nothing more. [29]
+            _progress.OnError($"Prefill operation failed: {ex.Message}", ex);
             return new PrefillResult
             {
                 Success = false,

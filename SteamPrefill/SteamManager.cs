@@ -113,6 +113,13 @@
                                                     int? prefillPopularGames, bool prefillRecentlyPurchasedGames,
                                                     CancellationToken cancellationToken = default)
         {
+            // Every Steam call below waits on a session that is already gone, so the run would otherwise
+            // sit silent until the caller's stall timeout instead of reporting why nothing downloaded.
+            if (_steam3.IsDisconnected)
+            {
+                throw new SteamConnectionException("Steam connection was lost. Log in to Steam again, then start the prefill.");
+            }
+
             // This run's counters and its own elapsed clock. Without this the summary carries every
             // earlier prefill in the same daemon process.
             _prefillSummaryResult = new PrefillSummaryResult();

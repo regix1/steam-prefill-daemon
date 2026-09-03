@@ -12,6 +12,7 @@ using SteamPrefill.Api;
 using SteamPrefill.Handlers;
 using SteamPrefill.Handlers.Steam;
 using SteamPrefill.Models;
+using SteamPrefill.Models.Exceptions;
 using Xunit;
 
 namespace SteamPrefill.Test;
@@ -283,6 +284,35 @@ public sealed class DaemonReliabilityTests
         cancellation.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => requestTask);
+        response.TrySetCanceled();
+    }
+
+    // A prefill's first Steam call is app metadata. When the connection is gone the PICS job never
+    // completes, so the run used to sit silent with no download and no error until the caller's stall
+    // timeout. The wait is bounded now, and the run fails with a reason naming Steam.
+    [Fact(Timeout = 120_000)]
+    public async Task AppMetadataRequest_TimesOutWhenSteamNeverAnswers()
+    {
+        var requestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var response = new TaskCompletionSource<SteamApps.PICSTokensCallback>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var steam3 = new Steam3Session(null);
+        var appInfoHandler = new AppInfoHandler(
+            new TestConsole(),
+            steam3,
+            steam3.LicenseManager,
+            _ =>
+            {
+                requestStarted.TrySetResult();
+                return response.Task;
+            });
+
+        var requestTask = appInfoHandler.GetAppInfoAsync(222, CancellationToken.None);
+        await requestStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        var exception = await Assert.ThrowsAsync<SteamConnectionException>(() => requestTask);
+        Assert.Contains("Steam did not answer", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("90 seconds", exception.Message, StringComparison.Ordinal);
+        Assert.IsType<TimeoutException>(exception.InnerException);
         response.TrySetCanceled();
     }
 

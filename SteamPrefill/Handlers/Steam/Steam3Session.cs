@@ -354,6 +354,14 @@ namespace SteamPrefill.Handlers.Steam
         }
 
         private bool _disconnected = true;
+
+        /// <summary>
+        /// True once a logged in session has lost its connection to Steam.  <see cref="_disconnected"/> also reads
+        /// true before the first connection is ever made, so the logon result is what separates a session that
+        /// dropped from one that has not logged in yet.
+        /// </summary>
+        public bool IsDisconnected => _disconnected && _loggedOnCallbackResult != null;
+
         public void Disconnect()
         {
             if (_disconnected)

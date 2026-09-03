@@ -8,6 +8,9 @@
         private readonly IAnsiConsole _ansiConsole;
         private readonly Steam3Session _steam3Session;
         private readonly LicenseManager _licenseManager;
+        private readonly Func<List<uint>, Task<PICSTokensCallback>> _requestAccessTokensAsync;
+
+        private static readonly TimeSpan MetadataRequestTimeout = TimeSpan.FromSeconds(90);
 
         private List<CPlayer_GetOwnedGames_Response.Game> _recentlyPlayed;
 
@@ -17,10 +20,23 @@
         internal ConcurrentDictionary<uint, AppInfo> LoadedAppInfos { get; } = new ConcurrentDictionary<uint, AppInfo>();
 
         public AppInfoHandler(IAnsiConsole ansiConsole, Steam3Session steam3Session, LicenseManager licenseManager)
+            : this(ansiConsole,
+                   steam3Session,
+                   licenseManager,
+                   appIds => steam3Session.SteamAppsApi.PICSGetAccessTokens(appIds, new List<uint>()).ToTask())
+        {
+        }
+
+        internal AppInfoHandler(
+            IAnsiConsole ansiConsole,
+            Steam3Session steam3Session,
+            LicenseManager licenseManager,
+            Func<List<uint>, Task<PICSTokensCallback>> requestAccessTokensAsync)
         {
             _ansiConsole = ansiConsole;
             _steam3Session = steam3Session;
             _licenseManager = licenseManager;
+            _requestAccessTokensAsync = requestAccessTokensAsync;
         }
 
         /// <summary>
@@ -116,31 +132,42 @@
                 return;
             }
 
-            // Some apps will require an additional "access token" in order to retrieve their app metadata
-            var accessTokensResponse = await _steam3Session.SteamAppsApi
-                .PICSGetAccessTokens(appIdsToLoad, new List<uint>())
-                .ToTask()
-                .WaitAsync(cancellationToken);
-            var appTokens = accessTokensResponse.AppTokens;
-
-            // Build out the requests
-            var requests = new List<PICSRequest>();
-            foreach (var appId in appIdsToLoad)
+            // A dropped Steam connection leaves these PICS jobs pending forever, so both are bounded the
+            // same way the manifest request code is.  One catch covers both because nothing between them
+            // waits on Steam, and the framework's own timeout text does not say what failed. [30]
+            AsyncJobMultiple<PICSProductInfoCallback>.ResultSet resultSet;
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var request = new PICSRequest(appId);
-                if (appTokens.ContainsKey(appId))
-                {
-                    request.AccessToken = appTokens[appId];
-                }
-                requests.Add(request);
-            }
+                // Some apps will require an additional "access token" in order to retrieve their app metadata
+                var accessTokensResponse = await _requestAccessTokensAsync(appIdsToLoad)
+                    .WaitAsync(MetadataRequestTimeout, cancellationToken);
+                var appTokens = accessTokensResponse.AppTokens;
 
-            // Finally request the metadata from steam
-            var resultSet = await _steam3Session.SteamAppsApi
-                .PICSGetProductInfo(requests, new List<PICSRequest>())
-                .ToTask()
-                .WaitAsync(cancellationToken);
+                // Build out the requests
+                var requests = new List<PICSRequest>();
+                foreach (var appId in appIdsToLoad)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var request = new PICSRequest(appId);
+                    if (appTokens.ContainsKey(appId))
+                    {
+                        request.AccessToken = appTokens[appId];
+                    }
+                    requests.Add(request);
+                }
+
+                // Finally request the metadata from steam
+                resultSet = await _steam3Session.SteamAppsApi
+                    .PICSGetProductInfo(requests, new List<PICSRequest>())
+                    .ToTask()
+                    .WaitAsync(MetadataRequestTimeout, cancellationToken);
+            }
+            catch (TimeoutException e)
+            {
+                throw new SteamConnectionException(
+                    $"Steam did not answer a request for game details within {MetadataRequestTimeout.TotalSeconds:0} seconds. " +
+                    "The Steam connection may be down; try again, and log in to Steam again if it keeps failing.", e);
+            }
 
             List<PicsProductInfo> appInfos = resultSet.Results.SelectMany(e => e.Apps).Select(e => e.Value).ToList();
             foreach (var app in appInfos)
@@ -239,10 +266,21 @@
                 include_played_free_games = true,
                 skip_unvetted_apps = false
             };
-            var response = await _steam3Session.unifiedPlayerService
-                .GetOwnedGames(request)
-                .ToTask()
-                .WaitAsync(cancellationToken);
+            SteamUnifiedMessages.ServiceMethodResponse<CPlayer_GetOwnedGames_Response> response;
+            try
+            {
+                response = await _steam3Session.unifiedPlayerService
+                    .GetOwnedGames(request)
+                    .ToTask()
+                    .WaitAsync(MetadataRequestTimeout, cancellationToken);
+            }
+            catch (TimeoutException e)
+            {
+                throw new SteamConnectionException(
+                    $"Steam did not answer a request for your game library within {MetadataRequestTimeout.TotalSeconds:0} seconds. " +
+                    "The Steam connection may be down; try again, and log in to Steam again if it keeps failing.", e);
+            }
+
             if (response.Result != EResult.OK)
             {
                 throw new Exception("Unexpected error while requesting owned games!");
