@@ -171,13 +171,16 @@ namespace SteamPrefill.Handlers
 
             Server server = _cdnPool.TakeConnection();
             DepotManifest manifest;
-            var downloadTask = _downloadManifestAsync(
-                depot,
-                manifestRequestCode.Code,
-                server);
+            Task<DepotManifest> downloadTask = null;
             var returnConnectionImmediately = true;
             try
             {
+                // Called inside the try so that a client which throws before returning its task still reaches
+                // the finally, and the connection is not lost with it.
+                downloadTask = _downloadManifestAsync(
+                    depot,
+                    manifestRequestCode.Code,
+                    server);
                 manifest = await downloadTask.WaitAsync(cancellationToken);
                 if (manifest == null)
                 {
@@ -188,6 +191,16 @@ namespace SteamPrefill.Handlers
             {
                 returnConnectionImmediately = false;
                 ReturnConnectionAfterCompletion(downloadTask, server);
+                throw;
+            }
+            // A server error or a timed out request is the server's fault, not the depot's.  Returning it here
+            // would put it straight back on top of the stack for the retry to take again, which is how a single
+            // dead edge failed every download for the life of the process.  508 is left to the caller's infinite
+            // loop check, as it means the network is misconfigured rather than the server being bad.
+            catch (Exception e) when (CdnPool.IsServerFault(e))
+            {
+                returnConnectionImmediately = false;
+                await _cdnPool.DiscardConnectionAsync(server, cancellationToken);
                 throw;
             }
             finally

@@ -190,8 +190,12 @@ namespace SteamPrefill.Handlers
             });
 
             //TODO In the scenario where a user still had all requests fail, potentially display a warning that there is an underlying issue
-            // Only return the connections for reuse if there were no errors
-            if (failedRequests.IsEmpty)
+            // A missing chunk is the same on every server, so only a failure that indicts this server drops it.
+            if (failedRequests.Any(e => CdnPool.IsServerFault(e.LastFailureReason)))
+            {
+                await _cdnPool.DiscardConnectionAsync(cdnServer, cancellationToken);
+            }
+            else
             {
                 _cdnPool.ReturnConnection(cdnServer);
             }

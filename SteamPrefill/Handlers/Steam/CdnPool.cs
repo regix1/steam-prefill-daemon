@@ -11,6 +11,7 @@ namespace SteamPrefill.Handlers.Steam
 
         private readonly int _minimumServerCount = 5;
         private readonly int _maxRetries = 3;
+        private readonly HashSet<string> _discardedHosts = new HashSet<string>();
 
         public ConcurrentStack<Server> AvailableServerEndpoints = new ConcurrentStack<Server>();
 
@@ -99,12 +100,25 @@ namespace SteamPrefill.Handlers.Steam
                 var returnedServers = await requestTask.WaitAsync(
                     TimeSpan.FromSeconds(15),
                     cancellationToken);
-                AvailableServerEndpoints.PushRange(returnedServers);
 
                 // Filtering out non-cacheable CDNs.  HTTPS servers are included, as they appear to be able to be manually overridden to HTTP.
                 // SteamCache type servers are Valve run.  CDN type servers appear to be ISP run.
+                var cacheableServers = returnedServers
+                                        .Where(e => (e.Type == "SteamCache" || e.Type == "CDN") && e.AllowedAppIds.Length == 0)
+                                        .ToList();
+
+                // Steam keeps listing a server after it has been dropped, so the refill has to leave it out itself.
+                var untriedServers = cacheableServers.Where(e => !_discardedHosts.Contains(e.Host)).ToList();
+                if (untriedServers.Count == 0)
+                {
+                    // Every server Steam offers has already failed once.  Trying them again beats a pool that
+                    // stays empty until the process restarts.
+                    _discardedHosts.Clear();
+                    untriedServers = cacheableServers;
+                }
+
+                AvailableServerEndpoints.PushRange(untriedServers.ToArray());
                 AvailableServerEndpoints = AvailableServerEndpoints
-                                            .Where(e => (e.Type == "SteamCache" || e.Type == "CDN") && e.AllowedAppIds.Length == 0)
                                             .DistinctBy(e => e.Host)
                                             .ToConcurrentStack();
             }
@@ -155,6 +169,34 @@ namespace SteamPrefill.Handlers.Steam
         public void ReturnConnection(Server server)
         {
             AvailableServerEndpoints.Push(server);
+        }
+
+        /// <summary>
+        /// Drops a server that failed for a reason that indicts the server itself, so that it is not handed out
+        /// again.  The pool is a stack, so a returned server would otherwise be the very next one taken, and
+        /// Steam keeps listing the server, so a refill would otherwise bring it straight back.
+        /// Tops the pool back up from Steam when dropping the server left it short.
+        /// </summary>
+        /// <param name="server">The server that will not be re-added to the pool.</param>
+        public async Task DiscardConnectionAsync(Server server, CancellationToken cancellationToken = default)
+        {
+            _ansiConsole.LogMarkupVerbose($"Dropping CDN {Cyan(server.Host)}, it is not answering");
+            _discardedHosts.Add(server.Host);
+            await PopulateAvailableServersAsync(cancellationToken);
+        }
+
+        /// <summary>
+        /// Whether a failed request says the server that answered it is unhealthy, rather than that the request
+        /// itself was bad.  A missing chunk or a refused manifest is the same on every server, so it is not.
+        /// 508 is left out, as it means the network is misconfigured and the callers treat it as fatal.
+        /// </summary>
+        public static bool IsServerFault(Exception exception)
+        {
+            return exception is TimeoutException
+                   || exception is TaskCanceledException
+                   || (exception is HttpRequestException webException
+                       && webException.StatusCode >= HttpStatusCode.InternalServerError
+                       && webException.StatusCode != HttpStatusCode.LoopDetected);
         }
     }
 }

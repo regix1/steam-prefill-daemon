@@ -2,9 +2,12 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using LancachePrefill.Common;
 using Moq;
+using Spectre.Console;
 using Spectre.Console.Testing;
 using SteamKit2;
 using SteamKit2.CDN;
@@ -314,6 +317,128 @@ public sealed class DaemonReliabilityTests
         Assert.Contains("90 seconds", exception.Message, StringComparison.Ordinal);
         Assert.IsType<TimeoutException>(exception.InnerException);
         response.TrySetCanceled();
+    }
+
+    // The pool is a stack, so a server returned after a failure is the very next one taken, and Steam keeps
+    // listing a server after it has been dropped, so a refill would hand it straight back. One dead CDN edge
+    // therefore answered every retry, and every download, until the process restarted. A server that fails with
+    // a server-side error is now dropped instead of returned, left out of the refill, and the retry reaches a
+    // different one.
+    [Fact]
+    public async Task ManifestDownloadOnFailingCdn_RetriesOnADifferentServer()
+    {
+        var console = new TestConsole();
+        var serversUsed = new List<Server>();
+        var steamHosts = Enumerable.Range(0, 8).Select(i => $"cdn-{i}").ToList();
+        var pool = new CdnPool(console, () => Task.FromResult(steamHosts.Select(CreateCdnServer).ToArray()));
+        // Holding only the minimum, so the first drop makes the pool ask Steam again, and Steam still lists the
+        // server that just failed.
+        pool.AvailableServerEndpoints = new ConcurrentStack<Server>(steamHosts.Take(5).Select(CreateCdnServer));
+        var handler = new ManifestHandler(
+            console,
+            pool,
+            _ => Task.FromResult(1UL),
+            (_, _, server) =>
+            {
+                serversUsed.Add(server);
+                // A faulted task, not a synchronous throw: the real client is an async method, and the
+                // connection handling being tested only runs once the download task is awaited.
+                return Task.FromException<DepotManifest>(new SteamKitWebRequestException(
+                    "504 Gateway Timeout",
+                    new HttpResponseMessage(HttpStatusCode.GatewayTimeout)));
+            });
+        var depot = CreateUncachedDepot();
+
+        var (manifests, skippedDepots) = await handler.GetAllManifestsAsync(new List<DepotInfo> { depot });
+
+        var hostsUsed = serversUsed.Select(e => e.Host).ToList();
+        Assert.Equal(3, hostsUsed.Count);
+        Assert.Equal(3, hostsUsed.Distinct().Count());
+        Assert.DoesNotContain(pool.AvailableServerEndpoints, e => hostsUsed.Contains(e.Host));
+        Assert.Equal(5, pool.AvailableServerEndpoints.Count);
+        Assert.Empty(manifests);
+        Assert.Same(depot, Assert.Single(skippedDepots));
+    }
+
+    // Dropped servers are left out of every refill, so once every server Steam lists has been dropped the
+    // refill would come back empty and the daemon would have no CDN until it was restarted.
+    [Fact]
+    public async Task CdnPoolWithItsOnlyServerDropped_OffersItAgain()
+    {
+        var pool = new CdnPool(new TestConsole(), () => Task.FromResult(new[] { CreateCdnServer("cdn-0") }));
+        await pool.PopulateAvailableServersAsync();
+        Assert.True(pool.AvailableServerEndpoints.TryPop(out var server));
+
+        await pool.DiscardConnectionAsync(server);
+
+        Assert.Equal("cdn-0", Assert.Single(pool.AvailableServerEndpoints).Host);
+    }
+
+    // The download delegate used to be called outside the try, so a client that threw before returning its task
+    // skipped the finally and the connection was never returned.
+    [Fact]
+    public async Task ManifestClientThrowingBeforeReturningATask_StillReturnsTheConnection()
+    {
+        var console = new TestConsole();
+        var pool = new CdnPool(console, new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var handler = new ManifestHandler(
+            console,
+            pool,
+            _ => Task.FromResult(1UL),
+            (_, _, _) => throw new InvalidOperationException("The CDN client is not ready"));
+        var depot = CreateUncachedDepot();
+
+        var (manifests, skippedDepots) = await handler.GetAllManifestsAsync(new List<DepotInfo> { depot });
+
+        Assert.Equal(5, pool.AvailableServerEndpoints.Count);
+        Assert.Empty(manifests);
+        Assert.Same(depot, Assert.Single(skippedDepots));
+    }
+
+    // Chunk requests go through the cache with the CDN as the Host header, so a 5xx or a timeout is that CDN not
+    // answering, while a 404 is a chunk no server has. Dropping the server on any failure stripped a healthy pool
+    // down over a long download, and nothing ever refilled it.
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound, false)]
+    [InlineData(HttpStatusCode.ServiceUnavailable, true)]
+    public async Task ChunkDownloadFailure_DropsTheServerOnlyWhenItIsTheServersFault(HttpStatusCode status, bool serverDropped)
+    {
+        var console = new TestConsole();
+        var steamHosts = Enumerable.Range(0, 6).Select(i => $"cdn-{i}").ToList();
+        var pool = new CdnPool(console, () => Task.FromResult(steamHosts.Select(CreateCdnServer).ToArray()));
+        // Holding only the minimum, so a drop has to ask Steam for more.
+        pool.AvailableServerEndpoints = new ConcurrentStack<Server>(steamHosts.Take(5).Select(CreateCdnServer));
+        var server = pool.AvailableServerEndpoints.First();
+        using var handler = new DownloadHandler(console, pool);
+        var cache = new TcpListener(IPAddress.Loopback, 0);
+        cache.Start();
+        // The cache address is resolved from DNS in InitializeAsync, which this test does not run.
+        typeof(DownloadHandler).GetField("_lancacheAddress", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(handler, $"127.0.0.1:{((IPEndPoint)cache.LocalEndpoint).Port}");
+        var answer = Task.Run(async () =>
+        {
+            using var client = await cache.AcceptTcpClientAsync();
+            using var stream = client.GetStream();
+            await stream.ReadAsync(new byte[4096]);
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                $"HTTP/1.1 {(int)status} {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+        });
+        var failedRequests = new ConcurrentBag<QueuedRequest>();
+
+        await console.Progress().StartAsync(async ctx =>
+        {
+            failedRequests = await handler.AttemptDownloadAsync(
+                ctx,
+                "Downloading..",
+                new List<QueuedRequest> { default },
+                new DownloadArguments { MaxConcurrentRequests = 1 });
+        });
+        await answer;
+        cache.Stop();
+
+        Assert.Single(failedRequests);
+        Assert.Equal(!serverDropped, pool.AvailableServerEndpoints.Any(e => e.Host == server.Host));
+        Assert.Equal(5, pool.AvailableServerEndpoints.Count);
     }
 
     [Fact]
@@ -934,6 +1059,17 @@ public sealed class DaemonReliabilityTests
         // An empty manifest is all the cached path needs, these tests only care that the load succeeds
         File.WriteAllBytes(depot.ManifestFileName, Array.Empty<byte>());
         return depot;
+    }
+
+    // A cacheable server as Steam would list it.  SteamKit only sets these from Steam's own reply, so the
+    // setters are internal.
+    private static Server CreateCdnServer(string host)
+    {
+        var server = new Server();
+        typeof(Server).GetProperty(nameof(Server.Host))!.SetValue(server, host);
+        typeof(Server).GetProperty(nameof(Server.Type))!.SetValue(server, "CDN");
+        typeof(Server).GetProperty(nameof(Server.AllowedAppIds))!.SetValue(server, Array.Empty<uint>());
+        return server;
     }
 
     private static async Task WriteRequestAsync(NetworkStream stream, CommandRequest request)
