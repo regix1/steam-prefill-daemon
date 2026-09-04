@@ -25,10 +25,10 @@
             try
             {
                 using var request = new HttpRequestMessage(HttpMethod.Get, new Uri("https://api.steampowered.com/ISteamChartsService/GetMostPlayedGames/v1/"));
-                using var response = await httpClient.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken);
+                // Buffered rather than read from headers only.  The whole body is read into a string on the line
+                // below regardless, and HttpClient.Timeout stops counting once the headers arrive, so streaming
+                // the body would leave it unbounded against a server that answers and then goes quiet.
+                using var response = await httpClient.SendAsync(request, cancellationToken);
                 response.EnsureSuccessStatusCode();
 
                 var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);

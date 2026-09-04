@@ -118,9 +118,24 @@ namespace SteamPrefill.Handlers
             // Per-request timeout to prevent indefinite hangs (2 minutes should be plenty for any chunk)
             var perRequestTimeout = TimeSpan.FromMinutes(2);
 
+            // The per-request timeout bounds one chunk, but nothing bounded the walk itself, so a cache that
+            // answers nothing costs that timeout on every request still queued.  A queue holds tens of thousands
+            // of chunks, which turns into hours of silence.  Two full waves failing without a single byte arriving
+            // is a source that is not serving, so the rest of the queue is abandoned instead of walked.  Two waves
+            // rather than one, because a queue whose first wave fails and then recovers is a working download.
+            var failuresBeforeSourceIsDown = downloadArgs.MaxConcurrentRequests * 2;
+            var succeededCount = 0;
+            var sourceIsDown = 0;
+
             var cdnServer = _cdnPool.TakeConnection();
             await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests, CancellationToken = cancellationToken }, body: async (request, ct) =>
             {
+                if (Volatile.Read(ref sourceIsDown) != 0)
+                {
+                    failedRequests.Add(request);
+                    return;
+                }
+
                 // Create a linked cancellation token with a per-request timeout
                 // This ensures that individual requests don't hang indefinitely even if the main token doesn't have a timeout
                 using var requestTimeoutCts = new CancellationTokenSource(perRequestTimeout);
@@ -147,6 +162,9 @@ namespace SteamPrefill.Handlers
                     while (await responseStream.ReadAsync(buffer, requestCt) != 0)
                     {
                     }
+                    // Counted here rather than from the progress totals below, which advance by the request's
+                    // estimated size whether it succeeded or not.
+                    Interlocked.Increment(ref succeededCount);
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -164,6 +182,13 @@ namespace SteamPrefill.Handlers
                     request.LastFailureReason = e;
                     failedRequests.Add(request);
                 }
+                // A single success anywhere in this attempt disables the check for the rest of it, so a slow but
+                // working transfer can never trip it.
+                if (Volatile.Read(ref succeededCount) == 0 && failedRequests.Count >= failuresBeforeSourceIsDown)
+                {
+                    Volatile.Write(ref sourceIsDown, 1);
+                }
+
                 progressTask.Increment(request.CompressedLength);
 
                 // Report progress via IPrefillProgress (throttled)
@@ -202,6 +227,18 @@ namespace SteamPrefill.Handlers
 
             // Making sure the progress bar is always set to its max value, in-case some unexpected error leaves the progress bar showing as unfinished
             progressTask.Increment(progressTask.MaxValue);
+
+            // Thrown out here rather than from inside the loop, where the catch-all above would record it as one
+            // more failed request, and where several bodies throwing at once would arrive as an AggregateException
+            // with this message buried in it.  The connection has already been discarded or returned above.
+            if (Volatile.Read(ref sourceIsDown) != 0)
+            {
+                throw new TimeoutException(
+                    $"Gave up downloading from {_lancacheAddress}.  The first {failuresBeforeSourceIsDown} requests for {cdnServer.Host} all failed " +
+                    "and not one byte arrived, so the rest of the queue was abandoned rather than waiting on every remaining chunk.  " +
+                    "Check that the cache is running and that it can reach the internet.");
+            }
+
             return failedRequests;
         }
 

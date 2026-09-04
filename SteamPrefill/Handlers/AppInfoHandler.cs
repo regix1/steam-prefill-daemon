@@ -10,7 +10,7 @@
         private readonly LicenseManager _licenseManager;
         private readonly Func<List<uint>, Task<PICSTokensCallback>> _requestAccessTokensAsync;
 
-        private static readonly TimeSpan MetadataRequestTimeout = TimeSpan.FromSeconds(90);
+        private static readonly TimeSpan MetadataRequestTimeout = TimeSpan.FromSeconds(45);
 
         private List<CPlayer_GetOwnedGames_Response.Game> _recentlyPlayed;
 

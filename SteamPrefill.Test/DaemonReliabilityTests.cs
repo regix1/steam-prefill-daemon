@@ -314,7 +314,7 @@ public sealed class DaemonReliabilityTests
 
         var exception = await Assert.ThrowsAsync<SteamConnectionException>(() => requestTask);
         Assert.Contains("Steam did not answer", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("90 seconds", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("45 seconds", exception.Message, StringComparison.Ordinal);
         Assert.IsType<TimeoutException>(exception.InnerException);
         response.TrySetCanceled();
     }
@@ -439,6 +439,67 @@ public sealed class DaemonReliabilityTests
         Assert.Single(failedRequests);
         Assert.Equal(!serverDropped, pool.AvailableServerEndpoints.Any(e => e.Host == server.Host));
         Assert.Equal(5, pool.AvailableServerEndpoints.Count);
+    }
+
+    // A cache that answers nothing still had every queued chunk walked, one per-request timeout at a time, and a
+    // queue holds tens of thousands of them, so a dead cache meant hours of silence. The walk now stops once two
+    // full waves have failed without a single byte arriving.
+    [Fact(Timeout = 60_000)]
+    public async Task ChunkDownload_AbandonsTheQueueOnceTwoWavesFailWithNothingTransferred()
+    {
+        var console = new TestConsole();
+        var pool = new CdnPool(console, () => Task.FromResult(new[] { CreateCdnServer("cdn-0") }));
+        pool.AvailableServerEndpoints = new ConcurrentStack<Server>(new[] { CreateCdnServer("cdn-0") });
+        using var handler = new DownloadHandler(console, pool);
+        using var cache = new CacheListener(_ => HttpStatusCode.ServiceUnavailable);
+        // The cache address is resolved from DNS in InitializeAsync, which this test does not run.
+        typeof(DownloadHandler).GetField("_lancacheAddress", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(handler, cache.Address);
+
+        await console.Progress().StartAsync(async ctx =>
+        {
+            var exception = await Assert.ThrowsAsync<TimeoutException>(() => handler.AttemptDownloadAsync(
+                ctx,
+                "Downloading..",
+                Enumerable.Range(0, 30).Select(_ => default(QueuedRequest)).ToList(),
+                new DownloadArguments { MaxConcurrentRequests = 2 }));
+
+            Assert.Contains("not one byte arrived", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("cdn-0", exception.Message, StringComparison.Ordinal);
+            Assert.Contains(cache.Address, exception.Message, StringComparison.Ordinal);
+        });
+
+        // The point of the rule: the length of the queue is no longer a multiplier on the time to fail.
+        Assert.True(cache.Served < 30, $"the queue should have been abandoned, but {cache.Served} of 30 requests were sent");
+    }
+
+    // The guard against firing on a download that works: one failed wave followed by a recovery must still finish.
+    // This passes with and without the abandon rule, because code that never abandons cannot fail an assertion
+    // that it did not abandon. It is here to prove the rule cannot break a working download.
+    [Fact(Timeout = 60_000)]
+    public async Task ChunkDownload_DoesNotAbandonWhenAFailedWaveRecovers()
+    {
+        var console = new TestConsole();
+        var pool = new CdnPool(console, () => Task.FromResult(new[] { CreateCdnServer("cdn-0") }));
+        pool.AvailableServerEndpoints = new ConcurrentStack<Server>(new[] { CreateCdnServer("cdn-0") });
+        using var handler = new DownloadHandler(console, pool);
+        // Exactly one wave fails, so the failure count can never reach the two wave threshold of 8.
+        using var cache = new CacheListener(served => served < 4 ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
+        typeof(DownloadHandler).GetField("_lancacheAddress", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(handler, cache.Address);
+
+        var failedRequests = new ConcurrentBag<QueuedRequest>();
+        await console.Progress().StartAsync(async ctx =>
+        {
+            failedRequests = await handler.AttemptDownloadAsync(
+                ctx,
+                "Downloading..",
+                Enumerable.Range(0, 20).Select(_ => default(QueuedRequest)).ToList(),
+                new DownloadArguments { MaxConcurrentRequests = 4 });
+        });
+
+        Assert.Equal(4, failedRequests.Count);
+        Assert.Equal(20, cache.Served);
     }
 
     [Fact]
@@ -1063,6 +1124,64 @@ public sealed class DaemonReliabilityTests
 
     // A cacheable server as Steam would list it.  SteamKit only sets these from Steam's own reply, so the
     // setters are internal.
+    // A stand-in cache on loopback that answers every chunk request with whatever status the test picks for it,
+    // so a test can make a source fail everything, or fail one wave and then recover. Requests are counted as
+    // they are accepted, which is serialized, so "the first four" is exact no matter how the client interleaves.
+    private sealed class CacheListener : IDisposable
+    {
+        private readonly TcpListener _listener;
+        private readonly CancellationTokenSource _stopped = new CancellationTokenSource();
+        private int _served;
+
+        public CacheListener(Func<int, HttpStatusCode> statusForRequest)
+        {
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            Address = $"127.0.0.1:{((IPEndPoint)_listener.LocalEndpoint).Port}";
+            _ = Task.Run(() => AcceptAsync(statusForRequest));
+        }
+
+        public string Address { get; }
+
+        public int Served => Volatile.Read(ref _served);
+
+        private async Task AcceptAsync(Func<int, HttpStatusCode> statusForRequest)
+        {
+            while (!_stopped.IsCancellationRequested)
+            {
+                TcpClient client;
+                try
+                {
+                    client = await _listener.AcceptTcpClientAsync(_stopped.Token);
+                }
+                catch (Exception)
+                {
+                    return;
+                }
+
+                var status = statusForRequest(Interlocked.Increment(ref _served) - 1);
+                _ = Task.Run(async () =>
+                {
+                    using (client)
+                    {
+                        using var stream = client.GetStream();
+                        await stream.ReadAsync(new byte[4096]);
+                        var body = status == HttpStatusCode.OK ? "chunk" : "";
+                        await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                            $"HTTP/1.1 {(int)status} {status}\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}"));
+                    }
+                });
+            }
+        }
+
+        public void Dispose()
+        {
+            _stopped.Cancel();
+            _listener.Stop();
+            _stopped.Dispose();
+        }
+    }
+
     private static Server CreateCdnServer(string host)
     {
         var server = new Server();

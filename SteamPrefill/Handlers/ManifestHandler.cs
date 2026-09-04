@@ -181,7 +181,12 @@ namespace SteamPrefill.Handlers
                     depot,
                     manifestRequestCode.Code,
                     server);
-                manifest = await downloadTask.WaitAsync(cancellationToken);
+                // Bounded so that a CDN edge which accepts the connection and then goes silent fails this
+                // attempt instead of stalling the whole prefill.  A TimeoutException is a server fault, so
+                // the edge is discarded below and the retry takes a different one.  Kept short because the
+                // caller retries three times: a dead edge has to be given up on in the time a person will
+                // wait, not three times the time one attempt is allowed.
+                manifest = await downloadTask.WaitAsync(TimeSpan.FromSeconds(20), cancellationToken);
                 if (manifest == null)
                 {
                     throw new ManifestException($"Unable to download manifest for depot {depot.Name} - {depot.DepotId}.  Manifest request received no response.");
@@ -251,9 +256,10 @@ namespace SteamPrefill.Handlers
             CancellationToken cancellationToken)
         {
             // Adding an additional timeout to this SteamKit method.  I have a feeling that this is not properly timing out
-            // for some users.
+            // for some users.  This is a small control call that returns a single number, so it gets the same 15 seconds
+            // the server list request gets, and it runs before the download on every one of the caller's three attempts.
             ulong manifestRequestCode = await _requestManifestCodeAsync(depot)
-                .WaitAsync(TimeSpan.FromSeconds(90), cancellationToken);
+                .WaitAsync(TimeSpan.FromSeconds(15), cancellationToken);
 
             // If we could not get the manifest code, this is a fatal error, as it we can't download the manifest without it.
             if (manifestRequestCode == 0)
