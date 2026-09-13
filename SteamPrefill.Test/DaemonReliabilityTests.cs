@@ -1369,6 +1369,7 @@ public sealed class DaemonReliabilityTests
         progress.AppCompleted += (_, result) => appResult = result;
         progress.PrefillCompleted += completed => summary = completed;
         progress.AppStarted += _ => appStarted = true;
+        using var cache = new CacheListener(_ => HttpStatusCode.OK);
 
         var steamManager = new SteamManager(
             console,
@@ -1377,7 +1378,8 @@ public sealed class DaemonReliabilityTests
             progress,
             cdnPool: cdnPool,
             appInfoHandler: appInfoHandler.Object,
-            depotHandler: depotHandler);
+            depotHandler: depotHandler,
+            download: sink => new DownloadHandler(console, cdnPool, new SocketsHttpHandler(), cache.Address, sink));
 
         await steamManager.DownloadMultipleAppsAsync(false, false, null, true);
 
