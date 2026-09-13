@@ -429,7 +429,7 @@
 
             // We will want to re-download the entire app, if any of the depots have been updated
             if (downloadArgs.Force == false && !skippedDepots.Any() &&
-                (_depotHandler.AppIsUpToDate(filteredDepots) || run != null && filteredDepots.All(depot => run.Options.CachedDepots.Contains($"{depot.DepotId}:{depot.ManifestId}"))))
+                _depotHandler.AppIsUpToDate(filteredDepots, run?.CacheSnapshot == true ? run.Options.CachedDepots : null))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
                 var cachedAppInfo = new AppDownloadInfo

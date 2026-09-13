@@ -968,8 +968,9 @@ public sealed class SocketCommandInterface : IDisposable
             if (parameters.TryGetValue("os", out var operatingSystems))
                 options.OperatingSystems = operatingSystems.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                     .Select(value => OperatingSystem.FromValue(value.ToLowerInvariant())).ToList();
-            var cachedDepots = parameters.TryGetValue("cachedDepots", out var cached)
-                ? JsonSerializer.Deserialize(cached, DaemonSerializationContext.Default.ListCachedDepotInput) ?? throw new ArgumentException("Invalid cached depots.")
+            var cacheSnapshot = parameters.TryGetValue("cachedDepots", out var cached);
+            var cachedDepots = cacheSnapshot
+                ? JsonSerializer.Deserialize(cached ?? throw new ArgumentException("Invalid cached depots."), DaemonSerializationContext.Default.ListCachedDepotInput) ?? throw new ArgumentException("Invalid cached depots.")
                 : new List<CachedDepotInput>();
             var captured = _protocol.Capture(new RunOptions
             {
@@ -982,9 +983,9 @@ public sealed class SocketCommandInterface : IDisposable
                 CachedDepots = cachedDepots.Select(depot => $"{depot.DepotId}:{depot.ManifestId}").Order(StringComparer.Ordinal).ToArray()
             });
             var progress = new RunProgress(request.Id, _protocol.DaemonInstanceId, captured, PublishRunAsync);
-            var run = new PrefillRun(captured, progress, _budget, _claims);
+            var run = new PrefillRun(captured, progress, _budget, _claims, cacheSnapshot);
             var sink = new SocketProgress(operationId: request.Id, run: run, sync: _lifecycle, enableDebugLogs: AppConfig.DebugLogs);
-            var admission = _prefillOperation.StartAsync(request.Id, PrefillProtocol.Fingerprint(captured), progress, async token =>
+            var admission = _prefillOperation.StartAsync(request.Id, $"{PrefillProtocol.Fingerprint(captured)}:{cacheSnapshot}", progress, async token =>
             {
                 PrefillRun.Current.Value = run;
                 try

@@ -8,6 +8,25 @@ namespace SteamPrefill.Test;
 
 public sealed class CacheCommitTests
 {
+    [Fact]
+    public void ManagerSnapshotReplacesHistoricalHintsWithoutChangingOtherRuns()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "steam-snapshot-" + Guid.NewGuid().ToString("N"));
+        var handler = new DepotHandler(null!, null!, null!, path);
+        var depots = new List<DepotInfo>
+        {
+            new(new KeyValue("101"), 100) { ManifestId = 1 },
+            new(new KeyValue("102"), 100) { ManifestId = 2 }
+        };
+        handler.SetCachedManifests(new[] { (101U, 1UL), (102U, 2UL) });
+        Assert.True(handler.AppIsUpToDate(depots));
+        Assert.False(handler.AppIsUpToDate(depots, Array.Empty<string>()));
+        Assert.False(handler.AppIsUpToDate(depots, new[] { "101:1" }));
+        Assert.False(handler.AppIsUpToDate(depots, new[] { "101:1", "102:3" }));
+        Assert.True(handler.AppIsUpToDate(depots, new[] { "101:1", "102:2" }));
+        Assert.True(handler.AppIsUpToDate(depots));
+    }
+
     [Theory]
     [InlineData("terminal")]
     [InlineData("commit")]

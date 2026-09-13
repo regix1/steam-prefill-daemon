@@ -11,6 +11,7 @@ internal sealed class PrefillRun
     private readonly ConcurrentBag<IDisposable> _leases = new();
     private readonly ConcurrentDictionary<string, long> _bytes = new(StringComparer.Ordinal);
     internal RunOptions Options { get; }
+    internal bool CacheSnapshot { get; }
     internal RunProgress Progress { get; }
     internal RequestBudget Budget { get; }
     internal ItemClaims Claims { get; }
@@ -18,9 +19,11 @@ internal sealed class PrefillRun
     internal DownloadArguments Arguments { get; }
     internal string OperationId => Progress.Snapshot.OperationId;
 
-    internal PrefillRun(RunOptions options, RunProgress progress, RequestBudget budget, ItemClaims claims)
+    internal PrefillRun(RunOptions options, RunProgress progress, RequestBudget budget, ItemClaims claims,
+        bool cacheSnapshot = false)
     {
         Options = options;
+        CacheSnapshot = cacheSnapshot;
         Progress = progress;
         Budget = budget;
         Claims = claims;

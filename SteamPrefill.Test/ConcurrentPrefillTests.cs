@@ -147,6 +147,38 @@ public sealed class ConcurrentPrefillTests
                 Assert.Equal("success", Assert.Single(page.Items).Result);
                 Assert.Single(page.Items[0].Depots!);
             }
+
+            // Removing cached content must override this persistent daemon's successful history.
+            var refill = new CommandRequest
+            {
+                Id = Guid.NewGuid().ToString("D"),
+                Type = "prefill",
+                Parameters = new(starts[2].Parameters!)
+                {
+                    ["force"] = "false",
+                    ["cachedDepots"] = "[]"
+                }
+            };
+            Assert.True((await InvokeAsync(commands, refill)).Success);
+            await owner.WaitAsync(refill.Id).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(2, sent[2]);
+            Assert.Equal(3, owner.GetOperation(refill.Id)!.BytesTransferred);
+            Assert.Equal(1, owner.GetOperation(refill.Id)!.CompletedApps);
+
+            var cached = new CommandRequest
+            {
+                Id = Guid.NewGuid().ToString("D"),
+                Type = "prefill",
+                Parameters = new(refill.Parameters!)
+                {
+                    ["cachedDepots"] = "[{\"depotId\":2002,\"manifestId\":\"" + apps[2002].Depots[0].ManifestId + "\"}]"
+                }
+            };
+            Assert.True((await InvokeAsync(commands, cached)).Success);
+            await owner.WaitAsync(cached.Id).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(2, sent[2]);
+            Assert.Equal(0, owner.GetOperation(cached.Id)!.BytesTransferred);
+            Assert.Equal(1, owner.GetOperation(cached.Id)!.CachedApps);
         }
         finally
         {
