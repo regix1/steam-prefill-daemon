@@ -10,42 +10,72 @@
         /// KeyValue store of DepotId/ManifestId, that keeps a history of which manifest version(s) have been downloaded for each depot id.
         /// If a manifest version is found for a specific depot, than that depot can be considered as previously downloaded.
         /// </summary>
-        private readonly Dictionary<uint, HashSet<ulong>> _downloadedDepots = new Dictionary<uint, HashSet<ulong>>();
+        private Dictionary<uint, HashSet<ulong>> _downloadedDepots = new Dictionary<uint, HashSet<ulong>>();
+        private readonly object _commit = new();
+        private readonly string _successPath;
+        private readonly Action<string, string> _replace;
 
         public DepotHandler(IAnsiConsole ansiConsole, Steam3Session steam3Session, AppInfoHandler appInfoHandler, CdnPool cdnPool)
             : this(steam3Session, appInfoHandler, new ManifestHandler(ansiConsole, cdnPool, steam3Session))
         {
         }
 
-        internal DepotHandler(Steam3Session steam3Session, AppInfoHandler appInfoHandler, ManifestHandler manifestHandler)
+        internal DepotHandler(Steam3Session steam3Session, AppInfoHandler appInfoHandler, ManifestHandler manifestHandler,
+            string successPath = null, Action<string, string> replace = null)
         {
             _steam3Session = steam3Session;
             _appInfoHandler = appInfoHandler;
             _manifestHandler = manifestHandler;
+            _successPath = successPath ?? AppConfig.SuccessfullyDownloadedDepotsPath;
+            _replace = replace ?? ((source, destination) => File.Move(source, destination, true));
 
-            if (File.Exists(AppConfig.SuccessfullyDownloadedDepotsPath))
+            if (File.Exists(_successPath))
             {
-                var fileContents = File.ReadAllText(AppConfig.SuccessfullyDownloadedDepotsPath);
+                var fileContents = File.ReadAllText(_successPath);
                 _downloadedDepots = JsonSerializer.Deserialize(fileContents, SerializationContext.Default.DictionaryUInt32HashSetUInt64);
             }
         }
 
         public void MarkDownloadAsSuccessful(List<DepotInfo> depots)
+            => MarkDownloadAsSuccessful(depots, null, null);
+
+        internal bool MarkDownloadAsSuccessful(List<DepotInfo> depots, RunProgress progress, RunItemSnapshot item)
         {
-            foreach (var depot in depots)
+            lock (_commit)
             {
-                var depotId = depot.DepotId;
-
-                // Initialize the entry for the specified depot
-                if (!_downloadedDepots.ContainsKey(depotId))
+                var merged = _downloadedDepots.ToDictionary(pair => pair.Key, pair => new HashSet<ulong>(pair.Value));
+                foreach (var depot in depots)
                 {
-                    _downloadedDepots.Add(depotId, new HashSet<ulong>());
-                }
+                    var depotId = depot.DepotId;
 
-                var downloadedManifests = _downloadedDepots[depotId];
-                downloadedManifests.Add(depot.ManifestId.Value);
+                    // Initialize the entry for the specified depot
+                    if (!merged.ContainsKey(depotId))
+                    {
+                        merged.Add(depotId, new HashSet<ulong>());
+                    }
+
+                    var downloadedManifests = merged[depotId];
+                    downloadedManifests.Add(depot.ManifestId.Value);
+                }
+                var temporary = _successPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    {
+                        JsonSerializer.Serialize(stream, merged, SerializationContext.Default.DictionaryUInt32HashSetUInt64);
+                        stream.Flush(true);
+                    }
+                    Action commit = () =>
+                    {
+                        _replace(temporary, _successPath);
+                        _downloadedDepots = merged;
+                    };
+                    if (progress != null) return progress.TryCommitItem(item, commit);
+                    commit();
+                    return true;
+                }
+                finally { if (File.Exists(temporary)) File.Delete(temporary); }
             }
-            File.WriteAllText(AppConfig.SuccessfullyDownloadedDepotsPath, JsonSerializer.Serialize(_downloadedDepots, SerializationContext.Default.DictionaryUInt32HashSetUInt64));
         }
 
         /// <summary>
@@ -54,7 +84,7 @@
         /// </summary>
         public bool AppIsUpToDate(List<DepotInfo> depots)
         {
-            return depots.All(e => _downloadedDepots.ContainsKey(e.DepotId)
+            lock (_commit) return depots.All(e => _downloadedDepots.ContainsKey(e.DepotId)
                                    && _downloadedDepots[e.DepotId].Contains(e.ManifestId.Value));
         }
 
@@ -66,13 +96,16 @@
         /// <param name="cachedDepots">List of cached depot info with depot ID and manifest ID</param>
         public void SetCachedManifests(IEnumerable<(uint DepotId, ulong ManifestId)> cachedDepots)
         {
-            foreach (var (depotId, manifestId) in cachedDepots)
+            lock (_commit)
             {
-                if (!_downloadedDepots.ContainsKey(depotId))
+                foreach (var (depotId, manifestId) in cachedDepots)
                 {
-                    _downloadedDepots.Add(depotId, new HashSet<ulong>());
+                    if (!_downloadedDepots.ContainsKey(depotId))
+                    {
+                        _downloadedDepots.Add(depotId, new HashSet<ulong>());
+                    }
+                    _downloadedDepots[depotId].Add(manifestId);
                 }
-                _downloadedDepots[depotId].Add(manifestId);
             }
         }
 
@@ -84,16 +117,18 @@
         /// <returns>The number of depots that were cleared</returns>
         public int ClearCachedManifests()
         {
-            var count = _downloadedDepots.Count;
-            _downloadedDepots.Clear();
-
-            // Also clear the persisted file if it exists
-            if (File.Exists(AppConfig.SuccessfullyDownloadedDepotsPath))
+            lock (_commit)
             {
-                File.Delete(AppConfig.SuccessfullyDownloadedDepotsPath);
-            }
+                var count = _downloadedDepots.Count;
 
-            return count;
+                // Also clear the persisted file if it exists
+                if (File.Exists(_successPath))
+                {
+                    File.Delete(_successPath);
+                }
+                _downloadedDepots.Clear();
+                return count;
+            }
         }
 
         /// <summary>
@@ -157,7 +192,7 @@
                 {
                     continue;
                 }
-                filteredDepots.Add(depot);
+                filteredDepots.Add(new DepotInfo(depot));
             }
             return filteredDepots;
         }

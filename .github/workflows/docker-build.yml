@@ -44,15 +44,21 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Restore dependencies
-        run: dotnet restore
+        run: dotnet restore SteamPrefill.sln
 
-      - name: Build
-        run: dotnet build --no-restore --configuration Release /p:TreatWarningsAsErrors=false
+      - name: Verify formatting
+        run: dotnet format SteamPrefill.sln --verify-no-changes
+
+      - name: Build solution
+        run: dotnet build SteamPrefill.sln --no-restore --no-incremental --configuration Release /p:TreatWarningsAsErrors=true
+
+      - name: Test solution
+        run: dotnet test SteamPrefill.sln --no-build --configuration Release
 
       - name: Publish
         run: |
           mkdir -p publish/$(echo ${{ matrix.platform }} | sed 's/linux\///')
-          dotnet publish ${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj --configuration Release -o publish/$(echo ${{ matrix.platform }} | sed 's/linux\///') --self-contained --runtime ${{ matrix.runtime }} /p:TreatWarningsAsErrors=false
+          dotnet publish ${{ env.PROJECT_NAME }}/${{ env.PROJECT_NAME }}.csproj --configuration Release -o publish/$(echo ${{ matrix.platform }} | sed 's/linux\///') --self-contained --runtime ${{ matrix.runtime }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

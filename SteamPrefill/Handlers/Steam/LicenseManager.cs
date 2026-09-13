@@ -3,19 +3,22 @@
     public sealed class LicenseManager
     {
         private readonly SteamApps _steamAppsApi;
+        private readonly Steam3Session _session;
+        private readonly object _sync = new();
 
         /// <summary>
         /// Contains the purchase date for an app.  Key is the appId and the value is when it was purchased.
         /// </summary>
-        private readonly Dictionary<uint, DateTime> _appPurchaseTimeLookup = new Dictionary<uint, DateTime>();
+        private Dictionary<uint, DateTime> _appPurchaseTimeLookup = new Dictionary<uint, DateTime>();
 
         internal UserLicenses _userLicenses = new UserLicenses();
 
-        public List<uint> AllOwnedAppIds => _userLicenses.OwnedAppIds.ToList();
+        public List<uint> AllOwnedAppIds { get { lock (_sync) return _userLicenses.OwnedAppIds.ToList(); } }
 
-        public LicenseManager(SteamApps steamAppsApi)
+        public LicenseManager(SteamApps steamAppsApi, Steam3Session session = null)
         {
             _steamAppsApi = steamAppsApi;
+            _session = session;
         }
 
         /// <summary>
@@ -25,7 +28,7 @@
         /// <returns>True if the user has access to the app</returns>
         public bool AccountHasAppAccess(uint appid)
         {
-            return _userLicenses.OwnedAppIds.Contains(appid);
+            lock (_sync) return _userLicenses.OwnedAppIds.Contains(appid);
         }
 
         /// <summary>
@@ -42,13 +45,14 @@
         /// <returns>True if the user has access to the depot</returns>
         public bool AccountHasDepotAccess(uint depotId)
         {
-            return _userLicenses.OwnedDepotIds.Contains(depotId) || _userLicenses.OwnedAppIds.Contains(depotId);
+            lock (_sync) return _userLicenses.OwnedDepotIds.Contains(depotId) || _userLicenses.OwnedAppIds.Contains(depotId);
         }
 
-        [SuppressMessage("Threading", "VSTHRD002:Synchronously waiting on tasks or awaiters may cause deadlocks", Justification = "Callback must be synchronous to compile")]
-        public void LoadPackageInfo(IReadOnlyCollection<LicenseListCallback.License> licenseList)
+        [SuppressMessage("Naming", "VSTHRD200", Justification = "Retains the established method name.")]
+        public async Task LoadPackageInfo(IReadOnlyCollection<LicenseListCallback.License> licenseList)
         {
-            _userLicenses = new UserLicenses();
+            var licenses = new UserLicenses();
+            var purchaseTimes = new Dictionary<uint, DateTime>();
 
             // Filters out licenses that are subscription based, and have expired, like EA Play for example.
             // The account will continue to "own" the packages, and will be unable to download their apps, so they must be filtered out here.
@@ -57,7 +61,7 @@
             // Some packages require an access token in order to request their apps/depot list
             var packageRequests = nonExpiredLicenses.Select(e => new PICSRequest(e.PackageID, e.AccessToken)).ToList();
 
-            var jobResult = _steamAppsApi.PICSGetProductInfo(new List<PICSRequest>(), packageRequests).ToTask().Result;
+            var jobResult = await _session.RequestAsync(() => _steamAppsApi.PICSGetProductInfo(new List<PICSRequest>(), packageRequests).ToTask(), _session.AuthLostToken);
             var packageInfos = jobResult.Results.SelectMany(e => e.Packages)
                                         .Select(e => e.Value)
                                         .Select(e => new Package(e.KeyValues))
@@ -77,20 +81,28 @@
                     continue;
                 }
 
-                _userLicenses.OwnedAppIds.AddRange(package.AppIds);
-                _userLicenses.OwnedDepotIds.AddRange(package.DepotIds);
+                licenses.OwnedAppIds.AddRange(package.AppIds);
+                licenses.OwnedDepotIds.AddRange(package.DepotIds);
 
                 // Building out the AppID to purchase date lookup.
                 foreach (var appId in package.AppIds)
                 {
-                    if (!_appPurchaseTimeLookup.ContainsKey(appId))
+                    if (!purchaseTimes.ContainsKey(appId))
                     {
-                        _appPurchaseTimeLookup.Add(appId, licenseDateLookup[package.Id]);
+                        purchaseTimes.Add(appId, licenseDateLookup[package.Id]);
                     }
                 }
             }
 
-            _userLicenses.OwnedPackageIds.AddRange(packageInfos.Select(e => e.Id).ToList());
+            licenses.OwnedPackageIds.AddRange(packageInfos.Select(e => e.Id).ToList());
+            _session.WhileAuthenticated(() =>
+            {
+                lock (_sync)
+                {
+                    _userLicenses = licenses;
+                    _appPurchaseTimeLookup = purchaseTimes;
+                }
+            }, _session.AuthLostToken);
         }
 
         /// <summary>
@@ -102,7 +114,7 @@
         {
             var cutoffDate = DateTime.UtcNow.Subtract(TimeSpan.FromDays(recentDays));
 
-            return _appPurchaseTimeLookup.ToList()
+            lock (_sync) return _appPurchaseTimeLookup.ToList()
                                          .Where(e => e.Value >= cutoffDate)
                                          .Select(e => e.Key)
                                          .ToList();
@@ -110,19 +122,8 @@
 
         public DateTime GetPurchaseDateForApp(uint appId)
         {
-            return _appPurchaseTimeLookup[appId];
+            lock (_sync) return _appPurchaseTimeLookup[appId];
         }
     }
 
-    public sealed class UserLicenses
-    {
-        public HashSet<uint> OwnedPackageIds { get; } = new HashSet<uint>();
-        public HashSet<uint> OwnedAppIds { get; } = new HashSet<uint>();
-        public HashSet<uint> OwnedDepotIds { get; } = new HashSet<uint>();
-
-        public override string ToString()
-        {
-            return $"Packages : {OwnedPackageIds.Count} Apps : {OwnedAppIds.Count} Depots : {OwnedDepotIds.Count}";
-        }
-    }
 }

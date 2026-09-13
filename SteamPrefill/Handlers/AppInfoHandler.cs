@@ -144,7 +144,7 @@
             try
             {
                 // Some apps will require an additional "access token" in order to retrieve their app metadata
-                var accessTokensResponse = await _requestAccessTokensAsync(appIdsToLoad)
+                var accessTokensResponse = await _steam3Session.RequestAsync(() => _requestAccessTokensAsync(appIdsToLoad), linked.Token)
                     .WaitAsync(MetadataRequestTimeout, linked.Token);
                 var appTokens = accessTokensResponse.AppTokens;
 
@@ -163,7 +163,7 @@
 
                 // Finally request the metadata from steam
                 stage = "product-details";
-                resultSet = await _requestProductsAsync(requests)
+                resultSet = await _steam3Session.RequestAsync(() => _requestProductsAsync(requests), linked.Token)
                     .WaitAsync(MetadataRequestTimeout, linked.Token);
             }
             catch (Exception e) when (e is AsyncJobFailedException or TimeoutException ||
@@ -233,8 +233,9 @@
                             continue;
                         }
 
-                        depot.AttachToParentApp(app.AppId, dlcAppId);
-                        app.Depots.Add(depot);
+                        var attached = new DepotInfo(depot);
+                        attached.AttachToParentApp(app.AppId, dlcAppId);
+                        app.Depots.Add(attached);
                     }
                 }
 
@@ -287,9 +288,8 @@
             SteamUnifiedMessages.ServiceMethodResponse<CPlayer_GetOwnedGames_Response> response;
             try
             {
-                response = await _steam3Session.unifiedPlayerService
-                    .GetOwnedGames(request)
-                    .ToTask()
+                response = await _steam3Session.RequestAsync(() => _steam3Session.unifiedPlayerService
+                    .GetOwnedGames(request).ToTask(), cancellationToken)
                     .WaitAsync(MetadataRequestTimeout, cancellationToken);
             }
             catch (TimeoutException e)

@@ -22,7 +22,11 @@ public sealed class SocketCommandInterface : IDisposable
     private readonly SocketAuthProvider _authProvider;
     private readonly SocketProgress _progress;
     private readonly CancellationTokenSource _cts = new();
-    private readonly OwnedOperationCoordinator _prefillOperation = new();
+    private readonly OwnedOperationCoordinator _prefillOperation;
+    private readonly PrefillProtocol _protocol = PrefillProtocol.FromEnvironment(30, AppConfig.MaxConcurrencyOverride);
+    private readonly RequestBudget _budget;
+    private readonly ItemClaims _claims = new();
+    private readonly Dictionary<string, PrefillRun> _runs = new(StringComparer.Ordinal);
     private CancellationTokenSource? _loginCts;
     private SteamPrefillApi? _api;
     private Task? _loginTask;
@@ -32,6 +36,7 @@ public sealed class SocketCommandInterface : IDisposable
     private Task _statusPublication = Task.CompletedTask;
     private bool _isLoggingIn;
     private bool _disposed;
+    private bool _restartRequired;
 
     // All generation changes and credential commits share the lifecycle gate.
     private long _loginGeneration;
@@ -46,6 +51,7 @@ public sealed class SocketCommandInterface : IDisposable
         "login",
         "logout",
         "status",
+        "get-operation",
         "shutdown",
         "cancel-prefill",
         "cancel-login",
@@ -56,6 +62,8 @@ public sealed class SocketCommandInterface : IDisposable
 
     public SocketCommandInterface(string socketPath)
     {
+        _prefillOperation = new OwnedOperationCoordinator(_protocol.MaxConcurrentRuns);
+        _budget = new RequestBudget(_protocol.MaxConcurrentRequests);
         _progress = new SocketProgress(enableDebugLogs: AppConfig.DebugLogs);
         _socketServer = new SocketServer(socketPath, _progress);
         _authProvider = new SocketAuthProvider(_socketServer, _progress);
@@ -68,6 +76,8 @@ public sealed class SocketCommandInterface : IDisposable
 
     public SocketCommandInterface(int tcpPort)
     {
+        _prefillOperation = new OwnedOperationCoordinator(_protocol.MaxConcurrentRuns);
+        _budget = new RequestBudget(_protocol.MaxConcurrentRequests);
         _progress = new SocketProgress(enableDebugLogs: AppConfig.DebugLogs);
         _socketServer = new SocketServer(tcpPort, _progress);
         _authProvider = new SocketAuthProvider(_socketServer, _progress);
@@ -132,6 +142,7 @@ public sealed class SocketCommandInterface : IDisposable
                 "get-auto-login-challenge" => HandleGetAutoLoginChallenge(request),
                 "provide-auto-login" => await HandleProvideAutoLoginAsync(request, cancellationToken),
                 "status" => HandleStatus(request),
+                "get-operation" => HandleOperation(request),
                 "get-owned-games" => await HandleGetOwnedGamesAsync(request, cancellationToken),
                 "get-selected-apps" => HandleGetSelectedApps(request),
                 "set-selected-apps" => HandleSetSelectedApps(request),
@@ -161,8 +172,9 @@ public sealed class SocketCommandInterface : IDisposable
             {
                 Id = request.Id,
                 Success = false,
-                Error = ex is SteamConnectionException { Failure: not null } ? ex.Message : "The prefill daemon could not complete the request. Try again.",
-                ErrorCode = (ex as SteamConnectionException)?.ErrorCode,
+                Error = _restartRequired ? "A Steam request has not drained. Restart the daemon before signing in again." :
+                    ex is SteamConnectionException { Failure: not null } ? ex.Message : "The prefill daemon could not complete the request. Try again.",
+                ErrorCode = _restartRequired ? "game-details-unavailable" : (ex as SteamConnectionException)?.ErrorCode,
                 RequiresLogin = (ex as SteamConnectionException)?.RequiresLogin == true,
                 CompletedAt = DateTime.UtcNow
             };
@@ -188,6 +200,12 @@ public sealed class SocketCommandInterface : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _cts.Token.ThrowIfCancellationRequested();
+        if (_prefillOperation.IsRunning) throw new InvalidOperationException("Active operations must drain before login.");
+        if (_restartRequired || _api?.RestartRequired == true || _api?.HasPendingRequests == true)
+        {
+            _restartRequired = true;
+            throw new InvalidOperationException("A Steam account request has not drained. Restart the daemon before signing in again.");
+        }
         var previous = _api;
         var previousLogin = _loginTask;
         var generation = ++_loginGeneration;
@@ -265,9 +283,10 @@ public sealed class SocketCommandInterface : IDisposable
             if (generation != _loginGeneration || !ReferenceEquals(_api, api)) return;
             _isLoggingIn = false;
             _run?.SelectTerminal(OwnedOperationStatus.Failed, new SteamConnectionException(SteamFailure.AuthLost));
+            foreach (var run in _runs.Values) run.Progress.TryChooseTerminal("failed", "auth-lost");
             _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login",
                 new SteamConnectionException(SteamFailure.AuthLost).Message);
-            if (_run != null) _ = _prefillOperation.CancelAndWaitAsync();
+            _ = _prefillOperation.CancelAllAndWaitAsync();
         }
     }
 
@@ -290,8 +309,9 @@ public sealed class SocketCommandInterface : IDisposable
             _loginCts = null;
             login = _loginTask;
             _run?.SelectTerminal(OwnedOperationStatus.Cancelled);
+            foreach (var run in _runs.Values) run.Progress.TryChooseTerminal("cancelled");
             publication = _run?.Publication.Task ?? Task.CompletedTask;
-            completion = _prefillOperation.CancelAndWaitAsync();
+            completion = _prefillOperation.CancelAllAndWaitAsync();
             if (erase) EraseAccountStore(_progress);
             _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", "Login required");
             _authProvider.CancelPendingRequest();
@@ -300,6 +320,7 @@ public sealed class SocketCommandInterface : IDisposable
         catch (ObjectDisposedException) { /* Login already completed. */ }
         await completion;
         await publication;
+        lock (_lifecycle) _restartRequired |= api?.HasPendingRequests == true || api?.RestartRequired == true;
         if (api != null) DisposeOrphanedApi(api);
         if (login != null) await login;
         await _statusPublication;
@@ -321,7 +342,7 @@ public sealed class SocketCommandInterface : IDisposable
     {
         return commandType.ToLowerInvariant() switch
         {
-            "cancel-login" or "cancel-prefill" or "provide-credential" or "status" or "shutdown"
+            "cancel-login" or "cancel-prefill" or "provide-credential" or "status" or "get-operation" or "shutdown"
                 => DaemonCommandLane.Control,
             "get-owned-games" or "get-selected-apps" or "get-cache-info" or
                 "get-selected-apps-status" or "check-cache-status"
@@ -332,10 +353,29 @@ public sealed class SocketCommandInterface : IDisposable
 
     private async Task<CommandResponse> HandleCancelPrefillAsync(CommandRequest request, CancellationToken cancellationToken)
     {
+        if (request.Parameters?.TryGetValue("operationId", out var operationId) == true)
+        {
+            lock (_lifecycle)
+            {
+                if (request.Parameters.GetValueOrDefault("daemonInstanceId") != _protocol.DaemonInstanceId)
+                    return new CommandResponse { Id = request.Id, Success = false, Error = "instance-changed", ErrorCode = "instance-changed" };
+                var operation = _prefillOperation.Cancel(operationId, _protocol.DaemonInstanceId);
+                return new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = operation != null,
+                    Data = operation,
+                    Error = operation == null ? "operation-not-found" : null,
+                    ErrorCode = operation == null ? "operation-not-found" : null
+                };
+            }
+        }
         Task publication;
         Task completion;
         lock (_lifecycle)
         {
+            if (_prefillOperation.GetActiveOperations().Count > 1)
+                return new CommandResponse { Id = request.Id, Success = false, Error = "ambiguous-operation", ErrorCode = "ambiguous-operation" };
             _run?.SelectTerminal(OwnedOperationStatus.Cancelled);
             publication = _run?.Publication.Task ?? Task.CompletedTask;
             completion = _prefillOperation.CancelAndWaitAsync(cancellationToken);
@@ -612,6 +652,7 @@ public sealed class SocketCommandInterface : IDisposable
     {
         lock (_lifecycle)
         {
+            PruneRuns();
             var ready = _api?.IsInitialized == true;
             return new CommandResponse
             {
@@ -621,8 +662,17 @@ public sealed class SocketCommandInterface : IDisposable
                 {
                     IsLoggedIn = ready,
                     IsInitialized = ready,
+                    RestartRequired = _restartRequired || _api?.RestartRequired == true,
                     AuthExpiryUtc = ready ? _api?.AuthExpiryUtc : null,
                     Username = ready ? _api?.Username : null
+                    ,
+                    ProtocolVersion = PrefillProtocol.Version,
+                    Features = PrefillProtocol.Features,
+                    DaemonInstanceId = _protocol.DaemonInstanceId,
+                    MaxConcurrentRuns = _protocol.MaxConcurrentRuns,
+                    MaxConcurrentRequests = _protocol.MaxConcurrentRequests,
+                    ActiveOperations = _prefillOperation.GetActiveOperations(),
+                    RecentOperations = _prefillOperation.GetRecentOperations()
                 },
                 CompletedAt = DateTime.UtcNow
             };
@@ -734,12 +784,14 @@ public sealed class SocketCommandInterface : IDisposable
 
     private Task<CommandResponse> HandlePrefillAsync(CommandRequest request, CancellationToken cancellationToken)
     {
+        if (request.Parameters?.GetValueOrDefault("protocolVersion") == "2")
+            return HandleRunAsync(request, cancellationToken);
         lock (_lifecycle)
         {
             cancellationToken.ThrowIfCancellationRequested();
             EnsureLoggedIn();
 
-            if (_run != null)
+            if (_run != null || _prefillOperation.IsRunning)
             {
                 return Task.FromResult(new CommandResponse
                 {
@@ -750,7 +802,7 @@ public sealed class SocketCommandInterface : IDisposable
                 });
             }
 
-            var options = new PrefillOptions();
+            var options = new PrefillOptions { MaxConcurrency = _protocol.MaxConcurrentRequests };
 
             if (request.Parameters != null)
             {
@@ -764,9 +816,8 @@ public sealed class SocketCommandInterface : IDisposable
                     options.PrefillTopGames = top;
                 if (bool.TryParse(request.Parameters.GetValueOrDefault("force"), out var force))
                     options.Force = force;
-                AppConfig.MaxConcurrencyOverride = null;
                 if (int.TryParse(request.Parameters.GetValueOrDefault("maxConcurrency"), out var maxConcurrency) && maxConcurrency > 0)
-                    AppConfig.MaxConcurrencyOverride = maxConcurrency;
+                    options.MaxConcurrency = Math.Min(maxConcurrency, _protocol.MaxConcurrentRequests);
 
                 // Parse operating systems
                 var osParam = request.Parameters.GetValueOrDefault("os");
@@ -834,6 +885,199 @@ public sealed class SocketCommandInterface : IDisposable
         }
     }
 
+    private CommandResponse HandleOperation(CommandRequest request)
+    {
+        lock (_lifecycle)
+        {
+            PruneRuns();
+            var parameters = request.Parameters;
+            if (parameters?.GetValueOrDefault("daemonInstanceId") != _protocol.DaemonInstanceId)
+                return new CommandResponse { Id = request.Id, Error = "instance-changed", ErrorCode = "instance-changed" };
+            var operationId = parameters.GetValueOrDefault("operationId");
+            if (string.IsNullOrWhiteSpace(operationId))
+                return new CommandResponse { Id = request.Id, Error = "operation-not-found", ErrorCode = "operation-not-found" };
+            var offset = parameters.TryGetValue("offset", out var offsetText) ? int.Parse(offsetText, System.Globalization.CultureInfo.InvariantCulture) : 0;
+            var limit = parameters.TryGetValue("limit", out var limitText) ? int.Parse(limitText, System.Globalization.CultureInfo.InvariantCulture) : 100;
+            var operation = _prefillOperation.GetOperation(operationId, offset, limit);
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = operation != null,
+                Data = operation == null ? null : new PrefillPage
+                {
+                    Operation = operation.Operation,
+                    Options = operation.Options,
+                    SelectionResolved = operation.SelectionResolved,
+                    TotalItems = operation.TotalItems,
+                    NextOffset = operation.NextOffset,
+                    Items = operation.Items.Select(item => new PrefillItem
+                    {
+                        AppId = item.AppId,
+                        Name = item.Name,
+                        State = item.State,
+                        Result = item.Result,
+                        Reason = item.Reason,
+                        Sequence = item.Sequence,
+                        BytesTransferred = item.BytesTransferred,
+                        TotalBytes = item.TotalBytes,
+                        Depots = _runs.GetValueOrDefault(operationId)?.Depots.GetValueOrDefault(item.AppId)
+                    }).ToArray()
+                },
+                Error = operation == null ? "operation-not-found" : null,
+                ErrorCode = operation == null ? "operation-not-found" : null
+            };
+        }
+    }
+
+    private Task<CommandResponse> HandleRunAsync(CommandRequest request, CancellationToken cancellationToken)
+    {
+        lock (_lifecycle)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var api = EnsureLoggedIn();
+            PruneRuns();
+            var parameters = request.Parameters!;
+            if (parameters.GetValueOrDefault("daemonInstanceId") != _protocol.DaemonInstanceId)
+                return Task.FromResult(new CommandResponse { Id = request.Id, Error = "instance-changed", ErrorCode = "instance-changed" });
+            if (!Guid.TryParse(request.Id, out _))
+                return Task.FromResult(new CommandResponse { Id = request.Id, Error = "A valid operation ID is required." });
+            var options = new PrefillOptions
+            {
+                DownloadAllOwnedGames = bool.TryParse(parameters.GetValueOrDefault("all"), out var all) && all,
+                PrefillRecentGames = bool.TryParse(parameters.GetValueOrDefault("recent"), out var recent) && recent,
+                PrefillRecentlyPurchased = bool.TryParse(parameters.GetValueOrDefault("recently_purchased"), out var purchased) && purchased,
+                PrefillTopGames = parameters.TryGetValue("top", out var top) ? int.Parse(top, System.Globalization.CultureInfo.InvariantCulture) : null,
+                Force = bool.TryParse(parameters.GetValueOrDefault("force"), out var force) && force,
+                MaxConcurrency = parameters.TryGetValue("maxConcurrency", out var maximum) ? int.Parse(maximum, System.Globalization.CultureInfo.InvariantCulture) : _protocol.MaxConcurrentRequests
+            };
+            var presets = new List<string>();
+            if (options.DownloadAllOwnedGames) presets.Add("all");
+            if (options.PrefillRecentGames) presets.Add("recent");
+            if (options.PrefillRecentlyPurchased) presets.Add("recently_purchased");
+            if (options.PrefillTopGames != null) presets.Add("top");
+            if (presets.Count > 1 || options.PrefillTopGames <= 0)
+                return Task.FromResult(new CommandResponse { Id = request.Id, Error = "Conflicting or invalid selection preset." });
+            List<string>? appIds = null;
+            if (parameters.TryGetValue("appIds", out var selection))
+            {
+                using var document = JsonDocument.Parse(selection);
+                appIds = document.RootElement.EnumerateArray().Select(element =>
+                    (element.ValueKind == JsonValueKind.Number ? element.GetUInt32() : uint.Parse(element.GetString()!, System.Globalization.CultureInfo.InvariantCulture))
+                    .ToString(System.Globalization.CultureInfo.InvariantCulture)).ToList();
+            }
+            if (parameters.TryGetValue("os", out var operatingSystems))
+                options.OperatingSystems = operatingSystems.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                    .Select(value => OperatingSystem.FromValue(value.ToLowerInvariant())).ToList();
+            var cachedDepots = parameters.TryGetValue("cachedDepots", out var cached)
+                ? JsonSerializer.Deserialize(cached, DaemonSerializationContext.Default.ListCachedDepotInput) ?? throw new ArgumentException("Invalid cached depots.")
+                : new List<CachedDepotInput>();
+            var captured = _protocol.Capture(new RunOptions
+            {
+                AppIds = appIds,
+                Selection = presets.FirstOrDefault() ?? "selected",
+                Force = options.Force,
+                OperatingSystems = options.OperatingSystems.Select(os => os.Value).ToArray(),
+                MaxConcurrency = options.MaxConcurrency!.Value,
+                TopCount = options.PrefillTopGames,
+                CachedDepots = cachedDepots.Select(depot => $"{depot.DepotId}:{depot.ManifestId}").Order(StringComparer.Ordinal).ToArray()
+            });
+            var progress = new RunProgress(request.Id, _protocol.DaemonInstanceId, captured, PublishRunAsync);
+            var run = new PrefillRun(captured, progress, _budget, _claims);
+            var sink = new SocketProgress(operationId: request.Id, run: run, sync: _lifecycle, enableDebugLogs: AppConfig.DebugLogs);
+            var admission = _prefillOperation.StartAsync(request.Id, PrefillProtocol.Fingerprint(captured), progress, async token =>
+            {
+                PrefillRun.Current.Value = run;
+                try
+                {
+                    var result = await api.PrefillAsync(options, token, sink);
+                    if (!result.Success)
+                    {
+                        progress.TryChooseTerminal("failed", result.ErrorCode);
+                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(result.Exception ?? new InvalidOperationException(result.ErrorMessage)).Throw();
+                    }
+                    token.ThrowIfCancellationRequested();
+                    progress.TryChooseTerminal("completed");
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    progress.TryChooseTerminal("cancelled");
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    progress.TryChooseTerminal("failed", (exception as SteamConnectionException)?.ErrorCode);
+                    throw;
+                }
+                finally
+                {
+                    await run.CompleteAsync();
+                    PrefillRun.Current.Value = null;
+                }
+            }, _cts.Token).GetAwaiter().GetResult();
+            if (admission.Accepted && !admission.Replayed) _runs.Add(request.Id, run);
+            return Task.FromResult(new CommandResponse
+            {
+                Id = request.Id,
+                Success = admission.Accepted,
+                Error = admission.Error,
+                ErrorCode = admission.Error,
+                Data = admission.Accepted ? new PrefillStart
+                {
+                    RunId = request.Id,
+                    DaemonInstanceId = _protocol.DaemonInstanceId,
+                    State = admission.Replayed ? admission.Operation!.State : "started",
+                    Operation = admission.Operation
+                } : null
+            });
+        }
+    }
+
+    private Task PublishRunAsync(RunSnapshot snapshot, CancellationToken cancellationToken)
+    {
+        var update = ToProgress(snapshot);
+        lock (_lifecycle)
+            update.Depots = snapshot.CurrentItem == null ? null : _runs.GetValueOrDefault(snapshot.OperationId)?.Depots.GetValueOrDefault(snapshot.CurrentItem.AppId);
+        return _socketServer.BroadcastProgressAsync(new ProgressEvent(update), cancellationToken);
+    }
+
+    private void PruneRuns()
+    {
+        var retained = _prefillOperation.GetActiveOperations().Concat(_prefillOperation.GetRecentOperations())
+            .Select(run => run.OperationId).ToHashSet(StringComparer.Ordinal);
+        foreach (var id in _runs.Keys.Where(id => !retained.Contains(id)).ToArray()) _runs.Remove(id);
+    }
+
+    internal static PrefillProgressUpdate ToProgress(RunSnapshot snapshot)
+    {
+        var item = snapshot.CurrentItem;
+        return new PrefillProgressUpdate
+        {
+            OperationId = snapshot.OperationId,
+            DaemonInstanceId = snapshot.DaemonInstanceId,
+            Sequence = snapshot.Sequence,
+            StartedAt = snapshot.StartedAt,
+            UpdatedAt = snapshot.UpdatedAt.UtcDateTime,
+            State = snapshot.State is "completed" or "failed" or "cancelled" or "cancelling" ? snapshot.State :
+                item?.Result == "already_cached" ? "already_cached" : item?.Result != null ? "app_completed" : snapshot.State,
+            CurrentAppId = item == null ? 0 : uint.Parse(item.AppId, System.Globalization.CultureInfo.InvariantCulture),
+            CurrentAppName = item?.Name,
+            Result = item?.Result,
+            Reason = snapshot.Reason ?? item?.Reason,
+            BytesDownloaded = item?.BytesTransferred ?? 0,
+            TotalBytes = item?.TotalBytes ?? 0,
+            TotalBytesTransferred = snapshot.BytesTransferred,
+            TotalApps = snapshot.TotalApps,
+            UpdatedApps = snapshot.CompletedApps,
+            AlreadyUpToDate = snapshot.CachedApps,
+            FailedApps = snapshot.FailedApps,
+            SkippedApps = snapshot.SkippedApps,
+            CancelledApps = snapshot.CancelledApps,
+            TotalTime = snapshot.UpdatedAt - snapshot.StartedAt,
+            ErrorCode = snapshot.State == "failed" ? snapshot.Reason : null,
+            RequiresLogin = snapshot.Reason == "auth-lost" ? true : null
+        };
+    }
+
     private async Task CompletePrefillAsync(SocketProgress progress, Task<OwnedOperationResult> completion)
     {
         try
@@ -888,20 +1132,24 @@ public sealed class SocketCommandInterface : IDisposable
 
     private CommandResponse HandleClearCache(CommandRequest request)
     {
-        var result = SteamPrefillApi.ClearCache();
-        if (result.Success && _api != null && _isLoggedIn)
+        lock (_lifecycle)
         {
-            _api.ClearAppInfoCache();
-        }
+            if (_prefillOperation.IsRunning) return new CommandResponse { Id = request.Id, Success = false, Error = "Active operations must drain before clearing cache." };
+            var result = SteamPrefillApi.ClearCache();
+            if (result.Success && _api != null && _isLoggedIn)
+            {
+                _api.ClearAppInfoCache();
+            }
 
-        return new CommandResponse
-        {
-            Id = request.Id,
-            Success = result.Success,
-            Data = result,
-            Message = result.Message,
-            CompletedAt = DateTime.UtcNow
-        };
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = result.Success,
+                Data = result,
+                Message = result.Message,
+                CompletedAt = DateTime.UtcNow
+            };
+        }
     }
 
     private CommandResponse HandleGetCacheInfo(CommandRequest request)
@@ -1081,6 +1329,7 @@ public sealed class SocketCommandInterface : IDisposable
         EndSessionAsync(false).GetAwaiter().GetResult();
         _loginCts?.Dispose();
         _prefillOperation.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        _budget.Dispose();
         _cts.Dispose();
         _api?.Dispose();
         _authProvider.Dispose();
@@ -1099,6 +1348,7 @@ public sealed class SocketCommandInterface : IDisposable
         private readonly object _sync;
         private readonly string? _operationId;
         private readonly Func<bool>? _isCurrent;
+        private readonly PrefillRun? _run;
         private Task _outbound = Task.CompletedTask;
         private PrefillSummary? _summary;
         internal string? OperationId => _operationId;
@@ -1113,12 +1363,13 @@ public sealed class SocketCommandInterface : IDisposable
             Action<PrefillProgressUpdate>? progressObserver = null,
             bool enableDebugLogs = false,
             Action<string>? logWriter = null,
-            string? operationId = null, object? sync = null, Func<bool>? isCurrent = null)
+            string? operationId = null, object? sync = null, Func<bool>? isCurrent = null, PrefillRun? run = null)
         {
             _progressObserver = progressObserver;
             _sync = sync ?? new object();
             _operationId = operationId;
             _isCurrent = isCurrent;
+            _run = run;
             _logSink = new DaemonLogSink(
                 logWriter ?? Console.WriteLine,
                 enableDebugLogs ? DaemonLogLevel.Debug : DaemonLogLevel.Info);
@@ -1153,6 +1404,23 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnAppStarted(AppDownloadInfo app)
         {
+            if (_run != null)
+            {
+                lock (_sync)
+                {
+                    if (_run.Progress.Terminal != null) return;
+                    if (app.Depots != null) _run.Depots[app.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture)] = app.Depots
+                        .Select(depot => new DepotManifestUpdateInfo { DepotId = depot.DepotId, ManifestId = depot.ManifestId, TotalBytes = depot.TotalBytes }).ToList();
+                    _run.Progress.UpdateItem(new RunItemSnapshot
+                    {
+                        AppId = app.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        Name = app.Name,
+                        State = "downloading",
+                        TotalBytes = app.TotalBytes
+                    });
+                    return;
+                }
+            }
             lock (_sync)
             {
                 if (Terminal != null || _isCurrent?.Invoke() == false) return;
@@ -1172,6 +1440,21 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnDownloadProgress(DownloadProgressInfo progress)
         {
+            if (_run != null)
+            {
+                lock (_sync)
+                {
+                    _run.Progress.UpdateItem(new RunItemSnapshot
+                    {
+                        AppId = progress.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        Name = progress.AppName,
+                        State = "downloading",
+                        TotalBytes = progress.TotalBytes,
+                        BytesTransferred = progress.BytesDownloaded
+                    });
+                    return;
+                }
+            }
             lock (_sync)
             {
                 if (Terminal != null || _isCurrent?.Invoke() == false) return;
@@ -1217,6 +1500,34 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnAppCompleted(AppDownloadInfo app, AppDownloadResult result)
         {
+            if (_run != null)
+            {
+                lock (_sync)
+                {
+                    if (_run.Progress.Terminal != null) return;
+                    var appId = app.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    if (app.Depots != null) _run.Depots[appId] = app.Depots
+                        .Select(depot => new DepotManifestUpdateInfo { DepotId = depot.DepotId, ManifestId = depot.ManifestId, TotalBytes = depot.TotalBytes }).ToList();
+                    var outcome = result switch
+                    {
+                        AppDownloadResult.Success => "success",
+                        AppDownloadResult.AlreadyUpToDate => "already_cached",
+                        AppDownloadResult.Failed => "failed",
+                        _ => "skipped"
+                    };
+                    _run.Progress.UpdateItem(new RunItemSnapshot
+                    {
+                        AppId = appId,
+                        Name = app.Name,
+                        State = "completed",
+                        Result = outcome,
+                        Reason = app.Reason,
+                        TotalBytes = app.TotalBytes,
+                        BytesTransferred = _run.Bytes(appId)
+                    });
+                    return;
+                }
+            }
             lock (_sync)
             {
                 if (Terminal != null || _isCurrent?.Invoke() == false) return;
@@ -1247,6 +1558,7 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnPrefillCompleted(PrefillSummary summary)
         {
+            if (_run != null) return;
             lock (_sync)
             {
                 if (Terminal != null || _isCurrent?.Invoke() == false || (_operationId == null && _progressObserver == null)) return;
@@ -1256,6 +1568,12 @@ public sealed class SocketCommandInterface : IDisposable
 
         public void OnError(string message, Exception? exception = null)
         {
+            if (_run != null)
+            {
+                _run.Progress.TryChooseTerminal("failed", (exception as SteamConnectionException)?.ErrorCode);
+                if (exception != null) FileLogger.LogException(message, exception);
+                return;
+            }
             if (exception != null) FileLogger.LogException(message, exception);
             else OnLog(LogLevel.Error, message);
             lock (_sync)
@@ -1323,18 +1641,6 @@ public sealed class SocketCommandInterface : IDisposable
             if (SocketServer != null)
                 await SocketServer.BroadcastProgressAsync(new ProgressEvent(update));
         }
-    }
-
-    /// <summary>
-    /// Auto-login challenge data storage
-    /// </summary>
-    private sealed class AutoLoginChallengeData
-    {
-        public required string ChallengeId { get; init; }
-        public required System.Security.Cryptography.ECParameters ServerPrivateKey { get; init; }
-        public required byte[] ServerPublicKey { get; init; }
-        public required DateTime ExpiresAt { get; init; }
-        public required long Generation { get; init; }
     }
 
 }

@@ -2,7 +2,7 @@
 {
     public sealed class DownloadArguments
     {
-        private int _maxConcurrentRequests = 30;
+        private int _maxConcurrentRequests = AppConfig.MaxConcurrencyOverride ?? 30;
 
         /// <summary>
         /// When set to true, always run the download, regardless of if the app has been previously downloaded.
@@ -23,15 +23,7 @@
         /// </summary>
         public int MaxConcurrentRequests
         {
-            get
-            {
-                //TODO I don't like how this is using a static variable like this, because nothing else in this class is like this. Consider removing this later once its no longer used for debugging.
-                if (AppConfig.MaxConcurrencyOverride != null)
-                {
-                    return AppConfig.MaxConcurrencyOverride.Value;
-                }
-                return _maxConcurrentRequests;
-            }
+            get => _maxConcurrentRequests;
             set => _maxConcurrentRequests = value;
         }
 

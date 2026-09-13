@@ -12,6 +12,10 @@ namespace SteamPrefill.Handlers.Steam
         private readonly int _minimumServerCount = 5;
         private readonly int _maxRetries = 3;
         private readonly HashSet<string> _discardedHosts = new HashSet<string>();
+        private readonly HashSet<Server> _borrowed = new();
+        private readonly object _sync = new();
+        private Task _refill = Task.CompletedTask;
+        private Task<Server[]> _serverRequest;
 
         public ConcurrentStack<Server> AvailableServerEndpoints = new ConcurrentStack<Server>();
 
@@ -19,7 +23,7 @@ namespace SteamPrefill.Handlers.Steam
         {
             _ansiConsole = ansiConsole;
             _requestServersAsync = async () =>
-                (await steamSession.SteamContent.GetServersForSteamPipe()).ToArray();
+                (await steamSession.RequestAsync(() => steamSession.SteamContent.GetServersForSteamPipe(), steamSession.AuthLostToken)).ToArray();
         }
 
         /// <summary>
@@ -47,6 +51,20 @@ namespace SteamPrefill.Handlers.Steam
         /// <exception cref="CdnExhaustionException">If no servers are available for use, this exception will be thrown.</exception>
         public async Task PopulateAvailableServersAsync(
             CancellationToken cancellationToken = default)
+        {
+            Task refill;
+            lock (_sync)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_refill.IsCompleted)
+                    _refill = Task.Run(() => PopulateAsync(CancellationToken.None), CancellationToken.None);
+                refill = _refill;
+            }
+            SteamPrefill.Api.PrefillRun.Current.Value?.Track(refill);
+            await refill.WaitAsync(cancellationToken);
+        }
+
+        private async Task PopulateAsync(CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (AvailableServerEndpoints.Count >= _minimumServerCount)
@@ -84,7 +102,7 @@ namespace SteamPrefill.Handlers.Steam
                 throw new CdnExhaustionException("Unable to get available CDN servers from Steam!");
             }
 
-            AvailableServerEndpoints = AvailableServerEndpoints
+            lock (_sync) AvailableServerEndpoints = AvailableServerEndpoints
                                        // "CDN" type servers always have a load of 0, seem to be the fastest
                                        .OrderByDescending(e => e.Load)
                                        .ToConcurrentStack();
@@ -93,7 +111,13 @@ namespace SteamPrefill.Handlers.Steam
 
         private async Task RequestSteamCdnServersAsync(CancellationToken cancellationToken)
         {
-            var requestTask = Task.Run(_requestServersAsync, CancellationToken.None);
+            Task<Server[]> requestTask;
+            lock (_sync)
+            {
+                if (_serverRequest == null || _serverRequest.IsCompleted)
+                    _serverRequest = Task.Run(_requestServersAsync, CancellationToken.None);
+                requestTask = _serverRequest;
+            }
             try
             {
                 // GetServersForSteamPipe() sometimes hangs and never times out.  Wrapping the call in another task, so that we can timeout the entire method.
@@ -108,19 +132,22 @@ namespace SteamPrefill.Handlers.Steam
                                         .ToList();
 
                 // Steam keeps listing a server after it has been dropped, so the refill has to leave it out itself.
-                var untriedServers = cacheableServers.Where(e => !_discardedHosts.Contains(e.Host)).ToList();
-                if (untriedServers.Count == 0)
+                lock (_sync)
                 {
-                    // Every server Steam offers has already failed once.  Trying them again beats a pool that
-                    // stays empty until the process restarts.
-                    _discardedHosts.Clear();
-                    untriedServers = cacheableServers;
-                }
+                    var untriedServers = cacheableServers.Where(e => !_discardedHosts.Contains(e.Host)).ToList();
+                    if (untriedServers.Count == 0)
+                    {
+                        // Every server Steam offers has already failed once.  Trying them again beats a pool that
+                        // stays empty until the process restarts.
+                        _discardedHosts.Clear();
+                        untriedServers = cacheableServers;
+                    }
 
-                AvailableServerEndpoints.PushRange(untriedServers.ToArray());
-                AvailableServerEndpoints = AvailableServerEndpoints
-                                            .DistinctBy(e => e.Host)
-                                            .ToConcurrentStack();
+                    AvailableServerEndpoints.PushRange(untriedServers.Where(server => !_borrowed.Any(active => active.Host == server.Host)).ToArray());
+                    AvailableServerEndpoints = AvailableServerEndpoints
+                                                .DistinctBy(e => e.Host)
+                                                .ToConcurrentStack();
+                }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -151,14 +178,17 @@ namespace SteamPrefill.Handlers.Steam
         /// <exception cref="CdnExhaustionException">If no servers are available for use, this exception will be thrown.</exception>
         public Server TakeConnection()
         {
-            if (AvailableServerEndpoints.Empty())
+            lock (_sync)
             {
-                throw new CdnExhaustionException("Available Steam CDN servers exhausted!  No more servers available to retry!  Try again in a few minutes");
-            }
+                if (!AvailableServerEndpoints.TryPop(out var server))
+                {
+                    throw new CdnExhaustionException("Available Steam CDN servers exhausted!  No more servers available to retry!  Try again in a few minutes");
+                }
 
-            AvailableServerEndpoints.TryPop(out var server);
-            _ansiConsole.LogMarkupVerbose($"Using CDN {Cyan(server.Host)}");
-            return server;
+                _borrowed.Add(server);
+                _ansiConsole.LogMarkupVerbose($"Using CDN {Cyan(server.Host)}");
+                return server;
+            }
         }
 
         /// <summary>
@@ -168,7 +198,12 @@ namespace SteamPrefill.Handlers.Steam
         /// <param name="server">The server that will be re-added to the pool.</param>
         public void ReturnConnection(Server server)
         {
-            AvailableServerEndpoints.Push(server);
+            lock (_sync)
+            {
+                _borrowed.Remove(server);
+                if (!_discardedHosts.Contains(server.Host) && !AvailableServerEndpoints.Contains(server))
+                    AvailableServerEndpoints.Push(server);
+            }
         }
 
         /// <summary>
@@ -181,7 +216,11 @@ namespace SteamPrefill.Handlers.Steam
         public async Task DiscardConnectionAsync(Server server, CancellationToken cancellationToken = default)
         {
             _ansiConsole.LogMarkupVerbose($"Dropping CDN {Cyan(server.Host)}, it is not answering");
-            _discardedHosts.Add(server.Host);
+            lock (_sync)
+            {
+                _borrowed.Remove(server);
+                _discardedHosts.Add(server.Host);
+            }
             await PopulateAvailableServersAsync(cancellationToken);
         }
 

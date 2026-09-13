@@ -51,6 +51,8 @@ public sealed class SteamPrefillApi : IDisposable
     }
     internal string? Username => _steamManager?.Username;
     internal DateTime? AuthExpiryUtc => _steamManager?.AuthExpiryUtc;
+    internal bool HasPendingRequests => _steamManager?.HasPendingRequests == true;
+    internal bool RestartRequired => _steamManager?.RestartRequired == true;
 
     /// <summary>
     /// Initializes the API and logs into Steam.
@@ -316,19 +318,23 @@ public sealed class SteamPrefillApi : IDisposable
     public async Task<PrefillResult> PrefillAsync(
         PrefillOptions? options = null,
         CancellationToken cancellationToken = default,
-        IPrefillProgress? progress = null)
+        IPrefillProgress? progress = null,
+        IReadOnlyList<uint>? appIds = null)
     {
         ThrowIfNotInitialized();
         ThrowIfDisposed();
 
         options ??= new PrefillOptions();
 
-        // Update download options before starting
-        _steamManager!.UpdateDownloadOptions(
-            force: options.Force,
-            operatingSystems: options.OperatingSystems);
+        var output = progress ?? _progress;
+        var arguments = PrefillRun.Current.Value?.Arguments ?? new DownloadArguments
+        {
+            Force = options.Force,
+            OperatingSystems = options.OperatingSystems.ToList(),
+            MaxConcurrentRequests = options.MaxConcurrency ?? AppConfig.MaxConcurrencyOverride ?? 30
+        };
 
-        _progress.OnOperationStarted("Prefill operation");
+        output.OnOperationStarted("Prefill operation");
         var timer = System.Diagnostics.Stopwatch.StartNew();
 
         try
@@ -339,9 +345,11 @@ public sealed class SteamPrefillApi : IDisposable
                 prefillPopularGames: options.PrefillTopGames,
                 prefillRecentlyPurchasedGames: options.PrefillRecentlyPurchased,
                 cancellationToken: cancellationToken,
-                progress: progress);
+                progress: output,
+                appIds: appIds ?? PrefillRun.Current.Value?.Options.AppIds?.Select(uint.Parse).ToArray(),
+                arguments: arguments);
 
-            _progress.OnOperationCompleted("Prefill operation", timer.Elapsed);
+            output.OnOperationCompleted("Prefill operation", timer.Elapsed);
 
             // Return result summary
             return new PrefillResult
@@ -352,14 +360,14 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _progress.OnLog(LogLevel.Info, "Prefill operation cancelled");
+            output.OnLog(LogLevel.Info, "Prefill operation cancelled");
             throw;
         }
         catch (Exception ex)
         {
             // Only the message is broadcast to the caller; the exception argument goes to the local log.
             // Without the reason in the message the caller is told the prefill failed and nothing more. [29]
-            _progress.OnError("Prefill operation failed", ex);
+            output.OnError("Prefill operation failed", ex);
             return new PrefillResult
             {
                 Success = false,
@@ -383,10 +391,7 @@ public sealed class SteamPrefillApi : IDisposable
         ThrowIfNotInitialized();
         ThrowIfDisposed();
 
-        // Set the apps and run prefill
-        SetSelectedApps(appIds);
-
-        return await PrefillAsync(new PrefillOptions { Force = force }, cancellationToken);
+        return await PrefillAsync(new PrefillOptions { Force = force }, cancellationToken, appIds: appIds.ToArray());
     }
 
     /// <summary>
@@ -546,161 +551,4 @@ public sealed class SteamPrefillApi : IDisposable
         if (_isDisposed)
             throw new ObjectDisposedException(nameof(SteamPrefillApi));
     }
-}
-
-/// <summary>
-/// Options for prefill operations
-/// </summary>
-public class PrefillOptions
-{
-    /// <summary>
-    /// Download all owned games
-    /// </summary>
-    public bool DownloadAllOwnedGames { get; set; }
-
-    /// <summary>
-    /// Include games played in the last 2 weeks
-    /// </summary>
-    public bool PrefillRecentGames { get; set; }
-
-    /// <summary>
-    /// Include recently purchased games (last 2 weeks)
-    /// </summary>
-    public bool PrefillRecentlyPurchased { get; set; }
-
-    /// <summary>
-    /// Number of top games by player count to prefill (null = disabled)
-    /// </summary>
-    public int? PrefillTopGames { get; set; }
-
-    /// <summary>
-    /// Force re-download even if already up to date
-    /// </summary>
-    public bool Force { get; set; }
-
-    /// <summary>
-    /// Target operating systems for downloads. Defaults to the current OS.
-    /// </summary>
-    public List<OperatingSystem> OperatingSystems { get; set; } = new() { GetCurrentOperatingSystem() };
-
-    public static OperatingSystem GetCurrentOperatingSystem()
-    {
-        if (System.OperatingSystem.IsLinux())
-            return OperatingSystem.Linux;
-        if (System.OperatingSystem.IsMacOS())
-            return OperatingSystem.MacOS;
-        return OperatingSystem.Windows;
-    }
-}
-
-/// <summary>
-/// Result of a prefill operation
-/// </summary>
-public class PrefillResult
-{
-    public string? ErrorCode { get; init; }
-    public bool? RequiresLogin { get; init; }
-    [System.Text.Json.Serialization.JsonIgnore]
-    internal Exception? Exception { get; init; }
-    public bool Success { get; init; }
-    public string? ErrorMessage { get; init; }
-    public TimeSpan TotalTime { get; init; }
-}
-
-
-/// <summary>
-/// Result of a cache clear operation
-/// </summary>
-public class ClearCacheResult
-{
-    public bool Success { get; init; }
-    public int FileCount { get; init; }
-    public long BytesCleared { get; init; }
-    public string? Message { get; init; }
-}
-
-
-/// <summary>
-/// Status information for a single app
-/// </summary>
-public class AppStatus
-{
-    public uint AppId { get; init; }
-    public string Name { get; init; } = "";
-    public long DownloadSize { get; init; }
-    public bool IsUpToDate { get; init; }
-    /// <summary>
-    /// If true, this game has no depots for the selected operating systems
-    /// </summary>
-    public bool IsUnsupportedOs { get; init; }
-    /// <summary>
-    /// Human-readable reason why the game is unavailable (e.g., "Not available for Linux")
-    /// </summary>
-    public string? UnavailableReason { get; init; }
-}
-
-/// <summary>
-/// Status information for all selected apps
-/// </summary>
-public class SelectedAppsStatus
-{
-    public List<AppStatus> Apps { get; init; } = new();
-    public long TotalDownloadSize { get; init; }
-    public string? Message { get; init; }
-}
-
-
-/// <summary>
-/// Input for cached depot manifest info from lancache-manager.
-/// Uses camelCase JSON from lancache-manager with manifestId as string for large numbers.
-/// </summary>
-public class CachedDepotInput
-{
-    public uint AppId { get; init; }
-    public uint DepotId { get; init; }
-
-    [System.Text.Json.Serialization.JsonNumberHandling(System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString)]
-    public ulong ManifestId { get; init; }
-}
-
-/// <summary>
-/// Result of cache status check for all apps.
-/// </summary>
-public class CacheStatusResult
-{
-    public List<AppCacheStatus> Apps { get; init; } = new();
-    public string? Message { get; init; }
-}
-
-/// <summary>
-/// Cache status for a single app.
-/// </summary>
-public class AppCacheStatus
-{
-    public uint AppId { get; init; }
-    public string Name { get; init; } = "";
-    public bool IsUpToDate { get; init; }
-    public long DownloadSize { get; init; }
-    public List<OutdatedDepot> OutdatedDepots { get; init; } = new();
-}
-
-/// <summary>
-/// Details about an outdated depot that needs updating.
-/// </summary>
-public class OutdatedDepot
-{
-    public uint DepotId { get; init; }
-    public ulong CachedManifest { get; init; }
-    public ulong CurrentManifest { get; init; }
-}
-
-/// <summary>
-/// Represents an owned game
-/// </summary>
-public class OwnedGame
-{
-    public uint AppId { get; init; }
-    public string Name { get; init; } = string.Empty;
-    public int MinutesPlayedLast2Weeks { get; init; }
-    public DateOnly? ReleaseDate { get; init; }
 }

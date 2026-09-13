@@ -33,19 +33,24 @@ namespace SteamPrefill.Models
             {
                 return null;
             }
-            using var fs = File.Open(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var fs = File.Open(filename, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
             return Serializer.Deserialize<Manifest>(fs);
         }
 
-        public void SaveToFile(string filename)
+        public void SaveToFile(string filename, Action<string, string> replace = null)
         {
-            using var ms = new MemoryStream();
-            Serializer.Serialize(ms, this);
-
-            ms.Seek(0, SeekOrigin.Begin);
-
-            using var fs = File.Open(filename, FileMode.Create);
-            ms.CopyTo(fs);
+            var temporary = filename + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                {
+                    Serializer.Serialize(stream, this);
+                    stream.Flush(true);
+                }
+                if (replace == null) File.Move(temporary, filename, true);
+                else replace(temporary, filename);
+            }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
         }
     }
 

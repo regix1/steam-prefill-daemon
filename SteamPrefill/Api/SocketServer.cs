@@ -24,11 +24,6 @@ namespace SteamPrefill.Api;
 /// - Credential encryption: ECDH + AES-GCM
 /// - Challenge expiration: 5 minutes
 /// </summary>
-public enum SocketServerMode
-{
-    UnixSocket,
-    Tcp
-}
 
 public sealed class SocketServer : IAsyncDisposable
 {
@@ -439,6 +434,9 @@ public sealed class SocketServer : IAsyncDisposable
 
     private async Task SendEventToClientInternalAsync<T>(ConnectedClient client, T eventData, System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken)
     {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, client.CancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(4));
+        cancellationToken = timeout.Token;
         try
         {
             await client.SendLock.WaitAsync(cancellationToken);
@@ -459,6 +457,7 @@ public sealed class SocketServer : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            client.Cancel();
             _progress.OnLog(LogLevel.Warning, $"Failed to send event to {client.Id}: {ex.Message}");
         }
     }
@@ -678,56 +677,4 @@ public sealed class SocketServer : IAsyncDisposable
             Socket.Dispose();
         }
     }
-}
-
-/// <summary>
-/// Event message sent from server to client (unsolicited).
-/// </summary>
-public class SocketEvent<T>
-{
-    public string Type { get; init; } = string.Empty;
-    public T? Data { get; init; }
-    public DateTime Timestamp { get; init; } = DateTime.UtcNow;
-}
-
-/// <summary>
-/// Credential challenge event sent when login requires credentials.
-/// </summary>
-public class CredentialChallengeEvent : SocketEvent<CredentialChallenge>
-{
-    public CredentialChallengeEvent(CredentialChallenge challenge)
-    {
-        Type = "credential-challenge";
-        Data = challenge;
-    }
-}
-
-/// <summary>
-/// Progress event sent during prefill operations.
-/// </summary>
-public class ProgressEvent : SocketEvent<PrefillProgressUpdate>
-{
-    public ProgressEvent(PrefillProgressUpdate progress)
-    {
-        Type = "progress";
-        Data = progress;
-    }
-}
-
-/// <summary>
-/// Auth state change event.
-/// </summary>
-public class AuthStateEvent : SocketEvent<AuthStateData>
-{
-    public AuthStateEvent(string state, string? message = null)
-    {
-        Type = "auth-state";
-        Data = new AuthStateData { State = state, Message = message };
-    }
-}
-
-public class AuthStateData
-{
-    public string State { get; init; } = string.Empty;
-    public string? Message { get; init; }
 }

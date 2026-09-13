@@ -100,6 +100,22 @@
             }
         }
 
+        internal DepotInfo(DepotInfo source)
+        {
+            DepotId = source.DepotId;
+            Name = source.Name;
+            ManifestId = source.ManifestId;
+            HasExplicitlyEmptyPublicManifest = source.HasExplicitlyEmptyPublicManifest;
+            SourceAppId = source.SourceAppId;
+            DepotFromApp = source.DepotFromApp;
+            DlcAppId = source.DlcAppId;
+            ParentAppId = source.ParentAppId;
+            SupportedOperatingSystems = source.SupportedOperatingSystems.ToList();
+            Architecture = source.Architecture;
+            Languages = source.Languages.ToList();
+            LowViolence = source.LowViolence;
+        }
+
         /// <summary>
         /// Attaches a DLC depot to the game being processed without changing its Steam manifest context.
         /// The DLC source AppID remains both the manifest request context and entitlement check.

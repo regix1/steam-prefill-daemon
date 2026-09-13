@@ -66,6 +66,11 @@ namespace SteamPrefill.Handlers.Steam
         private readonly CancellationTokenSource _pumpCts = new();
         private readonly Task _pump;
         private readonly object _sessionLock = new();
+        private readonly ConcurrentQueue<Action> _requests = new();
+        private Task _account = Task.CompletedTask;
+        private readonly TimeSpan _requestTimeout;
+        private readonly TaskCompletionSource _requestsUnavailable = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal Task RequestsUnavailable => _requestsUnavailable.Task;
         private TaskCompletionSource<bool> _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private TaskCompletionSource<SteamUser.LoggedOnCallback> _loggedOn = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource<bool> _licenses = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -74,6 +79,7 @@ namespace SteamPrefill.Handlers.Steam
         private bool _isAuthenticated;
         private bool _logonRequested;
         private bool _disposed;
+        internal bool HasPendingRequests { get { lock (_sessionLock) return !_account.IsCompleted; } }
         public bool IsAuthenticated { get { lock (_sessionLock) return _isAuthenticated; } }
         public CancellationToken AuthLostToken => _authLostToken;
         internal string Username => _userAccountStore.CurrentUsername;
@@ -105,8 +111,9 @@ namespace SteamPrefill.Handlers.Steam
             if (!_disposed && (notify || _logonRequested)) _authLost.Cancel();
         }
 
-        public Steam3Session(IAnsiConsole? ansiConsole, ISteamAuthProvider? authProvider = null, Action<Action>? commitCredentials = null)
+        public Steam3Session(IAnsiConsole? ansiConsole, ISteamAuthProvider? authProvider = null, Action<Action>? commitCredentials = null, TimeSpan? requestTimeout = null)
         {
+            _requestTimeout = requestTimeout ?? TimeSpan.FromSeconds(45);
             _authLostToken = _authLost.Token;
             _ansiConsole = ansiConsole ?? AnsiConsole.Console;
             _authProvider = authProvider;
@@ -169,11 +176,14 @@ namespace SteamPrefill.Handlers.Steam
 
             _userAccountStore.AuthProvider = authProvider; // Set auth provider for API/daemon mode
             _userAccountStore.CommitCredentials = commitCredentials;
-            LicenseManager = new LicenseManager(SteamAppsApi);
+            LicenseManager = new LicenseManager(SteamAppsApi, this);
             _pump = Task.Factory.StartNew(() =>
             {
                 while (!_pumpCts.IsCancellationRequested)
+                {
+                    while (_requests.TryDequeue(out var request)) request();
                     _callbackManager.RunWaitAllCallbacks(TimeSpan.FromMilliseconds(50));
+                }
             }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
             // Setting up optional SteamKit2 debug output.  Not enabled by default because it writes out way too much output that isn't useful outside of debugging.
@@ -181,6 +191,58 @@ namespace SteamPrefill.Handlers.Steam
             {
                 DebugLog.Enabled = true;
                 DebugLog.AddListener(new SteamKitDebugListener(_ansiConsole));
+            }
+        }
+
+        internal Task<T> RequestAsync<T>(Func<Task<T>> request, CancellationToken cancellationToken = default)
+        {
+            lock (_sessionLock)
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (_requestsUnavailable.Task.IsCompleted) throw new SteamConnectionException(SteamFailure.GameDetailsUnavailable);
+                var previous = _account;
+                var result = RunRequestAsync(previous, request, cancellationToken);
+                PrefillRun.Current.Value?.Track(result);
+                _account = Task.WhenAll(previous, result).ContinueWith(completed => { _ = completed.Exception; },
+                    CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                return result;
+            }
+        }
+
+        private async Task<T> RunRequestAsync<T>(Task previous, Func<Task<T>> request, CancellationToken cancellationToken)
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _pumpCts.Token);
+            await previous.WaitAsync(linked.Token);
+            linked.Token.ThrowIfCancellationRequested();
+            var started = new TaskCompletionSource<Task<T>>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var timeout = new CancellationTokenSource();
+            var dispatched = 0;
+            using var registration = linked.Token.Register(() =>
+            {
+                if (Interlocked.CompareExchange(ref dispatched, 1, 0) == 0) started.TrySetCanceled(linked.Token);
+            });
+            _requests.Enqueue(() =>
+            {
+                if (Interlocked.CompareExchange(ref dispatched, 1, 0) != 0) return;
+                try
+                {
+                    linked.Token.ThrowIfCancellationRequested();
+                    var job = request();
+                    timeout.CancelAfter(_requestTimeout);
+                    started.TrySetResult(job);
+                }
+                catch (Exception exception) { started.TrySetException(exception); }
+            });
+            // The caller may stop waiting, but the next account job cannot start until this one ends.
+            var pending = started.Task.Unwrap();
+            try { return await pending.WaitAsync(timeout.Token); }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested && !pending.IsCompleted)
+            {
+                InvalidateAuthentication(null);
+                _requestsUnavailable.TrySetResult();
+                try { await pending; }
+                catch (Exception exception) { FileLogger.LogException("Expired Steam request finished with an error", exception); }
+                throw new SteamConnectionException(SteamFailure.GameDetailsUnavailable);
             }
         }
 
@@ -477,18 +539,30 @@ namespace SteamPrefill.Handlers.Steam
 
         private void LicenseListCallback(LicenseListCallback licenseList)
         {
-            var timer = Stopwatch.StartNew();
-
             if (licenseList.Result != EResult.OK)
             {
                 _ansiConsole.MarkupLine(Red($"Unexpected error while retrieving license list : {licenseList.Result}"));
                 _licenses.TrySetException(new SteamLoginException("Unable to retrieve user licenses!"));
                 return;
             }
-            LicenseManager.LoadPackageInfo(licenseList.LicenseList);
-            _licenses.TrySetResult(true);
+            _ = LoadLicensesAsync(licenseList.LicenseList.ToArray());
+        }
 
-            _ansiConsole.LogMarkupLine("Loaded account licenses", timer);
+        private async Task LoadLicensesAsync(IReadOnlyCollection<LicenseListCallback.License> licenses)
+        {
+            try
+            {
+                var timer = Stopwatch.StartNew();
+                await LicenseManager.LoadPackageInfo(licenses);
+                WhileAuthenticated(() => _licenses.TrySetResult(true), _authLostToken);
+                _ansiConsole.LogMarkupLine("Loaded account licenses", timer);
+            }
+            catch (OperationCanceledException) { _licenses.TrySetCanceled(); }
+            catch (Exception exception)
+            {
+                FileLogger.LogException("Unable to load account licenses", exception);
+                _licenses.TrySetException(exception);
+            }
         }
 
         #endregion
@@ -505,7 +579,9 @@ namespace SteamPrefill.Handlers.Steam
             if (Task.CurrentId != _pump.Id) _pump.GetAwaiter().GetResult();
             _pumpCts.Dispose();
             _authLost.Dispose();
-            CdnClient.Dispose();
+            if (_account.IsCompleted) CdnClient.Dispose();
+            else _ = _account.ContinueWith(_ => CdnClient.Dispose(), CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         }
     }
 }

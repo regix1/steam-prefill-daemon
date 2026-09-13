@@ -10,7 +10,8 @@
         private readonly Steam3Session _steam3;
         private readonly CdnPool _cdnPool;
 
-        private readonly DownloadHandler _downloadHandler;
+        private readonly Func<IPrefillProgress, DownloadHandler> _download;
+        private readonly SemaphoreSlim _preparation = new(1, 1);
         private readonly DepotHandler _depotHandler;
         private readonly AppInfoHandler _appInfoHandler;
 
@@ -19,13 +20,16 @@
         // summary reported the container's whole lifetime, and its stopwatch measured from process
         // start. A one-game run could report "4 updated, 13 failed" and the failure count climbed by
         // one on every run forever, which made a caller unable to tell what THIS run did.
-        private PrefillSummaryResult _prefillSummaryResult = new PrefillSummaryResult();
+        private readonly AsyncLocal<PrefillSummaryResult> _summary = new();
+        private PrefillSummaryResult _prefillSummaryResult { get => _summary.Value; set => _summary.Value = value; }
         private readonly CallbackProgress _progress;
         private readonly AsyncLocal<IPrefillProgress> _runProgress = new();
 
         public bool IsAuthenticated => _steam3.IsAuthenticated;
         internal string Username => _steam3.Username;
         internal DateTime? AuthExpiryUtc => _steam3.AuthExpiryUtc;
+        internal bool HasPendingRequests => _steam3.HasPendingRequests;
+        internal bool RestartRequired => _steam3.RequestsUnavailable.IsCompleted;
         public event Action<EResult?> AuthenticationLost
         {
             add => _steam3.AuthenticationLost += value;
@@ -48,7 +52,8 @@
             IPrefillProgress progress = null,
             CdnPool cdnPool = null,
             AppInfoHandler appInfoHandler = null,
-            DepotHandler depotHandler = null)
+            DepotHandler depotHandler = null,
+            Func<IPrefillProgress, DownloadHandler> download = null)
         {
             _ansiConsole = ansiConsole;
             _downloadArgs = downloadArgs;
@@ -67,7 +72,7 @@
             _steam3 = steam3;
             _cdnPool = cdnPool ?? new CdnPool(_ansiConsole, _steam3);
             _appInfoHandler = appInfoHandler ?? new AppInfoHandler(_ansiConsole, _steam3, _steam3.LicenseManager);
-            _downloadHandler = new DownloadHandler(_ansiConsole, _cdnPool, _progress);
+            _download = download ?? (sink => new DownloadHandler(_ansiConsole, _cdnPool, sink));
             _depotHandler = depotHandler ?? new DepotHandler(_ansiConsole, _steam3, _appInfoHandler, _cdnPool);
         }
 
@@ -115,8 +120,8 @@
 
         public void Dispose()
         {
-            _downloadHandler.Dispose();
             _steam3.Dispose();
+            _preparation.Dispose();
         }
 
         #endregion
@@ -134,9 +139,21 @@
         [SuppressMessage("Design", "CA1068", Justification = "Preserves existing positional cancellation callers.")]
         public async Task DownloadMultipleAppsAsync(bool downloadAllOwnedGames, bool prefillRecentGames,
                                                     int? prefillPopularGames, bool prefillRecentlyPurchasedGames,
-                                                    CancellationToken cancellationToken = default, IPrefillProgress? progress = null)
+                                                    CancellationToken cancellationToken = default, IPrefillProgress? progress = null,
+                                                    IReadOnlyList<uint>? appIds = null, DownloadArguments? arguments = null)
         {
             _runProgress.Value = progress;
+            var run = PrefillRun.Current.Value;
+            var downloadArgs = arguments ?? run?.Arguments ?? new DownloadArguments
+            {
+                Force = _downloadArgs.Force,
+                MaxConcurrentRequests = _downloadArgs.MaxConcurrentRequests,
+                OperatingSystems = _downloadArgs.OperatingSystems.ToList(),
+                Architecture = _downloadArgs.Architecture,
+                Language = _downloadArgs.Language,
+                TransferSpeedUnit = _downloadArgs.TransferSpeedUnit
+            };
+            using var downloadHandler = _download(progress ?? _progress);
             // Every Steam call below waits on a session that is already gone, so the run would otherwise
             // sit silent until the caller's stall timeout instead of reporting why nothing downloaded.
             if (!_steam3.IsAuthenticated)
@@ -152,65 +169,79 @@
             // Only include previously selected apps if no specific filter is being used
             // When using filters like "recently purchased" or "recent games", users expect ONLY those games
             var hasSpecificFilter = downloadAllOwnedGames || prefillRecentGames || prefillPopularGames != null || prefillRecentlyPurchasedGames;
-            var appIdsToDownload = hasSpecificFilter ? new List<uint>() : LoadPreviouslySelectedApps();
-            if (downloadAllOwnedGames)
+            await _preparation.WaitAsync(cancellationToken);
+            List<uint> distinctAppIds;
+            List<AppInfo> availableGames;
+            try
             {
-                appIdsToDownload.AddRange(_steam3.LicenseManager.AllOwnedAppIds);
-            }
-            if (prefillRecentGames)
-            {
-                var recentGames = await _appInfoHandler.GetRecentlyPlayedGamesAsync(cancellationToken);
-                appIdsToDownload.AddRange(recentGames.Select(e => (uint)e.appid));
-            }
-            if (prefillPopularGames != null)
-            {
-                var popularGames = (await SteamChartsService.MostPlayedByDailyPlayersAsync(
-                                       _ansiConsole,
-                                       cancellationToken))
-                                   .Take(prefillPopularGames.Value)
-                                   .Select(e => e.AppId);
-                appIdsToDownload.AddRange(popularGames);
-            }
-            if (prefillRecentlyPurchasedGames)
-            {
-                var recentApps = _steam3.LicenseManager.GetRecentlyPurchasedAppIds(30);
-                appIdsToDownload.AddRange(recentApps);
-
-                // Verbose logging for recently purchased games
-                await _appInfoHandler.RetrieveAppMetadataAsync(
-                    recentApps,
-                    cancellationToken: cancellationToken);
-                _ansiConsole.LogMarkupVerbose("[bold yellow]Recently purchased games (last 2 weeks):[/]");
-                foreach (var appId in recentApps)
+                var appIdsToDownload = appIds?.ToList() ?? (hasSpecificFilter ? new List<uint>() : LoadPreviouslySelectedApps());
+                if (downloadAllOwnedGames)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var purchaseDate = _steam3.LicenseManager.GetPurchaseDateForApp(appId);
-                    var appInfo = await _appInfoHandler.GetAppInfoAsync(appId, cancellationToken);
-                    _ansiConsole.LogMarkupVerbose($"  {Green(appInfo.Name).PadRight(35)} - Purchased: {LightYellow(purchaseDate.ToLocalTime().ToString("yyyy-MM-dd"))}");
+                    appIdsToDownload.AddRange(_steam3.LicenseManager.AllOwnedAppIds);
                 }
+                if (prefillRecentGames)
+                {
+                    var recentGames = await _appInfoHandler.GetRecentlyPlayedGamesAsync(cancellationToken);
+                    appIdsToDownload.AddRange(recentGames.Select(e => (uint)e.appid));
+                }
+                if (prefillPopularGames != null)
+                {
+                    var popularGames = (await SteamChartsService.MostPlayedByDailyPlayersAsync(
+                                           _ansiConsole,
+                                           cancellationToken))
+                                       .Take(prefillPopularGames.Value)
+                                       .Select(e => e.AppId);
+                    appIdsToDownload.AddRange(popularGames);
+                }
+                if (prefillRecentlyPurchasedGames)
+                {
+                    var recentApps = _steam3.LicenseManager.GetRecentlyPurchasedAppIds(30);
+                    appIdsToDownload.AddRange(recentApps);
+
+                    // Verbose logging for recently purchased games
+                    await _appInfoHandler.RetrieveAppMetadataAsync(
+                        recentApps,
+                        cancellationToken: cancellationToken);
+                    _ansiConsole.LogMarkupVerbose("[bold yellow]Recently purchased games (last 2 weeks):[/]");
+                    foreach (var appId in recentApps)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var purchaseDate = _steam3.LicenseManager.GetPurchaseDateForApp(appId);
+                        var appInfo = await _appInfoHandler.GetAppInfoAsync(appId, cancellationToken);
+                        _ansiConsole.LogMarkupVerbose($"  {Green(appInfo.Name).PadRight(35)} - Purchased: {LightYellow(purchaseDate.ToLocalTime().ToString("yyyy-MM-dd"))}");
+                    }
+                }
+
+                // AppIds can potentially be added twice when building out the full list of ids
+                distinctAppIds = appIdsToDownload.Distinct().ToList();
+                if (run != null && !run.Progress.Snapshot.SelectionResolved)
+                    run.Progress.ResolveSelection(distinctAppIds.Select(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+
+                // Report progress for metadata retrieval (can be slow for large libraries)
+                _progress.OnLog(LogLevel.Info, $"Loading metadata for {distinctAppIds.Count} apps...");
+                await _appInfoHandler.RetrieveAppMetadataAsync(
+                    distinctAppIds,
+                    cancellationToken: cancellationToken);
+                _progress.OnLog(LogLevel.Info, $"Metadata loaded for {distinctAppIds.Count} apps");
+
+                // Whitespace divider
+                _ansiConsole.WriteLine();
+
+                availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(
+                    distinctAppIds,
+                    cancellationToken);
+                if (run != null) availableGames = distinctAppIds.Join(availableGames, id => id, app => app.AppId, (_, app) => app).ToList();
+                _progress.OnLog(LogLevel.Info, $"Starting prefill of {availableGames.Count} games");
             }
-
-            // AppIds can potentially be added twice when building out the full list of ids
-            var distinctAppIds = appIdsToDownload.Distinct().ToList();
-
-            // Report progress for metadata retrieval (can be slow for large libraries)
-            _progress.OnLog(LogLevel.Info, $"Loading metadata for {distinctAppIds.Count} apps...");
-            await _appInfoHandler.RetrieveAppMetadataAsync(
-                distinctAppIds,
-                cancellationToken: cancellationToken);
-            _progress.OnLog(LogLevel.Info, $"Metadata loaded for {distinctAppIds.Count} apps");
-
-            // Whitespace divider
-            _ansiConsole.WriteLine();
-
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(
-                distinctAppIds,
-                cancellationToken);
-            _progress.OnLog(LogLevel.Info, $"Starting prefill of {availableGames.Count} games");
+            finally { _preparation.Release(); }
 
             await DownloadAppsAsync(
                 availableGames,
-                DownloadSingleAppAsync,
+                async (app, token) =>
+                {
+                    try { await DownloadSingleAppAsync(app, downloadArgs, downloadHandler, token); }
+                    finally { if (run != null) await run.ReleaseAsync(); }
+                },
                 (app, e) =>
                 {
                     // Need to catch any exceptions that might happen during a single download, so that the other apps won't be affected
@@ -228,6 +259,7 @@
                         $"Prefill failed for {app}: {e.GetType().Name} - {e.Message}");
 
                     _prefillSummaryResult.FailedApps++;
+                    _progress.OnAppCompleted(new AppDownloadInfo { AppId = app.AppId, Name = app.Name }, AppDownloadResult.Failed);
                 },
                 cancellationToken);
             await PrintUnownedAppsAsync(distinctAppIds, cancellationToken);
@@ -282,46 +314,73 @@
             }
         }
 
-        private async Task DownloadSingleAppAsync(AppInfo appInfo, CancellationToken cancellationToken = default)
+        private async Task DownloadSingleAppAsync(AppInfo appInfo, DownloadArguments downloadArgs, DownloadHandler downloadHandler, CancellationToken cancellationToken = default)
         {
-            // Filter depots based on specified language/OS/cpu architecture/etc
-            var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
-                _downloadArgs,
-                appInfo.Depots,
-                cancellationToken);
-            if (filteredDepots.Empty())
+            var run = PrefillRun.Current.Value;
+            if (run != null)
             {
-                _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
-                _progress.OnAppCompleted(
-                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
-                    AppDownloadResult.NoDepotsToDownload);
-                return;
+                var claim = run.Claims.TryClaim(run.OperationId, new[] { "app:" + appInfo.AppId });
+                if (claim == null)
+                {
+                    _progress.OnAppCompleted(new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, Reason = "skippedOverlap" }, AppDownloadResult.Skipped);
+                    return;
+                }
+                run.Hold(claim);
             }
-
-            await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, cancellationToken);
-            if (filteredDepots.Empty())
-            {
-                _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
-                _progress.OnAppCompleted(
-                    new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
-                    AppDownloadResult.NoDepotsToDownload);
-                return;
-            }
-
-            // Get the full file list for each depot, and queue up the required chunks
-            // We do this before the up-to-date check so we can report accurate sizes for cached games
-            await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
-
+            await _preparation.WaitAsync(cancellationToken);
+            List<DepotInfo> filteredDepots;
             List<QueuedRequest> chunkDownloadQueue = null;
             List<DepotInfo> skippedDepots = null;
-            await _ansiConsole.StatusSpinner().StartAsync(
-                "Fetching depot manifests...",
-                async _ =>
+            try
+            {
+                // Filter depots based on specified language/OS/cpu architecture/etc
+                filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                    downloadArgs,
+                    appInfo.Depots,
+                    cancellationToken);
+                if (filteredDepots.Empty())
                 {
-                    (chunkDownloadQueue, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
-                        filteredDepots,
-                        cancellationToken);
-                });
+                    _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
+                    _progress.OnAppCompleted(
+                        new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                        AppDownloadResult.NoDepotsToDownload);
+                    return;
+                }
+
+                await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, cancellationToken);
+                if (filteredDepots.Empty())
+                {
+                    _ansiConsole.LogMarkupLine($"Starting {Cyan(appInfo)}  {LightYellow("No depots to download.  Current arguments filtered all depots")}");
+                    _progress.OnAppCompleted(
+                        new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, TotalBytes = 0 },
+                        AppDownloadResult.NoDepotsToDownload);
+                    return;
+                }
+
+                // Get the full file list for each depot, and queue up the required chunks
+                // We do this before the up-to-date check so we can report accurate sizes for cached games
+                await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
+
+                if (run != null)
+                {
+                    var claim = run.Claims.TryClaim(run.OperationId, filteredDepots.Select(depot => "depot:" + depot.DepotId));
+                    if (claim == null)
+                    {
+                        _progress.OnAppCompleted(new AppDownloadInfo { AppId = appInfo.AppId, Name = appInfo.Name, Reason = "skippedOverlap" }, AppDownloadResult.Skipped);
+                        return;
+                    }
+                    run.Hold(claim);
+                }
+                await _ansiConsole.StatusSpinner().StartAsync(
+                    "Fetching depot manifests...",
+                    async _ =>
+                    {
+                        (chunkDownloadQueue, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
+                            filteredDepots,
+                            cancellationToken);
+                    });
+            }
+            finally { _preparation.Release(); }
             if (skippedDepots.Any())
             {
                 _ansiConsole.LogMarkupError(
@@ -364,12 +423,13 @@
                 {
                     DepotId = d.DepotId,
                     ManifestId = d.ManifestId!.Value,
-                    TotalBytes = 0 // Will be set from chunk queue if downloaded
+                    TotalBytes = chunkDownloadQueue.Where(request => request.DepotId == d.DepotId).Sum(request => request.CompressedLength)
                 })
                 .ToList();
 
             // We will want to re-download the entire app, if any of the depots have been updated
-            if (_downloadArgs.Force == false && !skippedDepots.Any() && _depotHandler.AppIsUpToDate(filteredDepots))
+            if (downloadArgs.Force == false && !skippedDepots.Any() &&
+                (_depotHandler.AppIsUpToDate(filteredDepots) || run != null && filteredDepots.All(depot => run.Options.CachedDepots.Contains($"{depot.DepotId}:{depot.ManifestId}"))))
             {
                 _prefillSummaryResult.AlreadyUpToDate++;
                 var cachedAppInfo = new AppDownloadInfo
@@ -389,7 +449,6 @@
 
             // Finally run the queued downloads
             var downloadTimer = Stopwatch.StartNew();
-            _prefillSummaryResult.TotalBytesTransferred += totalBytes;
 
             // Notify that app download is starting
             var appDownloadInfo = new AppDownloadInfo
@@ -410,11 +469,11 @@
                 return;
             }
 
-            var downloadSuccessful = await _downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, _downloadArgs,
+            var downloadSuccessful = await downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, downloadArgs,
                 appId: appInfo.AppId, appName: appInfo.Name, cancellationToken: cancellationToken);
+            _prefillSummaryResult.TotalBytesTransferred += run == null ? totalBytes : ByteSize.FromBytes(run.Bytes(appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
             if (downloadSuccessful)
             {
-                _depotHandler.MarkDownloadAsSuccessful(filteredDepots);
                 if (skippedDepots.Any())
                 {
                     // Sibling depots were cached, but the app is still incomplete.
@@ -423,8 +482,20 @@
                 }
                 else
                 {
+                    var item = run == null ? null : new RunItemSnapshot
+                    {
+                        AppId = appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        Name = appInfo.Name,
+                        State = "completed",
+                        Result = "success",
+                        TotalBytes = appDownloadInfo.TotalBytes,
+                        BytesTransferred = run.Bytes(appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                    };
+                    var committed = false;
+                    _steam3.WhileAuthenticated(() => committed = _depotHandler.MarkDownloadAsSuccessful(filteredDepots, run?.Progress, item), cancellationToken);
+                    if (!committed) return;
                     _prefillSummaryResult.Updated++;
-                    _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
+                    if (run == null) _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
 
                     // Logging some metrics about the download
                     _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
@@ -494,158 +565,163 @@
             List<CachedDepotInput>? cachedDepots = null,
             CancellationToken cancellationToken = default)
         {
-            // Force-refresh app metadata for these specific apps to ensure accurate size calculations
-            _appInfoHandler.InvalidateApps(appIds);
-            await _appInfoHandler.RetrieveAppMetadataAsync(
-                appIds,
-                cancellationToken: cancellationToken);
-            await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
-
-            var appStatuses = new ConcurrentBag<AppStatus>();
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
-
-            _ansiConsole.LogMarkupVerbose($"Getting status for {Magenta(availableGames.Count)} available games out of {Magenta(appIds.Count)} requested");
-
-            // Build OS names string for error messages
-            var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
-
-            // Build lookup for cached manifests if provided
-            Dictionary<uint, Dictionary<uint, ulong>>? cachedByApp = null;
-            if (cachedDepots != null && cachedDepots.Count > 0)
+            await _preparation.WaitAsync(cancellationToken);
+            try
             {
-                cachedByApp = cachedDepots
-                    .GroupBy(d => d.AppId)
-                    .ToDictionary(g => g.Key, g => g.ToDictionary(d => d.DepotId, d => d.ManifestId));
-                _ansiConsole.LogMarkupVerbose($"Using {cachedDepots.Count} cached depot manifests for isUpToDate calculation");
+                // Force-refresh app metadata for these specific apps to ensure accurate size calculations
+                _appInfoHandler.InvalidateApps(appIds);
+                await _appInfoHandler.RetrieveAppMetadataAsync(
+                    appIds,
+                    cancellationToken: cancellationToken);
+                await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
+
+                var appStatuses = new ConcurrentBag<AppStatus>();
+                var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
+
+                _ansiConsole.LogMarkupVerbose($"Getting status for {Magenta(availableGames.Count)} available games out of {Magenta(appIds.Count)} requested");
+
+                // Build OS names string for error messages
+                var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
+
+                // Build lookup for cached manifests if provided
+                Dictionary<uint, Dictionary<uint, ulong>>? cachedByApp = null;
+                if (cachedDepots != null && cachedDepots.Count > 0)
+                {
+                    cachedByApp = cachedDepots
+                        .GroupBy(d => d.AppId)
+                        .ToDictionary(g => g.Key, g => g.ToDictionary(d => d.DepotId, d => d.ManifestId));
+                    _ansiConsole.LogMarkupVerbose($"Using {cachedDepots.Count} cached depot manifests for isUpToDate calculation");
+                }
+
+                await Parallel.ForEachAsync(
+                    availableGames,
+                    new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = 5,
+                        CancellationToken = cancellationToken
+                    },
+                    async (app, loopToken) =>
+                {
+                    try
+                    {
+                        _ansiConsole.LogMarkupVerbose($"Processing {Cyan(app.Name)}: {app.Depots.Count} depots");
+                        var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                            _downloadArgs,
+                            app.Depots,
+                            loopToken);
+                        _ansiConsole.LogMarkupVerbose($"  Filtered to {filteredDepots.Count} depots");
+
+                        // Check if game has no depots for the selected OS
+                        if (filteredDepots.Count == 0 && app.Depots.Count > 0)
+                        {
+                            // Game has depots but none match the selected OS
+                            appStatuses.Add(new AppStatus
+                            {
+                                AppId = app.AppId,
+                                Name = app.Name,
+                                DownloadSize = 0,
+                                IsUpToDate = false,
+                                IsUnsupportedOs = true,
+                                UnavailableReason = $"Not available for {selectedOsNames}"
+                            });
+                            return;
+                        }
+
+                        await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
+                        if (filteredDepots.Count == 0)
+                        {
+                            appStatuses.Add(new AppStatus
+                            {
+                                AppId = app.AppId,
+                                Name = app.Name,
+                                DownloadSize = 0,
+                                IsUpToDate = false,
+                                UnavailableReason = "No downloadable depots"
+                            });
+                            return;
+                        }
+
+                        var (allChunksForApp, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
+                            filteredDepots,
+                            loopToken);
+                        // Every depot can be dropped while fetching manifests, and an empty list would otherwise
+                        // report the app as up to date with nothing left to download
+                        if (filteredDepots.Count == 0)
+                        {
+                            appStatuses.Add(new AppStatus
+                            {
+                                AppId = app.AppId,
+                                Name = app.Name,
+                                DownloadSize = 0,
+                                IsUpToDate = false,
+                                UnavailableReason = "No downloadable depots"
+                            });
+                            return;
+                        }
+
+                        var downloadSize = allChunksForApp.Sum(e => e.CompressedLength);
+
+                        // Determine if app is up to date
+                        bool isUpToDate;
+                        if (cachedByApp != null && cachedByApp.TryGetValue(app.AppId, out var cachedManifests))
+                        {
+                            // Use passed-in cached manifests for comparison
+                            isUpToDate = _downloadArgs.Force == false &&
+                                filteredDepots.All(d =>
+                                    cachedManifests.TryGetValue(d.DepotId, out var cachedManifest) &&
+                                    cachedManifest == d.ManifestId.Value);
+                        }
+                        else
+                        {
+                            // Fall back to daemon's internal cache (will be empty on fresh session)
+                            isUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots);
+                        }
+
+                        // A depot that couldn't be fetched is removed from the list, so the depots left behind can all be
+                        // cached and still leave the app incomplete.  A prefill counts this app as failed, so the status
+                        // has to report it as needing a download instead of up to date.
+                        if (skippedDepots.Any())
+                        {
+                            isUpToDate = false;
+                        }
+
+                        appStatuses.Add(new AppStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = downloadSize,
+                            IsUpToDate = isUpToDate
+                        });
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (SteamConnectionException ex) when (ex.Failure != null)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log the error so we can debug size calculation failures
+                        _ansiConsole.LogMarkupError($"Failed to get size for {app.Name} ({app.AppId}): {ex.Message}");
+                        FileLogger.LogException($"Failed to get app status for {app.Name}", ex);
+
+                        // If we can't get info for an app, add it with zero size
+                        appStatuses.Add(new AppStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            UnavailableReason = "Failed to calculate size"
+                        });
+                    }
+                });
+
+                return appStatuses.OrderBy(a => a.Name).ToList();
             }
-
-            await Parallel.ForEachAsync(
-                availableGames,
-                new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = 5,
-                    CancellationToken = cancellationToken
-                },
-                async (app, loopToken) =>
-            {
-                try
-                {
-                    _ansiConsole.LogMarkupVerbose($"Processing {Cyan(app.Name)}: {app.Depots.Count} depots");
-                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
-                        _downloadArgs,
-                        app.Depots,
-                        loopToken);
-                    _ansiConsole.LogMarkupVerbose($"  Filtered to {filteredDepots.Count} depots");
-
-                    // Check if game has no depots for the selected OS
-                    if (filteredDepots.Count == 0 && app.Depots.Count > 0)
-                    {
-                        // Game has depots but none match the selected OS
-                        appStatuses.Add(new AppStatus
-                        {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            DownloadSize = 0,
-                            IsUpToDate = false,
-                            IsUnsupportedOs = true,
-                            UnavailableReason = $"Not available for {selectedOsNames}"
-                        });
-                        return;
-                    }
-
-                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
-                    if (filteredDepots.Count == 0)
-                    {
-                        appStatuses.Add(new AppStatus
-                        {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            DownloadSize = 0,
-                            IsUpToDate = false,
-                            UnavailableReason = "No downloadable depots"
-                        });
-                        return;
-                    }
-
-                    var (allChunksForApp, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
-                        filteredDepots,
-                        loopToken);
-                    // Every depot can be dropped while fetching manifests, and an empty list would otherwise
-                    // report the app as up to date with nothing left to download
-                    if (filteredDepots.Count == 0)
-                    {
-                        appStatuses.Add(new AppStatus
-                        {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            DownloadSize = 0,
-                            IsUpToDate = false,
-                            UnavailableReason = "No downloadable depots"
-                        });
-                        return;
-                    }
-
-                    var downloadSize = allChunksForApp.Sum(e => e.CompressedLength);
-
-                    // Determine if app is up to date
-                    bool isUpToDate;
-                    if (cachedByApp != null && cachedByApp.TryGetValue(app.AppId, out var cachedManifests))
-                    {
-                        // Use passed-in cached manifests for comparison
-                        isUpToDate = _downloadArgs.Force == false &&
-                            filteredDepots.All(d =>
-                                cachedManifests.TryGetValue(d.DepotId, out var cachedManifest) &&
-                                cachedManifest == d.ManifestId.Value);
-                    }
-                    else
-                    {
-                        // Fall back to daemon's internal cache (will be empty on fresh session)
-                        isUpToDate = _downloadArgs.Force == false && _depotHandler.AppIsUpToDate(filteredDepots);
-                    }
-
-                    // A depot that couldn't be fetched is removed from the list, so the depots left behind can all be
-                    // cached and still leave the app incomplete.  A prefill counts this app as failed, so the status
-                    // has to report it as needing a download instead of up to date.
-                    if (skippedDepots.Any())
-                    {
-                        isUpToDate = false;
-                    }
-
-                    appStatuses.Add(new AppStatus
-                    {
-                        AppId = app.AppId,
-                        Name = app.Name,
-                        DownloadSize = downloadSize,
-                        IsUpToDate = isUpToDate
-                    });
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (SteamConnectionException ex) when (ex.Failure != null)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    // Log the error so we can debug size calculation failures
-                    _ansiConsole.LogMarkupError($"Failed to get size for {app.Name} ({app.AppId}): {ex.Message}");
-                    FileLogger.LogException($"Failed to get app status for {app.Name}", ex);
-
-                    // If we can't get info for an app, add it with zero size
-                    appStatuses.Add(new AppStatus
-                    {
-                        AppId = app.AppId,
-                        Name = app.Name,
-                        DownloadSize = 0,
-                        IsUpToDate = false,
-                        UnavailableReason = "Failed to calculate size"
-                    });
-                }
-            });
-
-            return appStatuses.OrderBy(a => a.Name).ToList();
+            finally { _preparation.Release(); }
         }
 
 
@@ -657,165 +733,170 @@
             List<CachedDepotInput> cachedDepots,
             CancellationToken cancellationToken = default)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (cachedDepots.Count == 0)
+            await _preparation.WaitAsync(cancellationToken);
+            try
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (cachedDepots.Count == 0)
+                {
+                    return new CacheStatusResult
+                    {
+                        Apps = new List<AppCacheStatus>(),
+                        Message = "No cached depots provided"
+                    };
+                }
+
+                // Group cached depots by app ID
+                var cachedByApp = cachedDepots
+                    .GroupBy(d => d.AppId)
+                    .ToDictionary(g => g.Key, g => g.ToDictionary(d => d.DepotId, d => d.ManifestId));
+
+                var appIds = cachedByApp.Keys.ToList();
+
+                // Force-refresh app metadata for these specific apps to ensure accurate manifest info
+                _appInfoHandler.InvalidateApps(appIds);
+                await _appInfoHandler.RetrieveAppMetadataAsync(
+                    appIds,
+                    cancellationToken: cancellationToken);
+                await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
+
+                var appStatuses = new ConcurrentBag<AppCacheStatus>();
+                var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
+
+                _ansiConsole.LogMarkupVerbose($"Checking cache status for {Magenta(availableGames.Count)} available games");
+
+                // Build OS names string for error messages
+                var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
+
+                await Parallel.ForEachAsync(
+                    availableGames,
+                    new ParallelOptions
+                    {
+                        MaxDegreeOfParallelism = 5,
+                        CancellationToken = cancellationToken
+                    },
+                    async (app, loopToken) =>
+                {
+                    try
+                    {
+                        var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
+                            _downloadArgs,
+                            app.Depots,
+                            loopToken);
+
+                        // Check if game has no depots for the selected OS
+                        if (filteredDepots.Count == 0 && app.Depots.Count > 0)
+                        {
+                            appStatuses.Add(new AppCacheStatus
+                            {
+                                AppId = app.AppId,
+                                Name = app.Name,
+                                DownloadSize = 0,
+                                IsUpToDate = false,
+                                OutdatedDepots = new List<OutdatedDepot>()
+                            });
+                            return;
+                        }
+
+                        await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
+                        if (filteredDepots.Count == 0)
+                        {
+                            appStatuses.Add(new AppCacheStatus
+                            {
+                                AppId = app.AppId,
+                                Name = app.Name,
+                                DownloadSize = 0,
+                                IsUpToDate = false,
+                                OutdatedDepots = new List<OutdatedDepot>()
+                            });
+                            return;
+                        }
+
+                        // Get cached manifests for this app
+                        var cachedManifests = cachedByApp.GetValueOrDefault(app.AppId) ?? new Dictionary<uint, ulong>();
+
+                        // Compare each depot's current manifest against cached manifest
+                        var outdatedDepots = new List<OutdatedDepot>();
+                        long downloadSize = 0;
+
+                        foreach (var depot in filteredDepots)
+                        {
+                            var currentManifest = depot.ManifestId.Value;
+                            var hasCached = cachedManifests.TryGetValue(depot.DepotId, out var cachedManifest);
+
+                            if (!hasCached || cachedManifest != currentManifest)
+                            {
+                                outdatedDepots.Add(new OutdatedDepot
+                                {
+                                    DepotId = depot.DepotId,
+                                    CachedManifest = hasCached ? cachedManifest : 0,
+                                    CurrentManifest = currentManifest
+                                });
+                            }
+                        }
+
+                        // If any depot is outdated, calculate download size for outdated depots
+                        if (outdatedDepots.Count > 0)
+                        {
+                            var outdatedDepotIds = outdatedDepots.Select(d => d.DepotId).ToHashSet();
+                            var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
+                            var (chunks, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
+                                depotsToDownload,
+                                loopToken);
+                            downloadSize = chunks.Sum(e => e.CompressedLength);
+
+                            // The depots stay listed as outdated, they just have no size to add, so say so rather than
+                            // letting the total quietly come up short
+                            if (skippedDepots.Any())
+                            {
+                                _ansiConsole.LogMarkupError($"Could not size {skippedDepots.Count} depots for {app.Name} ({app.AppId}), the download size is incomplete");
+                            }
+                        }
+
+                        appStatuses.Add(new AppCacheStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            IsUpToDate = outdatedDepots.Count == 0,
+                            DownloadSize = downloadSize,
+                            OutdatedDepots = outdatedDepots
+                        });
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (SteamConnectionException ex) when (ex.Failure != null)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        _ansiConsole.LogMarkupError($"Failed to check cache status for {app.Name} ({app.AppId}): {ex.Message}");
+                        FileLogger.LogException($"Failed to check cache status for {app.Name}", ex);
+
+                        appStatuses.Add(new AppCacheStatus
+                        {
+                            AppId = app.AppId,
+                            Name = app.Name,
+                            DownloadSize = 0,
+                            IsUpToDate = false,
+                            OutdatedDepots = new List<OutdatedDepot>()
+                        });
+                    }
+                });
+
+                var upToDateCount = appStatuses.Count(a => a.IsUpToDate);
+                var needsUpdateCount = appStatuses.Count - upToDateCount;
+                var totalDownloadSize = ByteSize.FromBytes(appStatuses.Sum(a => a.DownloadSize));
+
                 return new CacheStatusResult
                 {
-                    Apps = new List<AppCacheStatus>(),
-                    Message = "No cached depots provided"
+                    Apps = appStatuses.OrderBy(a => a.Name).ToList(),
+                    Message = $"{upToDateCount} apps up-to-date, {needsUpdateCount} need updates ({totalDownloadSize.ToDecimalString()} to download)"
                 };
             }
-
-            // Group cached depots by app ID
-            var cachedByApp = cachedDepots
-                .GroupBy(d => d.AppId)
-                .ToDictionary(g => g.Key, g => g.ToDictionary(d => d.DepotId, d => d.ManifestId));
-
-            var appIds = cachedByApp.Keys.ToList();
-
-            // Force-refresh app metadata for these specific apps to ensure accurate manifest info
-            _appInfoHandler.InvalidateApps(appIds);
-            await _appInfoHandler.RetrieveAppMetadataAsync(
-                appIds,
-                cancellationToken: cancellationToken);
-            await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
-
-            var appStatuses = new ConcurrentBag<AppCacheStatus>();
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(appIds, cancellationToken);
-
-            _ansiConsole.LogMarkupVerbose($"Checking cache status for {Magenta(availableGames.Count)} available games");
-
-            // Build OS names string for error messages
-            var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
-
-            await Parallel.ForEachAsync(
-                availableGames,
-                new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = 5,
-                    CancellationToken = cancellationToken
-                },
-                async (app, loopToken) =>
-            {
-                try
-                {
-                    var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
-                        _downloadArgs,
-                        app.Depots,
-                        loopToken);
-
-                    // Check if game has no depots for the selected OS
-                    if (filteredDepots.Count == 0 && app.Depots.Count > 0)
-                    {
-                        appStatuses.Add(new AppCacheStatus
-                        {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            DownloadSize = 0,
-                            IsUpToDate = false,
-                            OutdatedDepots = new List<OutdatedDepot>()
-                        });
-                        return;
-                    }
-
-                    await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
-                    if (filteredDepots.Count == 0)
-                    {
-                        appStatuses.Add(new AppCacheStatus
-                        {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            DownloadSize = 0,
-                            IsUpToDate = false,
-                            OutdatedDepots = new List<OutdatedDepot>()
-                        });
-                        return;
-                    }
-
-                    // Get cached manifests for this app
-                    var cachedManifests = cachedByApp.GetValueOrDefault(app.AppId) ?? new Dictionary<uint, ulong>();
-
-                    // Compare each depot's current manifest against cached manifest
-                    var outdatedDepots = new List<OutdatedDepot>();
-                    long downloadSize = 0;
-
-                    foreach (var depot in filteredDepots)
-                    {
-                        var currentManifest = depot.ManifestId.Value;
-                        var hasCached = cachedManifests.TryGetValue(depot.DepotId, out var cachedManifest);
-
-                        if (!hasCached || cachedManifest != currentManifest)
-                        {
-                            outdatedDepots.Add(new OutdatedDepot
-                            {
-                                DepotId = depot.DepotId,
-                                CachedManifest = hasCached ? cachedManifest : 0,
-                                CurrentManifest = currentManifest
-                            });
-                        }
-                    }
-
-                    // If any depot is outdated, calculate download size for outdated depots
-                    if (outdatedDepots.Count > 0)
-                    {
-                        var outdatedDepotIds = outdatedDepots.Select(d => d.DepotId).ToHashSet();
-                        var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
-                        var (chunks, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
-                            depotsToDownload,
-                            loopToken);
-                        downloadSize = chunks.Sum(e => e.CompressedLength);
-
-                        // The depots stay listed as outdated, they just have no size to add, so say so rather than
-                        // letting the total quietly come up short
-                        if (skippedDepots.Any())
-                        {
-                            _ansiConsole.LogMarkupError($"Could not size {skippedDepots.Count} depots for {app.Name} ({app.AppId}), the download size is incomplete");
-                        }
-                    }
-
-                    appStatuses.Add(new AppCacheStatus
-                    {
-                        AppId = app.AppId,
-                        Name = app.Name,
-                        IsUpToDate = outdatedDepots.Count == 0,
-                        DownloadSize = downloadSize,
-                        OutdatedDepots = outdatedDepots
-                    });
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (SteamConnectionException ex) when (ex.Failure != null)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    _ansiConsole.LogMarkupError($"Failed to check cache status for {app.Name} ({app.AppId}): {ex.Message}");
-                    FileLogger.LogException($"Failed to check cache status for {app.Name}", ex);
-
-                    appStatuses.Add(new AppCacheStatus
-                    {
-                        AppId = app.AppId,
-                        Name = app.Name,
-                        DownloadSize = 0,
-                        IsUpToDate = false,
-                        OutdatedDepots = new List<OutdatedDepot>()
-                    });
-                }
-            });
-
-            var upToDateCount = appStatuses.Count(a => a.IsUpToDate);
-            var needsUpdateCount = appStatuses.Count - upToDateCount;
-            var totalDownloadSize = ByteSize.FromBytes(appStatuses.Sum(a => a.DownloadSize));
-
-            return new CacheStatusResult
-            {
-                Apps = appStatuses.OrderBy(a => a.Name).ToList(),
-                Message = $"{upToDateCount} apps up-to-date, {needsUpdateCount} need updates ({totalDownloadSize.ToDecimalString()} to download)"
-            };
+            finally { _preparation.Release(); }
         }
 
         #endregion
@@ -823,18 +904,23 @@
         public async Task<List<AppInfo>> GetAllAvailableAppsAsync(
             CancellationToken cancellationToken = default)
         {
-            var ownedGameIds = _steam3.LicenseManager.AllOwnedAppIds;
+            await _preparation.WaitAsync(cancellationToken);
+            try
+            {
+                var ownedGameIds = _steam3.LicenseManager.AllOwnedAppIds;
 
-            // Loading app metadata from steam, skipping related DLC apps
-            await _appInfoHandler.RetrieveAppMetadataAsync(
-                ownedGameIds,
-                getRecentlyPlayedMetadata: true,
-                cancellationToken);
-            var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(
-                ownedGameIds,
-                cancellationToken);
+                // Loading app metadata from steam, skipping related DLC apps
+                await _appInfoHandler.RetrieveAppMetadataAsync(
+                    ownedGameIds,
+                    getRecentlyPlayedMetadata: true,
+                    cancellationToken);
+                var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(
+                    ownedGameIds,
+                    cancellationToken);
 
-            return availableGames;
+                return availableGames;
+            }
+            finally { _preparation.Release(); }
         }
 
         /// <summary>
@@ -843,37 +929,47 @@
         /// </summary>
         public void ClearAppInfoCache()
         {
-            _appInfoHandler.ClearLoadedAppInfos();
+            if (!_preparation.Wait(0)) throw new InvalidOperationException("Catalog preparation is active.");
+            try
+            {
+                _appInfoHandler.ClearLoadedAppInfos();
+            }
+            finally { _preparation.Release(); }
         }
 
         private async Task PrintUnownedAppsAsync(
             List<uint> distinctAppIds,
             CancellationToken cancellationToken)
         {
-            // Write out any apps that can't be downloaded as a warning message, so users can know that they were skipped
-            AppInfo[] unownedApps = await Task.WhenAll(distinctAppIds.Where(e => !_steam3.LicenseManager.AccountHasAppAccess(e))
-                                                                     .Select(e => _appInfoHandler.GetAppInfoAsync(e, cancellationToken)));
-            _prefillSummaryResult.UnownedAppsSkipped = unownedApps.Length;
-
-
-            if (unownedApps.Empty())
+            await _preparation.WaitAsync(cancellationToken);
+            try
             {
-                return;
+                // Write out any apps that can't be downloaded as a warning message, so users can know that they were skipped
+                AppInfo[] unownedApps = await Task.WhenAll(distinctAppIds.Where(e => !_steam3.LicenseManager.AccountHasAppAccess(e))
+                                                                         .Select(e => _appInfoHandler.GetAppInfoAsync(e, cancellationToken)));
+                _prefillSummaryResult.UnownedAppsSkipped = unownedApps.Length;
+
+
+                if (unownedApps.Empty())
+                {
+                    return;
+                }
+
+                var table = new Table { Border = TableBorder.MinimalHeavyHead };
+                // Header
+                table.AddColumn(new TableColumn(White("App")));
+
+                // Rows
+                foreach (var app in unownedApps.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase))
+                {
+                    table.AddRow($"[link=https://store.steampowered.com/app/{app.AppId}]🔗[/] {White(app.Name)}");
+                }
+
+                _ansiConsole.MarkupLine("");
+                _ansiConsole.MarkupLine(LightYellow($" Warning!  Found {Magenta(unownedApps.Length)} unowned apps!  They will be excluded from this prefill run..."));
+                _ansiConsole.Write(table);
             }
-
-            var table = new Table { Border = TableBorder.MinimalHeavyHead };
-            // Header
-            table.AddColumn(new TableColumn(White("App")));
-
-            // Rows
-            foreach (var app in unownedApps.OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase))
-            {
-                table.AddRow($"[link=https://store.steampowered.com/app/{app.AppId}]🔗[/] {White(app.Name)}");
-            }
-
-            _ansiConsole.MarkupLine("");
-            _ansiConsole.MarkupLine(LightYellow($" Warning!  Found {Magenta(unownedApps.Length)} unowned apps!  They will be excluded from this prefill run..."));
-            _ansiConsole.Write(table);
+            finally { _preparation.Release(); }
         }
 
     }

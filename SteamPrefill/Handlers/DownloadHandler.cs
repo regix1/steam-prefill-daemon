@@ -19,20 +19,22 @@ namespace SteamPrefill.Handlers
         private string _lancacheAddress;
 
         public DownloadHandler(IAnsiConsole ansiConsole, CdnPool cdnPool, IPrefillProgress? progress = null)
+            : this(ansiConsole, cdnPool, new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+                MaxConnectionsPerServer = 512
+            }, null, progress)
+        {
+        }
+
+        internal DownloadHandler(IAnsiConsole ansiConsole, CdnPool cdnPool, HttpMessageHandler handler,
+            string? lancacheAddress, IPrefillProgress? progress = null)
         {
             _ansiConsole = ansiConsole;
             _cdnPool = cdnPool;
             _progress = progress ?? NullProgress.Instance;
-
-            // Configure SocketsHttpHandler with connection pooling settings
-            var handler = new SocketsHttpHandler
-            {
-                // Connection pool settings to keep connections alive longer
-                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
-                PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
-                // Allow more concurrent connections per server
-                MaxConnectionsPerServer = 512
-            };
+            _lancacheAddress = lancacheAddress;
 
             _client = new HttpClient(handler);
             // Lancache requires this user agent in order to correctly identify and cache Valve's content servers
@@ -116,7 +118,7 @@ namespace SteamPrefill.Handlers
             var startTime = DateTime.UtcNow;
             long lastProgressReportTicks = 0;
             var progressThrottle = TimeSpan.FromMilliseconds(500);
-            
+
             // Per-request timeout to prevent indefinite hangs (2 minutes should be plenty for any chunk)
             var perRequestTimeout = TimeSpan.FromMinutes(2);
 
@@ -130,101 +132,120 @@ namespace SteamPrefill.Handlers
             var sourceIsDown = 0;
 
             var cdnServer = _cdnPool.TakeConnection();
-            await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests, CancellationToken = cancellationToken }, body: async (request, ct) =>
+            try
             {
-                if (Volatile.Read(ref sourceIsDown) != 0)
+                await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests, CancellationToken = cancellationToken }, body: async (request, ct) =>
                 {
-                    failedRequests.Add(request);
-                    return;
-                }
-
-                // Create a linked cancellation token with a per-request timeout
-                // This ensures that individual requests don't hang indefinitely even if the main token doesn't have a timeout
-                using var requestTimeoutCts = new CancellationTokenSource(perRequestTimeout);
-                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, requestTimeoutCts.Token);
-                var requestCt = linkedCts.Token;
-                
-                try
-                {
-                    var url = $"http://{_lancacheAddress}/depot/{request.DepotId}/chunk/{request.ChunkId}";
-                    if (forceRecache)
+                    if (Volatile.Read(ref sourceIsDown) != 0)
                     {
-                        url += "?nocache=1";
+                        failedRequests.Add(request);
+                        return;
                     }
-                    using var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
-                    requestMessage.Headers.Host = cdnServer.Host;
 
-                    using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, requestCt);
-                    response.EnsureSuccessStatusCode();
-                    using Stream responseStream = await response.Content.ReadAsStreamAsync(requestCt);
+                    // Create a linked cancellation token with a per-request timeout
+                    // This ensures that individual requests don't hang indefinitely even if the main token doesn't have a timeout
+                    using var requestTimeoutCts = new CancellationTokenSource(perRequestTimeout);
+                    using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, requestTimeoutCts.Token);
+                    var requestCt = linkedCts.Token;
 
-                    // Use larger buffer for more efficient reads (64KB instead of 4KB)
-                    var buffer = new byte[65536];
-                    // Don't save the data anywhere, so we don't have to waste time writing it to disk.
-                    while (await responseStream.ReadAsync(buffer, requestCt) != 0)
+                    try
                     {
+                        var run = PrefillRun.Current.Value;
+                        using var permit = run == null ? null : await run.Budget.AcquireAsync(run.OperationId, downloadArgs.MaxConcurrentRequests, requestCt);
+                        var url = $"http://{_lancacheAddress}/depot/{request.DepotId}/chunk/{request.ChunkId}";
+                        if (forceRecache)
+                        {
+                            url += "?nocache=1";
+                        }
+                        using var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
+                        requestMessage.Headers.Host = cdnServer.Host;
+
+                        using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, requestCt);
+                        response.EnsureSuccessStatusCode();
+                        using Stream responseStream = await response.Content.ReadAsStreamAsync(requestCt);
+
+                        // Use larger buffer for more efficient reads (64KB instead of 4KB)
+                        var buffer = new byte[65536];
+                        // Don't save the data anywhere, so we don't have to waste time writing it to disk.
+                        int count;
+                        while ((count = await responseStream.ReadAsync(buffer, requestCt)) != 0)
+                        {
+                            Interlocked.Add(ref bytesDownloaded, count);
+                            run?.AddBytes(appId, count);
+                        }
+                        // Counted here rather than from the progress totals below, which advance by the request's
+                        // estimated size whether it succeeded or not.
+                        Interlocked.Increment(ref succeededCount);
                     }
-                    // Counted here rather than from the progress totals below, which advance by the request's
-                    // estimated size whether it succeeded or not.
-                    Interlocked.Increment(ref succeededCount);
-                }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                {
-                    // Main cancellation requested - don't add to failed requests, just exit
-                    throw;
-                }
-                catch (OperationCanceledException) when (requestTimeoutCts.IsCancellationRequested)
-                {
-                    // Per-request timeout - treat as a failure that can be retried
-                    request.LastFailureReason = new TimeoutException($"Request timed out after {perRequestTimeout.TotalSeconds} seconds");
-                    failedRequests.Add(request);
-                }
-                catch (Exception e)
-                {
-                    request.LastFailureReason = e;
-                    failedRequests.Add(request);
-                }
-                // A single success anywhere in this attempt disables the check for the rest of it, so a slow but
-                // working transfer can never trip it.
-                if (Volatile.Read(ref succeededCount) == 0 && failedRequests.Count >= failuresBeforeSourceIsDown)
-                {
-                    Volatile.Write(ref sourceIsDown, 1);
-                }
-
-                progressTask.Increment(request.CompressedLength);
-
-                // Report progress via IPrefillProgress (throttled)
-                var downloaded = Interlocked.Add(ref bytesDownloaded, request.CompressedLength);
-                var now = DateTime.UtcNow;
-                var lastTicks = Interlocked.Read(ref lastProgressReportTicks);
-                var lastReport = lastTicks == 0 ? DateTime.MinValue : new DateTime(lastTicks);
-                if (now - lastReport >= progressThrottle)
-                {
-                    Interlocked.Exchange(ref lastProgressReportTicks, now.Ticks);
-                    var elapsed = now - startTime;
-                    var bytesPerSecond = elapsed.TotalSeconds > 0 ? downloaded / elapsed.TotalSeconds : 0;
-
-                    _progress.OnDownloadProgress(new DownloadProgressInfo
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                     {
-                        AppId = appId,
-                        AppName = appName ?? $"App {appId}",
-                        TotalBytes = (long)requestTotalSize,
-                        BytesDownloaded = downloaded,
-                        BytesPerSecond = bytesPerSecond,
-                        Elapsed = elapsed
-                    });
-                }
-            });
+                        // Main cancellation requested - don't add to failed requests, just exit
+                        throw;
+                    }
+                    catch (OperationCanceledException) when (requestTimeoutCts.IsCancellationRequested)
+                    {
+                        // Per-request timeout - treat as a failure that can be retried
+                        request.LastFailureReason = new TimeoutException($"Request timed out after {perRequestTimeout.TotalSeconds} seconds");
+                        failedRequests.Add(request);
+                    }
+                    catch (Exception e)
+                    {
+                        request.LastFailureReason = e;
+                        failedRequests.Add(request);
+                    }
+                    // A single success anywhere in this attempt disables the check for the rest of it, so a slow but
+                    // working transfer can never trip it.
+                    if (Volatile.Read(ref succeededCount) == 0 && failedRequests.Count >= failuresBeforeSourceIsDown)
+                    {
+                        Volatile.Write(ref sourceIsDown, 1);
+                    }
 
-            //TODO In the scenario where a user still had all requests fail, potentially display a warning that there is an underlying issue
-            // A missing chunk is the same on every server, so only a failure that indicts this server drops it.
-            if (failedRequests.Any(e => CdnPool.IsServerFault(e.LastFailureReason)))
-            {
-                await _cdnPool.DiscardConnectionAsync(cdnServer, cancellationToken);
+                    progressTask.Increment(request.CompressedLength);
+
+                    // Report progress via IPrefillProgress (throttled)
+                    var downloaded = PrefillRun.Current.Value?.Bytes(appId.ToString(System.Globalization.CultureInfo.InvariantCulture)) ?? Interlocked.Read(ref bytesDownloaded);
+                    var now = DateTime.UtcNow;
+                    var lastTicks = Interlocked.Read(ref lastProgressReportTicks);
+                    var lastReport = lastTicks == 0 ? DateTime.MinValue : new DateTime(lastTicks);
+                    if (now - lastReport >= progressThrottle)
+                    {
+                        Interlocked.Exchange(ref lastProgressReportTicks, now.Ticks);
+                        var elapsed = now - startTime;
+                        var bytesPerSecond = elapsed.TotalSeconds > 0 ? downloaded / elapsed.TotalSeconds : 0;
+
+                        _progress.OnDownloadProgress(new DownloadProgressInfo
+                        {
+                            AppId = appId,
+                            AppName = appName ?? $"App {appId}",
+                            TotalBytes = (long)requestTotalSize,
+                            BytesDownloaded = downloaded,
+                            BytesPerSecond = bytesPerSecond,
+                            Elapsed = elapsed
+                        });
+                    }
+                });
             }
-            else
+            finally
             {
-                _cdnPool.ReturnConnection(cdnServer);
+
+                //TODO In the scenario where a user still had all requests fail, potentially display a warning that there is an underlying issue
+                // A missing chunk is the same on every server, so only a failure that indicts this server drops it.
+                if (failedRequests.Any(e => CdnPool.IsServerFault(e.LastFailureReason)))
+                {
+                    await _cdnPool.DiscardConnectionAsync(cdnServer, CancellationToken.None);
+                }
+                else
+                {
+                    _cdnPool.ReturnConnection(cdnServer);
+                }
+                _progress.OnDownloadProgress(new DownloadProgressInfo
+                {
+                    AppId = appId,
+                    AppName = appName ?? $"App {appId}",
+                    TotalBytes = (long)requestTotalSize,
+                    BytesDownloaded = PrefillRun.Current.Value?.Bytes(appId.ToString(System.Globalization.CultureInfo.InvariantCulture)) ?? Interlocked.Read(ref bytesDownloaded),
+                    Elapsed = DateTime.UtcNow - startTime
+                });
             }
 
             // Making sure the progress bar is always set to its max value, in-case some unexpected error leaves the progress bar showing as unfinished

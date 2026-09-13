@@ -66,6 +66,23 @@ prefills, and the app is not treated as up to date until every depot succeeds.
 - A Steam account that owns the games you want to prefill.
 - Docker, or the [.NET 8 SDK](https://dotnet.microsoft.com/) to build from source.
 
+## Concurrent runs
+
+The daemon keeps one persistent Steam login and callback pump while accepting
+independent prefill runs. Each run processes its apps in order; different runs
+may transfer disjoint apps concurrently. It never creates another account
+session or container for a schedule.
+
+`PREFILL_MAX_RUNS` defaults to `4` and accepts `1` through `16`.
+`PREFILL_MAX_REQUESTS` defaults to `30` and independently caps all content
+requests in the process. The existing `--max-threads` option remains
+authoritative when supplied. These values are read at startup, so a change
+requires a restart. Use a run limit of `1` as the conservative fallback.
+
+Managers that do not negotiate the complete protocol-v2 feature set use the
+legacy exclusive single-run behavior. Existing selection, status, and cancel
+commands remain available during mixed-version rollout.
+
 ## Support
 
 Questions or issues? [Open an issue](https://github.com/regix1/steam-prefill-daemon/issues),

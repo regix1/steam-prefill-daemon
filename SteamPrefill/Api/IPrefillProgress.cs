@@ -49,65 +49,6 @@ public interface IPrefillProgress
     void OnError(string message, Exception? exception = null);
 }
 
-public enum LogLevel
-{
-    Debug,
-    Info,
-    Warning,
-    Error
-}
-
-public class AppDownloadInfo
-{
-    public uint AppId { get; init; }
-    public string Name { get; init; } = string.Empty;
-    public long TotalBytes { get; init; }
-    public int ChunkCount { get; init; }
-
-    /// <summary>
-    /// List of depots that were downloaded, with their manifest IDs.
-    /// Used for cache tracking to detect when games need re-downloading.
-    /// </summary>
-    public List<DepotManifestInfo>? Depots { get; init; }
-}
-
-public class DepotManifestInfo
-{
-    public uint DepotId { get; init; }
-    public ulong ManifestId { get; init; }
-    public long TotalBytes { get; init; }
-}
-
-public class DownloadProgressInfo
-{
-    public uint AppId { get; init; }
-    public string AppName { get; init; } = string.Empty;
-    public long BytesDownloaded { get; init; }
-    public long TotalBytes { get; init; }
-    public double PercentComplete => TotalBytes > 0 ? (double)BytesDownloaded / TotalBytes * 100 : 0;
-    public double BytesPerSecond { get; init; }
-    public TimeSpan Elapsed { get; init; }
-}
-
-public enum AppDownloadResult
-{
-    Success,
-    AlreadyUpToDate,
-    Failed,
-    Skipped,
-    NoDepotsToDownload
-}
-
-public class PrefillSummary
-{
-    public int TotalApps { get; init; }
-    public int UpdatedApps { get; init; }
-    public int AlreadyUpToDate { get; init; }
-    public int FailedApps { get; init; }
-    public int UnownedApps { get; init; }
-    public long TotalBytesTransferred { get; init; }
-    public TimeSpan TotalTime { get; init; }
-}
 
 /// <summary>
 /// Default no-op implementation that discards all progress events
