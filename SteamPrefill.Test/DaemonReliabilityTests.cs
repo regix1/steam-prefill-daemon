@@ -1689,8 +1689,10 @@ public sealed class DaemonReliabilityTests
         var progress = new CallbackProgress();
         AppDownloadResult? appResult = null;
         progress.AppCompleted += (_, result) => appResult = result;
+        using var cache = new CacheListener(_ => HttpStatusCode.OK);
         var manager = new SteamManager(console, new DownloadArguments(), session, progress,
-            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler);
+            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler,
+            download: sink => new DownloadHandler(console, pool, new SocketsHttpHandler(), cache.Address, sink));
         var snapshot = new List<CachedDepotInput>
         {
             new()
