@@ -239,6 +239,63 @@ public sealed class DaemonReliabilityTests
         Assert.DoesNotContain("not-a-command", response.Error!, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task CacheStatusAppIdsFeatureValidatesCurrentAndLegacyRequests()
+    {
+        using var session = new Steam3Session(new TestConsole());
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(session, true);
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        typeof(SteamPrefillApi).GetField("_steamManager", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(api, new SteamManager(new TestConsole(), new DownloadArguments(), session));
+        typeof(SteamPrefillApi).GetField("_isInitialized", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(api, true);
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        typeof(SocketCommandInterface).GetField("_api", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(commands, api);
+
+        var status = Assert.IsType<StatusData>((await InvokeAsync(commands,
+            new CommandRequest { Id = "status-1", Type = "status" })).Data);
+        Assert.Contains("cacheStatusAppIds", status.Features);
+
+        var current = await InvokeAsync(commands, new CommandRequest
+        {
+            Id = "current-empty",
+            Type = "check-cache-status",
+            Parameters = new() { ["appIds"] = "[]", ["cachedDepots"] = "[]" }
+        });
+        Assert.True(current.Success);
+        Assert.Empty(Assert.IsType<CacheStatusResult>(current.Data).Apps);
+
+        var legacy = await InvokeAsync(commands, new CommandRequest
+        {
+            Id = "legacy-empty",
+            Type = "check-cache-status",
+            Parameters = new() { ["cachedDepots"] = "[]" }
+        });
+        Assert.True(legacy.Success);
+        Assert.Empty(Assert.IsType<CacheStatusResult>(legacy.Data).Apps);
+
+        foreach (var invalid in new[]
+        {
+            new Dictionary<string, string> { ["appIds"] = "null", ["cachedDepots"] = "[]" },
+            new Dictionary<string, string> { ["appIds"] = "{}", ["cachedDepots"] = "[]" },
+            new Dictionary<string, string> { ["appIds"] = "[]" },
+            new Dictionary<string, string> { ["appIds"] = "[]", ["cachedDepots"] = "null" },
+            new Dictionary<string, string> { ["appIds"] = "[]", ["cachedDepots"] = "{}" }
+        })
+        {
+            var response = await InvokeAsync(commands, new CommandRequest
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Type = "check-cache-status",
+                Parameters = invalid
+            });
+            Assert.False(response.Success);
+            Assert.Null(response.Data);
+        }
+    }
+
     [Theory]
     [InlineData("get-owned-games", false)]
     [InlineData("get-owned-games", true)]
@@ -1417,6 +1474,262 @@ public sealed class DaemonReliabilityTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => downloadTask);
         Assert.Equal(0, failureCount);
     }
+
+    [Fact]
+    public async Task CacheStatusUsesRequestedAppsAndGlobalPhysicalPairs()
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+
+        var app = new AppInfo(session, 222, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        var sharedDepot = new DepotInfo(new KeyValue("0"), 222) { DepotId = 100, ManifestId = 1000 };
+        var uniqueDepot = new DepotInfo(new KeyValue("0"), 222) { DepotId = 200, ManifestId = 2000 };
+        app.Depots.Add(sharedDepot);
+        app.Depots.Add(uniqueDepot);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(sharedDepot.DepotId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(uniqueDepot.DepotId);
+
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { app }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(app));
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manager = new SteamManager(console, new DownloadArguments(), session,
+            cdnPool: pool, appInfoHandler: apps.Object);
+        var cachedDepots = new List<CachedDepotInput>
+        {
+            new() { AppId = 111, DepotId = sharedDepot.DepotId, ManifestId = sharedDepot.ManifestId!.Value },
+            new() { AppId = 111, DepotId = sharedDepot.DepotId, ManifestId = sharedDepot.ManifestId!.Value },
+            new() { AppId = 444, DepotId = sharedDepot.DepotId, ManifestId = 999 },
+            new() { AppId = 333, DepotId = uniqueDepot.DepotId, ManifestId = uniqueDepot.ManifestId!.Value }
+        };
+
+        var result = await manager.CheckCacheStatusAsync(cachedDepots, appIds: new List<uint> { 222 });
+
+        var status = Assert.Single(result.Apps);
+        Assert.Equal(222U, status.AppId);
+        Assert.True(status.IsUpToDate);
+        Assert.Empty(status.OutdatedDepots);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CacheStatusReportsNoSingleHistoricalManifestWhenSeveralExist(bool reverse)
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        var depot = CreateCachedDepot();
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(depot.LicenseAppId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(depot.DepotId);
+        var app = new AppInfo(session, 222, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        app.Depots.Add(depot);
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { app }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(app));
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manager = new SteamManager(console, new DownloadArguments(), session,
+            cdnPool: pool, appInfoHandler: apps.Object);
+        var currentManifest = depot.ManifestId!.Value;
+        var manifests = reverse
+            ? new[] { currentManifest + 2, currentManifest + 1 }
+            : new[] { currentManifest + 1, currentManifest + 2 };
+        var cachedDepots = manifests.Select(manifest => new CachedDepotInput
+        {
+            AppId = 111,
+            DepotId = depot.DepotId,
+            ManifestId = manifest
+        }).ToList();
+
+        try
+        {
+            var emptyResult = await manager.CheckCacheStatusAsync(
+                new List<CachedDepotInput>(), appIds: new List<uint> { 222 });
+            Assert.False(Assert.Single(emptyResult.Apps).IsUpToDate);
+
+            var result = await manager.CheckCacheStatusAsync(cachedDepots, appIds: new List<uint> { 222 });
+            var status = Assert.Single(result.Apps);
+            Assert.False(status.IsUpToDate);
+            var outdated = Assert.Single(status.OutdatedDepots);
+            Assert.Equal(0UL, outdated.CachedManifest);
+            Assert.Equal(depot.ManifestId, outdated.CurrentManifest);
+        }
+        finally
+        {
+            File.Delete(depot.ManifestFileName);
+        }
+    }
+
+    [Fact]
+    public async Task SelectedStatusDistinguishesHistoryFromAnAuthoritativeSnapshot()
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        var depot = CreateCachedDepot();
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(depot.LicenseAppId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(depot.DepotId);
+        var app = new AppInfo(session, 222, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        app.Depots.Add(depot);
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { app }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(app));
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var depotHandler = new DepotHandler(session, apps.Object, new ManifestHandler(console, pool, session));
+        depotHandler.SetCachedManifests(new[] { (depot.DepotId, depot.ManifestId!.Value) });
+        var arguments = new DownloadArguments();
+        var manager = new SteamManager(console, arguments, session,
+            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler);
+
+        try
+        {
+            Assert.True(Assert.Single(await manager.GetSelectedAppsStatusAsync([222])).IsUpToDate);
+            Assert.False(Assert.Single(await manager.GetSelectedAppsStatusAsync(
+                [222], new List<CachedDepotInput>())).IsUpToDate);
+            var globalSnapshot = new List<CachedDepotInput>
+            {
+                new()
+                {
+                    AppId = 111,
+                    DepotId = depot.DepotId,
+                    ManifestId = depot.ManifestId.Value
+                }
+            };
+            Assert.True(Assert.Single(await manager.GetSelectedAppsStatusAsync(
+                [222], globalSnapshot)).IsUpToDate);
+            arguments.Force = true;
+            Assert.False(Assert.Single(await manager.GetSelectedAppsStatusAsync(
+                [222], globalSnapshot)).IsUpToDate);
+        }
+        finally
+        {
+            File.Delete(depot.ManifestFileName);
+        }
+    }
+
+    [Fact]
+    public async Task UnresolvedLinkedDepotPreventsCurrentStatusAndSuccessfulCommit()
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        var validDepot = CreateCachedDepot();
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(validDepot.LicenseAppId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(validDepot.DepotId);
+        var linkedDepot = new DepotInfo(new KeyValue("123")
+        {
+            Children = { new KeyValue("depotfromapp", "333") }
+        }, 222);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(linkedDepot.LicenseAppId);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(linkedDepot.ManifestRequestAppId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(linkedDepot.DepotId);
+        var app = new AppInfo(session, 222, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        app.Depots.Add(validDepot);
+        app.Depots.Add(linkedDepot);
+        var linkedApp = new AppInfo(session, 333, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { app }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns((uint appId, CancellationToken _) => Task.FromResult(appId == 333 ? linkedApp : app));
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var successPath = Path.Combine(Path.GetTempPath(), "linked-depot-" + Guid.NewGuid().ToString("N") + ".json");
+        var depotHandler = new DepotHandler(session, apps.Object,
+            new ManifestHandler(console, pool, session), successPath);
+        var progress = new CallbackProgress();
+        AppDownloadResult? appResult = null;
+        progress.AppCompleted += (_, result) => appResult = result;
+        var manager = new SteamManager(console, new DownloadArguments(), session, progress,
+            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler);
+        var snapshot = new List<CachedDepotInput>
+        {
+            new()
+            {
+                AppId = 111,
+                DepotId = validDepot.DepotId,
+                ManifestId = validDepot.ManifestId!.Value
+            }
+        };
+
+        try
+        {
+            Assert.False(Assert.Single(await manager.GetSelectedAppsStatusAsync([222], snapshot)).IsUpToDate);
+            Assert.False(Assert.Single((await manager.CheckCacheStatusAsync(
+                snapshot, appIds: new List<uint> { 222 })).Apps).IsUpToDate);
+
+            await manager.DownloadMultipleAppsAsync(
+                false,
+                false,
+                null,
+                false,
+                appIds: [222],
+                arguments: new DownloadArguments { Force = true });
+
+            Assert.Equal(AppDownloadResult.Failed, appResult);
+            Assert.False(depotHandler.AppIsUpToDate([validDepot]));
+            Assert.False(File.Exists(successPath));
+        }
+        finally
+        {
+            File.Delete(validDepot.ManifestFileName);
+            File.Delete(successPath);
+        }
+    }
+
+    private static Task<CommandResponse> InvokeAsync(SocketCommandInterface commands, CommandRequest request) =>
+        (Task<CommandResponse>)typeof(SocketCommandInterface)
+            .GetMethod("HandleCommandAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(commands, new object[] { request, CancellationToken.None })!;
 
     private static int GetFreeTcpPort()
     {

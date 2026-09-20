@@ -226,23 +226,18 @@ public sealed class SteamPrefillApi : IDisposable
     /// Checks cache status by comparing cached depot manifests against Steam's current manifests.
     /// This allows accurate detection of which apps are truly up-to-date even when daemon restarts.
     /// </summary>
-    public async Task<CacheStatusResult> CheckCacheStatusAsync(List<CachedDepotInput> cachedDepots, CancellationToken cancellationToken = default)
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Design", "CA1068", Justification = "Preserves existing positional cancellation callers.")]
+    public async Task<CacheStatusResult> CheckCacheStatusAsync(
+        List<CachedDepotInput> cachedDepots,
+        CancellationToken cancellationToken = default,
+        List<uint>? appIds = null)
     {
         ThrowIfNotInitialized();
         ThrowIfDisposed();
 
-        if (cachedDepots.Count == 0)
-        {
-            return new CacheStatusResult
-            {
-                Apps = new List<AppCacheStatus>(),
-                Message = "No cached depots provided"
-            };
-        }
-
         try
         {
-            return await _steamManager!.CheckCacheStatusAsync(cachedDepots, cancellationToken);
+            return await _steamManager!.CheckCacheStatusAsync(cachedDepots, cancellationToken, appIds);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

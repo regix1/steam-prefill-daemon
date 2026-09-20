@@ -82,7 +82,7 @@
         /// An depot will be considered up to date if it's current version (manifest) has been previously downloaded.
         /// Thus, an app will be considered up to date if all of it's depots latest manifests have been previously downloaded.
         /// </summary>
-        public bool AppIsUpToDate(List<DepotInfo> depots, IReadOnlyList<string> cachedDepots = null)
+        public bool AppIsUpToDate(List<DepotInfo> depots, IReadOnlyCollection<string> cachedDepots = null)
         {
             // A supplied manager snapshot replaces historical hints for this run without changing
             // another run's snapshot or the standalone client's completed-download history.

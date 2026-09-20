@@ -667,7 +667,7 @@ public sealed class SocketCommandInterface : IDisposable
                     Username = ready ? _api?.Username : null
                     ,
                     ProtocolVersion = PrefillProtocol.Version,
-                    Features = PrefillProtocol.Features,
+                    Features = [.. PrefillProtocol.Features, "cacheStatusAppIds"],
                     DaemonInstanceId = _protocol.DaemonInstanceId,
                     MaxConcurrentRuns = _protocol.MaxConcurrentRuns,
                     MaxConcurrentRequests = _protocol.MaxConcurrentRequests,
@@ -1212,6 +1212,35 @@ public sealed class SocketCommandInterface : IDisposable
     private async Task<CommandResponse> HandleCheckCacheStatusAsync(CommandRequest request, CancellationToken cancellationToken)
     {
         var api = EnsureLoggedIn();
+
+        if (request.Parameters?.ContainsKey("appIds") == true)
+        {
+            var appIdsJson = request.Parameters["appIds"];
+            if (!request.Parameters.TryGetValue("cachedDepots", out var currentCachedDepotsJson))
+            {
+                throw new JsonException("cachedDepots is required when appIds is supplied.");
+            }
+
+            var appIds = JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListUInt32)
+                ?? throw new JsonException("appIds must be a JSON array.");
+            var currentCachedDepots = JsonSerializer.Deserialize(
+                currentCachedDepotsJson,
+                DaemonSerializationContext.Default.ListCachedDepotInput)
+                ?? throw new JsonException("cachedDepots must be a JSON array.");
+            var currentStatus = await api.CheckCacheStatusAsync(
+                currentCachedDepots,
+                cancellationToken,
+                appIds);
+
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = true,
+                Data = currentStatus,
+                Message = currentStatus.Message,
+                CompletedAt = DateTime.UtcNow
+            };
+        }
 
         var cachedDepotsJson = request.Parameters?.GetValueOrDefault("cachedDepots");
         if (string.IsNullOrEmpty(cachedDepotsJson))

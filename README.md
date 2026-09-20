@@ -83,6 +83,24 @@ Managers that do not negotiate the complete protocol-v2 feature set use the
 legacy exclusive single-run behavior. Existing selection, status, and cancel
 commands remain available during mixed-version rollout.
 
+Steam cache-status clients can also negotiate the Steam-local
+`cacheStatusAppIds` feature. A manager that sees this feature sends requested
+app IDs separately from the complete physical depot/manifest snapshot. This
+keeps shared depots independent from the app that first recorded them. The
+feature does not change the common protocol version or other prefill providers.
+
+During a mixed-version rollout, use these compatibility rules:
+
+- A new manager with an old daemon reports the requested Steam apps as unknown
+  and does not send the unsupported cache-status command.
+- An old manager with a new daemon uses the legacy inferred-app request. It can
+  conservatively report an app as outdated when the manager omitted shared rows.
+- A new manager with a new daemon uses explicit app IDs and the global physical
+  snapshot.
+- An old manager with an old daemon keeps the legacy behavior.
+
+You can upgrade or roll back either component without a database migration.
+
 ## Support
 
 Questions or issues? [Open an issue](https://github.com/regix1/steam-prefill-daemon/issues),
