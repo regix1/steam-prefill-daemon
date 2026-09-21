@@ -1746,6 +1746,96 @@ public sealed class DaemonReliabilityTests
         Assert.Equal(CacheOutcome.Outdated, Assert.Single(snapshotWithoutPairs.Apps).Outcome);
     }
 
+    [Fact]
+    public async Task CacheStatusUsesRequestedOperatingSystems()
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+
+        var app = new AppInfo(session, 222, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        var windowsDepot = new DepotInfo(new KeyValue("0"), 222)
+        {
+            DepotId = 100,
+            ManifestId = 1000,
+            SupportedOperatingSystems = new List<SteamPrefill.Models.Enums.OperatingSystem>
+            {
+                SteamPrefill.Models.Enums.OperatingSystem.Windows
+            }
+        };
+        var linuxDepot = new DepotInfo(new KeyValue("0"), 222)
+        {
+            DepotId = 200,
+            ManifestId = 2000,
+            SupportedOperatingSystems = new List<SteamPrefill.Models.Enums.OperatingSystem>
+            {
+                SteamPrefill.Models.Enums.OperatingSystem.Linux
+            }
+        };
+        app.Depots.Add(windowsDepot);
+        app.Depots.Add(linuxDepot);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(windowsDepot.DepotId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(linuxDepot.DepotId);
+
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { app }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(app));
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manager = new SteamManager(
+            console,
+            new DownloadArguments
+            {
+                OperatingSystems = new List<SteamPrefill.Models.Enums.OperatingSystem>
+                {
+                    SteamPrefill.Models.Enums.OperatingSystem.Windows,
+                    SteamPrefill.Models.Enums.OperatingSystem.Linux
+                }
+            },
+            session,
+            cdnPool: pool,
+            appInfoHandler: apps.Object);
+        var cachedDepots = new List<CachedDepotInput>
+        {
+            new() { AppId = 222, DepotId = windowsDepot.DepotId, ManifestId = windowsDepot.ManifestId!.Value }
+        };
+        var scope = new List<CacheAppScope>
+        {
+            new() { AppId = 222, Authority = CacheAuthority.Snapshot }
+        };
+
+        var allPlatforms = await manager.CheckCacheStatusAsync(
+            cachedDepots,
+            appIds: new List<uint> { 222 },
+            scope: scope,
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+        var windows = await manager.CheckCacheStatusAsync(
+            cachedDepots,
+            appIds: new List<uint> { 222 },
+            scope: scope,
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2,
+            operatingSystems: new List<SteamPrefill.Models.Enums.OperatingSystem>
+            {
+                SteamPrefill.Models.Enums.OperatingSystem.Windows
+            });
+
+        Assert.Equal(CacheOutcome.Outdated, Assert.Single(allPlatforms.Apps).Outcome);
+        Assert.Equal(CacheOutcome.Current, Assert.Single(windows.Apps).Outcome);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

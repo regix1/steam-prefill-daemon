@@ -1184,23 +1184,9 @@ public sealed class SocketCommandInterface : IDisposable
     {
         var api = EnsureLoggedIn();
 
-        // Parse operating systems if provided
-        var osParam = request.Parameters?.GetValueOrDefault("os");
-        if (!string.IsNullOrEmpty(osParam))
-        {
-            var osList = new List<OperatingSystem>();
-            foreach (var os in osParam.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                if (OperatingSystem.TryFromValue(os.ToLowerInvariant(), out var operatingSystem))
-                {
-                    osList.Add(operatingSystem);
-                }
-            }
-            if (osList.Count > 0)
-            {
-                api.UpdateDownloadOptions(operatingSystems: osList);
-            }
-        }
+        var operatingSystems = ReadOperatingSystems(request);
+        if (operatingSystems.Count > 0)
+            api.UpdateDownloadOptions(operatingSystems: operatingSystems);
 
         // Parse optional cachedDepots
         List<CachedDepotInput>? cachedDepots = null;
@@ -1225,6 +1211,7 @@ public sealed class SocketCommandInterface : IDisposable
     private async Task<CommandResponse> HandleCheckCacheStatusAsync(CommandRequest request, CancellationToken cancellationToken)
     {
         var api = EnsureLoggedIn();
+        var operatingSystems = ReadOperatingSystems(request);
 
         if (request.Parameters?.TryGetValue("cacheStatusVersion", out var versionValue) == true)
         {
@@ -1294,7 +1281,8 @@ public sealed class SocketCommandInterface : IDisposable
                 appIds,
                 scope,
                 expiresAtUtc,
-                version);
+                version,
+                operatingSystems);
 
             return new CommandResponse
             {
@@ -1323,7 +1311,8 @@ public sealed class SocketCommandInterface : IDisposable
             var currentStatus = await api.CheckCacheStatusAsync(
                 currentCachedDepots,
                 cancellationToken,
-                appIds);
+                appIds,
+                operatingSystems: operatingSystems);
 
             return new CommandResponse
             {
@@ -1361,7 +1350,10 @@ public sealed class SocketCommandInterface : IDisposable
             };
         }
 
-        var status = await api.CheckCacheStatusAsync(cachedDepots, cancellationToken);
+        var status = await api.CheckCacheStatusAsync(
+            cachedDepots,
+            cancellationToken,
+            operatingSystems: operatingSystems);
 
         return new CommandResponse
         {
@@ -1371,6 +1363,19 @@ public sealed class SocketCommandInterface : IDisposable
             Message = status.Message,
             CompletedAt = DateTime.UtcNow
         };
+    }
+
+    private static List<OperatingSystem> ReadOperatingSystems(CommandRequest request)
+    {
+        var operatingSystems = new List<OperatingSystem>();
+        var value = request.Parameters?.GetValueOrDefault("os");
+        if (string.IsNullOrWhiteSpace(value)) return operatingSystems;
+        foreach (var name in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (OperatingSystem.TryFromValue(name.ToLowerInvariant(), out var operatingSystem))
+                operatingSystems.Add(operatingSystem);
+        }
+        return operatingSystems;
     }
 
     private async Task<CommandResponse> HandleShutdownAsync(CommandRequest request, CancellationToken cancellationToken)

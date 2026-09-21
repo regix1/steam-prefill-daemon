@@ -236,7 +236,8 @@ public sealed class SteamPrefillApi : IDisposable
         List<uint>? appIds = null,
         List<CacheAppScope>? scope = null,
         DateTimeOffset? expiresAtUtc = null,
-        int? version = null)
+        int? version = null,
+        IReadOnlyList<OperatingSystem>? operatingSystems = null)
     {
         ThrowIfNotInitialized();
         ThrowIfDisposed();
@@ -249,7 +250,8 @@ public sealed class SteamPrefillApi : IDisposable
                 appIds,
                 scope,
                 expiresAtUtc,
-                version);
+                version,
+                operatingSystems);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

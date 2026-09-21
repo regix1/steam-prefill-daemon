@@ -736,12 +736,24 @@
             List<uint>? appIds = null,
             List<CacheAppScope>? scope = null,
             DateTimeOffset? expiresAtUtc = null,
-            int? version = null)
+            int? version = null,
+            IReadOnlyList<OperatingSystem>? operatingSystems = null)
         {
             var requestedAppIds = (appIds ?? cachedDepots.Select(depot => depot.AppId)).Distinct().ToList();
             var versionTwo = version == 2;
             var statuses = new ConcurrentDictionary<uint, AppCacheStatus>();
             var deadlineReached = false;
+            var statusArguments = new DownloadArguments
+            {
+                Force = false,
+                MaxConcurrentRequests = _downloadArgs.MaxConcurrentRequests,
+                OperatingSystems = operatingSystems is { Count: > 0 }
+                    ? operatingSystems.ToList()
+                    : _downloadArgs.OperatingSystems.ToList(),
+                Architecture = _downloadArgs.Architecture,
+                Language = _downloadArgs.Language,
+                TransferSpeedUnit = _downloadArgs.TransferSpeedUnit
+            };
 
             AppCacheStatus Unknown(uint appId, string name, CacheReason reason) => new()
             {
@@ -879,7 +891,7 @@
                     try
                     {
                         var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
-                            _downloadArgs,
+                            statusArguments,
                             game.Depots,
                             loopToken);
                         loopToken.ThrowIfCancellationRequested();
