@@ -25,6 +25,7 @@ public sealed class SocketCommandInterface : IDisposable
     private readonly OwnedOperationCoordinator _prefillOperation;
     private readonly PrefillProtocol _protocol = PrefillProtocol.FromEnvironment(30, AppConfig.MaxConcurrencyOverride);
     private readonly RequestBudget _budget;
+    private readonly TimeProvider _clock;
     private readonly ItemClaims _claims = new();
     private readonly Dictionary<string, PrefillRun> _runs = new(StringComparer.Ordinal);
     private CancellationTokenSource? _loginCts;
@@ -61,7 +62,13 @@ public sealed class SocketCommandInterface : IDisposable
     };
 
     public SocketCommandInterface(string socketPath)
+        : this(socketPath, TimeProvider.System)
     {
+    }
+
+    internal SocketCommandInterface(string socketPath, TimeProvider clock)
+    {
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _prefillOperation = new OwnedOperationCoordinator(_protocol.MaxConcurrentRuns);
         _budget = new RequestBudget(_protocol.MaxConcurrentRequests);
         _progress = new SocketProgress(enableDebugLogs: AppConfig.DebugLogs);
@@ -75,7 +82,13 @@ public sealed class SocketCommandInterface : IDisposable
     }
 
     public SocketCommandInterface(int tcpPort)
+        : this(tcpPort, TimeProvider.System)
     {
+    }
+
+    internal SocketCommandInterface(int tcpPort, TimeProvider clock)
+    {
+        _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _prefillOperation = new OwnedOperationCoordinator(_protocol.MaxConcurrentRuns);
         _budget = new RequestBudget(_protocol.MaxConcurrentRequests);
         _progress = new SocketProgress(enableDebugLogs: AppConfig.DebugLogs);
@@ -224,7 +237,7 @@ public sealed class SocketCommandInterface : IDisposable
                 save();
             }
         }
-        api = new SteamPrefillApi(_authProvider, _progress, Commit);
+        api = new SteamPrefillApi(_authProvider, _progress, Commit, _clock);
         _api = api;
         api.AuthenticationLost += result => HandleAuthenticationLost(api, generation, result);
         if (username != null && token != null)
@@ -667,7 +680,7 @@ public sealed class SocketCommandInterface : IDisposable
                     Username = ready ? _api?.Username : null
                     ,
                     ProtocolVersion = PrefillProtocol.Version,
-                    Features = [.. PrefillProtocol.Features, "cacheStatusAppIds"],
+                    Features = [.. PrefillProtocol.Features, "cacheStatusAppIds", "cacheStatusV2"],
                     DaemonInstanceId = _protocol.DaemonInstanceId,
                     MaxConcurrentRuns = _protocol.MaxConcurrentRuns,
                     MaxConcurrentRequests = _protocol.MaxConcurrentRequests,
@@ -1212,6 +1225,86 @@ public sealed class SocketCommandInterface : IDisposable
     private async Task<CommandResponse> HandleCheckCacheStatusAsync(CommandRequest request, CancellationToken cancellationToken)
     {
         var api = EnsureLoggedIn();
+
+        if (request.Parameters?.TryGetValue("cacheStatusVersion", out var versionValue) == true)
+        {
+            if (!int.TryParse(
+                    versionValue,
+                    System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var version)
+                || version != 2)
+            {
+                throw new JsonException("cacheStatusVersion must be 2.");
+            }
+
+            if (!request.Parameters.TryGetValue("appIds", out var appIdsJson)
+                || !request.Parameters.TryGetValue("cachedDepots", out var currentCachedDepotsJson)
+                || !request.Parameters.TryGetValue("scope", out var scopeJson)
+                || !request.Parameters.TryGetValue("expiresAtUtc", out var expiresAtUtcValue))
+            {
+                throw new JsonException("Version 2 cache status fields are required.");
+            }
+
+            var appIds = JsonSerializer.Deserialize(appIdsJson, DaemonSerializationContext.Default.ListUInt32)
+                ?? throw new JsonException("appIds must be a JSON array.");
+            var currentCachedDepots = JsonSerializer.Deserialize(
+                currentCachedDepotsJson,
+                DaemonSerializationContext.Default.ListCachedDepotInput)
+                ?? throw new JsonException("cachedDepots must be a JSON array.");
+            using var scopeDocument = JsonDocument.Parse(scopeJson);
+            if (scopeDocument.RootElement.ValueKind != JsonValueKind.Array)
+                throw new JsonException("scope must be a JSON array.");
+            foreach (var item in scopeDocument.RootElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object
+                    || !item.TryGetProperty("authority", out var authorityElement)
+                    || authorityElement.ValueKind != JsonValueKind.String
+                    || authorityElement.GetString() is not ("Absent" or "Empty" or "Snapshot"))
+                {
+                    throw new JsonException("scope authority must be an exact cache authority name.");
+                }
+            }
+            var scope = JsonSerializer.Deserialize(scopeJson, DaemonSerializationContext.Default.ListCacheAppScope)
+                ?? throw new JsonException("scope must be a JSON array.");
+
+            if (appIds.Any(appId => appId == 0) || appIds.Distinct().Count() != appIds.Count)
+                throw new JsonException("appIds must contain distinct positive IDs.");
+            if (currentCachedDepots.Any(depot => depot.AppId == 0 || depot.DepotId == 0 || depot.ManifestId == 0))
+                throw new JsonException("cachedDepots contains an invalid ID.");
+            if (scope.Any(item => item.AppId == 0 || !item.Authority.HasValue)
+                || scope.Select(item => item.AppId).Distinct().Count() != scope.Count
+                || scope.Count != appIds.Count
+                || !scope.Select(item => item.AppId).ToHashSet().SetEquals(appIds))
+            {
+                throw new JsonException("scope must contain one authority for every requested app.");
+            }
+            if (!DateTimeOffset.TryParseExact(
+                    expiresAtUtcValue,
+                    "O",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind,
+                    out var expiresAtUtc))
+            {
+                throw new JsonException("expiresAtUtc must use round-trip ISO 8601 format.");
+            }
+            var currentStatus = await api.CheckCacheStatusAsync(
+                currentCachedDepots,
+                cancellationToken,
+                appIds,
+                scope,
+                expiresAtUtc,
+                version);
+
+            return new CommandResponse
+            {
+                Id = request.Id,
+                Success = true,
+                Data = currentStatus,
+                Message = currentStatus.Message,
+                CompletedAt = DateTime.UtcNow
+            };
+        }
 
         if (request.Parameters?.ContainsKey("appIds") == true)
         {

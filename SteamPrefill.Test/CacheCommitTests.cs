@@ -25,6 +25,15 @@ public sealed class CacheCommitTests
         Assert.False(handler.AppIsUpToDate(depots, new[] { "101:1", "102:3" }));
         Assert.True(handler.AppIsUpToDate(depots, new[] { "101:1", "102:2" }));
         Assert.True(handler.AppIsUpToDate(depots));
+        Assert.False(handler.AppIsUpToDate(new List<DepotInfo>()));
+
+        var missingManifest = new DepotInfo(new KeyValue("103"), 100);
+        var zeroManifest = new DepotInfo(new KeyValue("104"), 100) { ManifestId = 0 };
+        handler.SetCachedManifests(new[] { (103U, 3UL), (104U, 0UL) });
+        Assert.False(handler.AppIsUpToDate(new List<DepotInfo> { missingManifest }));
+        Assert.False(handler.AppIsUpToDate(new List<DepotInfo> { missingManifest }, new[] { "103:3" }));
+        Assert.False(handler.AppIsUpToDate(new List<DepotInfo> { zeroManifest }));
+        Assert.False(handler.AppIsUpToDate(new List<DepotInfo> { zeroManifest }, new[] { "104:0" }));
     }
 
     [Theory]

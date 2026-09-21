@@ -14,6 +14,7 @@ public sealed class SteamPrefillApi : IDisposable
     private readonly ISteamAuthProvider _authProvider;
     private readonly IPrefillProgress _progress;
     private readonly Action<Action>? _commitCredentials;
+    private readonly TimeProvider _clock;
     public event Action<EResult?>? AuthenticationLost;
 
     private SteamManager? _steamManager;
@@ -32,11 +33,13 @@ public sealed class SteamPrefillApi : IDisposable
     public SteamPrefillApi(
         ISteamAuthProvider authProvider,
         IPrefillProgress? progress = null,
-        Action<Action>? commitCredentials = null)
+        Action<Action>? commitCredentials = null,
+        TimeProvider? clock = null)
     {
         _authProvider = authProvider ?? throw new ArgumentNullException(nameof(authProvider));
         _progress = progress ?? NullProgress.Instance;
         _commitCredentials = commitCredentials;
+        _clock = clock ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -81,7 +84,7 @@ public sealed class SteamPrefillApi : IDisposable
                 OperatingSystems = new List<OperatingSystem> { OperatingSystem.Windows, OperatingSystem.Linux, OperatingSystem.MacOS }
             };
 
-            var manager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress, _commitCredentials);
+            var manager = new SteamManager(consoleAdapter, downloadArgs, _authProvider, _progress, _commitCredentials, _clock);
             lock (_sync)
             {
                 if (_isDisposed)
@@ -230,14 +233,23 @@ public sealed class SteamPrefillApi : IDisposable
     public async Task<CacheStatusResult> CheckCacheStatusAsync(
         List<CachedDepotInput> cachedDepots,
         CancellationToken cancellationToken = default,
-        List<uint>? appIds = null)
+        List<uint>? appIds = null,
+        List<CacheAppScope>? scope = null,
+        DateTimeOffset? expiresAtUtc = null,
+        int? version = null)
     {
         ThrowIfNotInitialized();
         ThrowIfDisposed();
 
         try
         {
-            return await _steamManager!.CheckCacheStatusAsync(cachedDepots, cancellationToken, appIds);
+            return await _steamManager!.CheckCacheStatusAsync(
+                cachedDepots,
+                cancellationToken,
+                appIds,
+                scope,
+                expiresAtUtc,
+                version);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {

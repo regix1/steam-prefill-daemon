@@ -164,6 +164,7 @@ namespace SteamPrefill.Api
     /// </summary>
     public class CacheStatusResult
     {
+        public int? Version { get; init; }
         public List<AppCacheStatus> Apps { get; init; } = new();
         public string? Message { get; init; }
     }
@@ -176,6 +177,8 @@ namespace SteamPrefill.Api
         public uint AppId { get; init; }
         public string Name { get; init; } = "";
         public bool IsUpToDate { get; init; }
+        public CacheOutcome? Outcome { get; init; }
+        public CacheReason? Reason { get; init; }
         public long DownloadSize { get; init; }
         public List<OutdatedDepot> OutdatedDepots { get; init; } = new();
     }

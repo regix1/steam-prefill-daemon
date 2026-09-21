@@ -14,6 +14,7 @@
         private readonly SemaphoreSlim _preparation = new(1, 1);
         private readonly DepotHandler _depotHandler;
         private readonly AppInfoHandler _appInfoHandler;
+        private readonly TimeProvider _clock;
 
         // Replaced at the start of every prefill rather than created once. In daemon mode one manager
         // serves many prefill commands, so a single instance accumulated across all of them: the
@@ -36,8 +37,8 @@
             remove => _steam3.AuthenticationLost -= value;
         }
 
-        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null, Action<Action>? commitCredentials = null)
-            : this(ansiConsole, downloadArgs, new Steam3Session(ansiConsole, authProvider, commitCredentials), progress)
+        public SteamManager(IAnsiConsole ansiConsole, DownloadArguments downloadArgs, ISteamAuthProvider? authProvider = null, IPrefillProgress? progress = null, Action<Action>? commitCredentials = null, TimeProvider? clock = null)
+            : this(ansiConsole, downloadArgs, new Steam3Session(ansiConsole, authProvider, commitCredentials), progress, clock: clock)
         {
         }
 
@@ -53,7 +54,8 @@
             CdnPool cdnPool = null,
             AppInfoHandler appInfoHandler = null,
             DepotHandler depotHandler = null,
-            Func<IPrefillProgress, DownloadHandler> download = null)
+            Func<IPrefillProgress, DownloadHandler> download = null,
+            TimeProvider? clock = null)
         {
             _ansiConsole = ansiConsole;
             _downloadArgs = downloadArgs;
@@ -74,6 +76,7 @@
             _appInfoHandler = appInfoHandler ?? new AppInfoHandler(_ansiConsole, _steam3, _steam3.LicenseManager);
             _download = download ?? (sink => new DownloadHandler(_ansiConsole, _cdnPool, sink));
             _depotHandler = depotHandler ?? new DepotHandler(_ansiConsole, _steam3, _appInfoHandler, _cdnPool);
+            _clock = clock ?? TimeProvider.System;
         }
 
         #region Startup + Shutdown
@@ -730,21 +733,105 @@
         public async Task<CacheStatusResult> CheckCacheStatusAsync(
             List<CachedDepotInput> cachedDepots,
             CancellationToken cancellationToken = default,
-            List<uint>? appIds = null)
+            List<uint>? appIds = null,
+            List<CacheAppScope>? scope = null,
+            DateTimeOffset? expiresAtUtc = null,
+            int? version = null)
         {
-            await _preparation.WaitAsync(cancellationToken);
-            try
+            var requestedAppIds = (appIds ?? cachedDepots.Select(depot => depot.AppId)).Distinct().ToList();
+            var versionTwo = version == 2;
+            var statuses = new ConcurrentDictionary<uint, AppCacheStatus>();
+            var deadlineReached = false;
+
+            AppCacheStatus Unknown(uint appId, string name, CacheReason reason) => new()
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var requestedAppIds = appIds ?? cachedDepots.Select(depot => depot.AppId).Distinct().ToList();
-                if (requestedAppIds.Count == 0)
+                AppId = appId,
+                Name = name,
+                IsUpToDate = false,
+                Outcome = CacheOutcome.Unknown,
+                Reason = reason,
+                DownloadSize = 0,
+                OutdatedDepots = new List<OutdatedDepot>()
+            };
+
+            CacheStatusResult BuildResult()
+            {
+                if (versionTwo)
                 {
+                    foreach (var appId in requestedAppIds)
+                    {
+                        statuses.TryAdd(appId, Unknown(
+                            appId,
+                            "",
+                            deadlineReached ? CacheReason.DeadlineReached : CacheReason.InvalidResult));
+                    }
+
+                    var ordered = requestedAppIds.Select(appId => statuses[appId]).ToList();
                     return new CacheStatusResult
+                    {
+                        Version = 2,
+                        Apps = ordered,
+                        Message = null
+                    };
+                }
+
+                var legacy = statuses.Values
+                    .Where(status => status.Outcome != CacheOutcome.Unknown)
+                    .OrderBy(status => status.Name)
+                    .Select(status => new AppCacheStatus
+                    {
+                        AppId = status.AppId,
+                        Name = status.Name,
+                        IsUpToDate = status.IsUpToDate,
+                        DownloadSize = status.DownloadSize,
+                        OutdatedDepots = status.OutdatedDepots
+                    })
+                    .ToList();
+                var upToDate = legacy.Count(status => status.IsUpToDate);
+                var needsUpdate = legacy.Count - upToDate;
+                var totalDownloadSize = ByteSize.FromBytes(legacy.Sum(status => status.DownloadSize));
+                return new CacheStatusResult
+                {
+                    Apps = legacy,
+                    Message = $"{upToDate} apps up-to-date, {needsUpdate} need updates ({totalDownloadSize.ToDecimalString()} to download)"
+                };
+            }
+
+            if (requestedAppIds.Count == 0)
+            {
+                return versionTwo
+                    ? BuildResult()
+                    : new CacheStatusResult
                     {
                         Apps = new List<AppCacheStatus>(),
                         Message = "No cached depots provided"
                     };
+            }
+
+            TimeSpan? reserveDelay = null;
+            if (expiresAtUtc.HasValue)
+            {
+                reserveDelay = expiresAtUtc.Value - _clock.GetUtcNow() - TimeSpan.FromSeconds(2);
+                if (reserveDelay <= TimeSpan.Zero)
+                {
+                    deadlineReached = true;
+                    return BuildResult();
                 }
+            }
+
+            using var reserveCancellation = reserveDelay.HasValue
+                ? new CancellationTokenSource(reserveDelay.Value, _clock)
+                : null;
+            using var inspectionCancellation = reserveCancellation != null
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, reserveCancellation.Token)
+                : null;
+            var inspectionToken = inspectionCancellation?.Token ?? cancellationToken;
+            var preparationHeld = false;
+            try
+            {
+                await _preparation.WaitAsync(inspectionToken);
+                preparationHeld = true;
+                inspectionToken.ThrowIfCancellationRequested();
 
                 var cachedManifests = cachedDepots
                     .Select(depot => $"{depot.DepotId}:{depot.ManifestId}")
@@ -758,86 +845,127 @@
                 _appInfoHandler.InvalidateApps(requestedAppIds);
                 await _appInfoHandler.RetrieveAppMetadataAsync(
                     requestedAppIds,
-                    cancellationToken: cancellationToken);
-                await _cdnPool.PopulateAvailableServersAsync(cancellationToken);
+                    cancellationToken: inspectionToken);
+                if (!versionTwo)
+                    await _cdnPool.PopulateAvailableServersAsync(inspectionToken);
 
-                var appStatuses = new ConcurrentBag<AppCacheStatus>();
-                var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(requestedAppIds, cancellationToken);
+                var availableGames = await _appInfoHandler.GetAvailableGamesByIdAsync(requestedAppIds, inspectionToken);
+                var gamesById = availableGames
+                    .GroupBy(app => app.AppId)
+                    .ToDictionary(group => group.Key, group => group.First());
+                var authorityByApp = versionTwo
+                    ? scope!.ToDictionary(item => item.AppId, item => item.Authority!.Value)
+                    : null;
 
-                _ansiConsole.LogMarkupVerbose($"Checking cache status for {Magenta(availableGames.Count)} available games");
-
-                // Build OS names string for error messages
-                var selectedOsNames = string.Join(", ", _downloadArgs.OperatingSystems.Select(os => os.Name));
+                _ansiConsole.LogMarkupVerbose($"Checking cache status for {Magenta(availableGames.Count)} available games out of {Magenta(requestedAppIds.Count)} requested");
 
                 await Parallel.ForEachAsync(
-                    availableGames,
+                    requestedAppIds,
                     new ParallelOptions
                     {
                         MaxDegreeOfParallelism = 5,
-                        CancellationToken = cancellationToken
+                        CancellationToken = inspectionToken
                     },
                     async (app, loopToken) =>
                 {
+                    loopToken.ThrowIfCancellationRequested();
+                    if (!gamesById.TryGetValue(app, out var game))
+                    {
+                        if (versionTwo)
+                            statuses.TryAdd(app, Unknown(app, "", CacheReason.MissingApp));
+                        return;
+                    }
+
                     try
                     {
                         var filteredDepots = await _depotHandler.FilterDepotsToDownloadAsync(
                             _downloadArgs,
-                            app.Depots,
+                            game.Depots,
                             loopToken);
+                        loopToken.ThrowIfCancellationRequested();
 
                         // Check if game has no depots for the selected OS
-                        if (filteredDepots.Count == 0 && app.Depots.Count > 0)
+                        if (filteredDepots.Count == 0 && game.Depots.Count > 0)
                         {
-                            appStatuses.Add(new AppCacheStatus
-                            {
-                                AppId = app.AppId,
-                                Name = app.Name,
-                                DownloadSize = 0,
-                                IsUpToDate = false,
-                                OutdatedDepots = new List<OutdatedDepot>()
-                            });
+                            if (versionTwo)
+                                statuses.TryAdd(app, Unknown(app, game.Name, CacheReason.UnsupportedOs));
+                            return;
+                        }
+
+                        if (filteredDepots.Count == 0)
+                        {
+                            if (versionTwo)
+                                statuses.TryAdd(app, Unknown(app, game.Name, CacheReason.NoContent));
                             return;
                         }
 
                         var requiredDepotCount = filteredDepots.Count;
                         await _depotHandler.BuildLinkedDepotInfoAsync(filteredDepots, loopToken);
-                        var linkedDepotsResolved = filteredDepots.Count == requiredDepotCount;
-                        if (filteredDepots.Count == 0)
+                        loopToken.ThrowIfCancellationRequested();
+                        if (filteredDepots.Count != requiredDepotCount)
                         {
-                            appStatuses.Add(new AppCacheStatus
-                            {
-                                AppId = app.AppId,
-                                Name = app.Name,
-                                DownloadSize = 0,
-                                IsUpToDate = false,
-                                OutdatedDepots = new List<OutdatedDepot>()
-                            });
+                            if (versionTwo)
+                                statuses.TryAdd(app, Unknown(app, game.Name, CacheReason.LinkedDepotUnavailable));
                             return;
                         }
 
-                        // Compare each depot's current manifest against cached manifest
-                        var outdatedDepots = new List<OutdatedDepot>();
-                        long downloadSize = 0;
-
-                        foreach (var depot in filteredDepots)
+                        if (filteredDepots.Any(depot => !depot.ManifestId.HasValue || depot.ManifestId.Value == 0))
                         {
-                            var currentManifest = depot.ManifestId.Value;
-                            var hasCached = cachedManifests.Contains($"{depot.DepotId}:{currentManifest}");
+                            if (versionTwo)
+                                statuses.TryAdd(app, Unknown(app, game.Name, CacheReason.ManifestUnavailable));
+                            return;
+                        }
 
-                            if (!hasCached)
+                        var authority = versionTwo ? authorityByApp![app] : CacheAuthority.Snapshot;
+                        IReadOnlyCollection<string> suppliedPairs = authority == CacheAuthority.Empty
+                            ? Array.Empty<string>()
+                            : cachedManifests;
+                        var suppliedPairsMatch = _depotHandler.AppIsUpToDate(filteredDepots, suppliedPairs);
+                        CacheOutcome outcome;
+                        CacheReason? reason = null;
+                        if (authority == CacheAuthority.Absent)
+                        {
+                            if (suppliedPairsMatch || _depotHandler.AppIsUpToDate(filteredDepots))
+                                outcome = CacheOutcome.Current;
+                            else
                             {
-                                var storedManifests = cachedByDepot.GetValueOrDefault(depot.DepotId);
-                                outdatedDepots.Add(new OutdatedDepot
+                                outcome = CacheOutcome.Unknown;
+                                reason = CacheReason.NoCacheEvidence;
+                            }
+                        }
+                        else
+                        {
+                            outcome = suppliedPairsMatch ? CacheOutcome.Current : CacheOutcome.Outdated;
+                        }
+
+                        if (outcome == CacheOutcome.Unknown)
+                        {
+                            if (versionTwo)
+                                statuses.TryAdd(app, Unknown(app, game.Name, reason!.Value));
+                            return;
+                        }
+
+                        var outdatedDepots = new List<OutdatedDepot>();
+                        if (outcome == CacheOutcome.Outdated)
+                        {
+                            foreach (var depot in filteredDepots)
+                            {
+                                var currentManifest = depot.ManifestId!.Value;
+                                if (!cachedManifests.Contains($"{depot.DepotId}:{currentManifest}"))
                                 {
-                                    DepotId = depot.DepotId,
-                                    CachedManifest = storedManifests is { Length: 1 } ? storedManifests[0] : 0,
-                                    CurrentManifest = currentManifest
-                                });
+                                    var storedManifests = cachedByDepot.GetValueOrDefault(depot.DepotId);
+                                    outdatedDepots.Add(new OutdatedDepot
+                                    {
+                                        DepotId = depot.DepotId,
+                                        CachedManifest = storedManifests is { Length: 1 } ? storedManifests[0] : 0,
+                                        CurrentManifest = currentManifest
+                                    });
+                                }
                             }
                         }
 
-                        // If any depot is outdated, calculate download size for outdated depots
-                        if (outdatedDepots.Count > 0)
+                        long downloadSize = 0;
+                        if (!versionTwo && outdatedDepots.Count > 0)
                         {
                             var outdatedDepotIds = outdatedDepots.Select(d => d.DepotId).ToHashSet();
                             var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
@@ -850,20 +978,22 @@
                             // letting the total quietly come up short
                             if (skippedDepots.Any())
                             {
-                                _ansiConsole.LogMarkupError($"Could not size {skippedDepots.Count} depots for {app.Name} ({app.AppId}), the download size is incomplete");
+                                _ansiConsole.LogMarkupError($"Could not size {skippedDepots.Count} depots for {game.Name} ({game.AppId}), the download size is incomplete");
                             }
                         }
 
-                        appStatuses.Add(new AppCacheStatus
+                        loopToken.ThrowIfCancellationRequested();
+                        statuses.TryAdd(app, new AppCacheStatus
                         {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            IsUpToDate = linkedDepotsResolved && outdatedDepots.Count == 0,
+                            AppId = app,
+                            Name = game.Name,
+                            IsUpToDate = outcome == CacheOutcome.Current,
+                            Outcome = outcome,
                             DownloadSize = downloadSize,
                             OutdatedDepots = outdatedDepots
                         });
                     }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    catch (OperationCanceledException) when (loopToken.IsCancellationRequested)
                     {
                         throw;
                     }
@@ -873,31 +1003,25 @@
                     }
                     catch (Exception ex)
                     {
-                        _ansiConsole.LogMarkupError($"Failed to check cache status for {app.Name} ({app.AppId}): {ex.Message}");
-                        FileLogger.LogException($"Failed to check cache status for {app.Name}", ex);
-
-                        appStatuses.Add(new AppCacheStatus
-                        {
-                            AppId = app.AppId,
-                            Name = app.Name,
-                            DownloadSize = 0,
-                            IsUpToDate = false,
-                            OutdatedDepots = new List<OutdatedDepot>()
-                        });
+                        _ansiConsole.LogMarkupError($"Failed to check cache status for {game.Name} ({game.AppId})");
+                        FileLogger.LogException($"Failed to check cache status for {game.Name}", ex);
+                        if (versionTwo)
+                            statuses.TryAdd(app, Unknown(app, game.Name, CacheReason.InspectionFailed));
                     }
                 });
-
-                var upToDateCount = appStatuses.Count(a => a.IsUpToDate);
-                var needsUpdateCount = appStatuses.Count - upToDateCount;
-                var totalDownloadSize = ByteSize.FromBytes(appStatuses.Sum(a => a.DownloadSize));
-
-                return new CacheStatusResult
-                {
-                    Apps = appStatuses.OrderBy(a => a.Name).ToList(),
-                    Message = $"{upToDateCount} apps up-to-date, {needsUpdateCount} need updates ({totalDownloadSize.ToDecimalString()} to download)"
-                };
             }
-            finally { _preparation.Release(); }
+            catch (OperationCanceledException) when (reserveCancellation?.IsCancellationRequested == true
+                && !cancellationToken.IsCancellationRequested)
+            {
+                deadlineReached = true;
+            }
+            finally
+            {
+                if (preparationHeld)
+                    _preparation.Release();
+            }
+
+            return BuildResult();
         }
 
         #endregion

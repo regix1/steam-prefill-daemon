@@ -242,21 +242,88 @@ public sealed class DaemonReliabilityTests
     [Fact]
     public async Task CacheStatusAppIdsFeatureValidatesCurrentAndLegacyRequests()
     {
+        var clock = new CacheStatusClock(new DateTimeOffset(2026, 9, 21, 0, 0, 0, TimeSpan.Zero));
         using var session = new Steam3Session(new TestConsole());
         typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(session, true);
-        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        var apps = new Mock<AppInfoHandler>(new TestConsole(), session, session.LicenseManager);
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"), clock: clock);
         typeof(SteamPrefillApi).GetField("_steamManager", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .SetValue(api, new SteamManager(new TestConsole(), new DownloadArguments(), session));
+            .SetValue(api, new SteamManager(
+                new TestConsole(),
+                new DownloadArguments(),
+                session,
+                appInfoHandler: apps.Object,
+                clock: clock));
         typeof(SteamPrefillApi).GetField("_isInitialized", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(api, true);
-        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        using var commands = new SocketCommandInterface(GetFreeTcpPort(), clock);
         typeof(SocketCommandInterface).GetField("_api", BindingFlags.Instance | BindingFlags.NonPublic)!
             .SetValue(commands, api);
 
         var status = Assert.IsType<StatusData>((await InvokeAsync(commands,
             new CommandRequest { Id = "status-1", Type = "status" })).Data);
         Assert.Contains("cacheStatusAppIds", status.Features);
+        Assert.Contains("cacheStatusV2", status.Features);
+
+        var versionTwo = await InvokeAsync(commands, new CommandRequest
+        {
+            Id = "v2-empty",
+            Type = "check-cache-status",
+            Parameters = new()
+            {
+                ["cacheStatusVersion"] = "2",
+                ["appIds"] = "[]",
+                ["cachedDepots"] = "[]",
+                ["scope"] = "[]",
+                ["expiresAtUtc"] = clock.GetUtcNow().AddMinutes(1).ToString("O")
+            }
+        });
+        Assert.True(versionTwo.Success);
+        var versionTwoResult = Assert.IsType<CacheStatusResult>(versionTwo.Data);
+        Assert.Equal(2, versionTwoResult.Version);
+        Assert.Empty(versionTwoResult.Apps);
+        Assert.Null(versionTwoResult.Message);
+
+        var serialized = JsonSerializer.Serialize(new CacheStatusResult
+        {
+            Version = 2,
+            Apps = new List<AppCacheStatus>
+            {
+                new()
+                {
+                    AppId = 1,
+                    Outcome = CacheOutcome.Unknown,
+                    Reason = CacheReason.NoCacheEvidence
+                }
+            }
+        }, DaemonSerializationContext.Default.CacheStatusResult);
+        using var document = JsonDocument.Parse(serialized);
+        var serializedStatus = document.RootElement.GetProperty("apps")[0];
+        Assert.Equal("Unknown", serializedStatus.GetProperty("outcome").GetString());
+        Assert.Equal("NoCacheEvidence", serializedStatus.GetProperty("reason").GetString());
+
+        var expired = await InvokeAsync(commands, new CommandRequest
+        {
+            Id = "v2-expired",
+            Type = "check-cache-status",
+            Parameters = new()
+            {
+                ["cacheStatusVersion"] = "2",
+                ["appIds"] = "[1]",
+                ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":1,\"authority\":\"Empty\"}]",
+                ["expiresAtUtc"] = clock.GetUtcNow().AddSeconds(-1).ToString("O")
+            }
+        });
+        Assert.True(expired.Success);
+        var expiredResult = Assert.IsType<CacheStatusResult>(expired.Data);
+        Assert.Null(expiredResult.Message);
+        var expiredStatus = Assert.Single(expiredResult.Apps);
+        Assert.Equal(CacheOutcome.Unknown, expiredStatus.Outcome);
+        Assert.Equal(CacheReason.DeadlineReached, expiredStatus.Reason);
+        apps.Verify(handler => handler.RetrieveAppMetadataAsync(
+            It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.Never);
 
         var current = await InvokeAsync(commands, new CommandRequest
         {
@@ -283,6 +350,66 @@ public sealed class DaemonReliabilityTests
             new Dictionary<string, string> { ["appIds"] = "[]" },
             new Dictionary<string, string> { ["appIds"] = "[]", ["cachedDepots"] = "null" },
             new Dictionary<string, string> { ["appIds"] = "[]", ["cachedDepots"] = "{}" }
+        })
+        {
+            var response = await InvokeAsync(commands, new CommandRequest
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Type = "check-cache-status",
+                Parameters = invalid
+            });
+            Assert.False(response.Success);
+            Assert.Null(response.Data);
+        }
+
+        var future = clock.GetUtcNow().AddMinutes(1).ToString("O");
+        foreach (var invalid in new[]
+        {
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "1", ["appIds"] = "[]", ["cachedDepots"] = "[]",
+                ["scope"] = "[]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[1,1]", ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":1,\"authority\":\"Empty\"}]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[1]", ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":1}]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[1]", ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":1,\"authority\":1}]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[1]", ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":1,\"authority\":\"empty\"}]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[1]", ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":2,\"authority\":\"Empty\"}]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[0]", ["cachedDepots"] = "[]",
+                ["scope"] = "[{\"appId\":0,\"authority\":\"Empty\"}]", ["expiresAtUtc"] = future
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[]", ["cachedDepots"] = "[]",
+                ["scope"] = "[]", ["expiresAtUtc"] = "not-a-date"
+            },
+            new Dictionary<string, string>
+            {
+                ["cacheStatusVersion"] = "2", ["appIds"] = "[]", ["cachedDepots"] = "[]",
+                ["scope"] = "{}", ["expiresAtUtc"] = future
+            }
         })
         {
             var response = await InvokeAsync(commands, new CommandRequest
@@ -1506,8 +1633,9 @@ public sealed class DaemonReliabilityTests
             .Returns(Task.FromResult(app));
         var pool = new CdnPool(console,
             new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var depotHandler = new DepotHandler(session, apps.Object, new ManifestHandler(console, pool, session));
         var manager = new SteamManager(console, new DownloadArguments(), session,
-            cdnPool: pool, appInfoHandler: apps.Object);
+            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler);
         var cachedDepots = new List<CachedDepotInput>
         {
             new() { AppId = 111, DepotId = sharedDepot.DepotId, ManifestId = sharedDepot.ManifestId!.Value },
@@ -1516,12 +1644,106 @@ public sealed class DaemonReliabilityTests
             new() { AppId = 333, DepotId = uniqueDepot.DepotId, ManifestId = uniqueDepot.ManifestId!.Value }
         };
 
-        var result = await manager.CheckCacheStatusAsync(cachedDepots, appIds: new List<uint> { 222 });
+        var legacy = await manager.CheckCacheStatusAsync(cachedDepots, appIds: new List<uint> { 222 });
+        var legacyStatus = Assert.Single(legacy.Apps);
+        Assert.True(legacyStatus.IsUpToDate);
+        Assert.Null(legacyStatus.Outcome);
+        Assert.Null(legacyStatus.Reason);
+        Assert.NotNull(legacy.Message);
+        Assert.Contains("1 apps up-to-date, 0 need updates", legacy.Message, StringComparison.Ordinal);
+
+        var result = await manager.CheckCacheStatusAsync(
+            cachedDepots,
+            appIds: new List<uint> { 222 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 222, Authority = CacheAuthority.Snapshot }
+            },
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
 
         var status = Assert.Single(result.Apps);
         Assert.Equal(222U, status.AppId);
         Assert.True(status.IsUpToDate);
+        Assert.Equal(CacheOutcome.Current, status.Outcome);
+        Assert.Null(status.Reason);
+        Assert.Equal(0, status.DownloadSize);
         Assert.Empty(status.OutdatedDepots);
+        Assert.Null(result.Message);
+
+        var absentPairs = await manager.CheckCacheStatusAsync(
+            cachedDepots,
+            appIds: new List<uint> { 222 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 222, Authority = CacheAuthority.Absent }
+            },
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+        Assert.Equal(CacheOutcome.Current, Assert.Single(absentPairs.Apps).Outcome);
+
+        foreach (var authority in new[] { CacheAuthority.Snapshot, CacheAuthority.Empty })
+        {
+            var outdated = await manager.CheckCacheStatusAsync(
+                new List<CachedDepotInput>(),
+                appIds: new List<uint> { 222 },
+                scope: new List<CacheAppScope> { new() { AppId = 222, Authority = authority } },
+                expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+                version: 2);
+            var outdatedStatus = Assert.Single(outdated.Apps);
+            Assert.Equal(CacheOutcome.Outdated, outdatedStatus.Outcome);
+            Assert.Null(outdatedStatus.Reason);
+            Assert.Equal(2, outdatedStatus.OutdatedDepots.Count);
+        }
+
+        var absent = await manager.CheckCacheStatusAsync(
+            new List<CachedDepotInput>(),
+            appIds: new List<uint> { 222 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 222, Authority = CacheAuthority.Absent }
+            },
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+        Assert.Equal(CacheReason.NoCacheEvidence, Assert.Single(absent.Apps).Reason);
+
+        depotHandler.SetCachedManifests(new[]
+        {
+            (sharedDepot.DepotId, sharedDepot.ManifestId!.Value),
+            (uniqueDepot.DepotId, uniqueDepot.ManifestId!.Value)
+        });
+        var history = await manager.CheckCacheStatusAsync(
+            new List<CachedDepotInput>(),
+            appIds: new List<uint> { 222 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 222, Authority = CacheAuthority.Absent }
+            },
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+        Assert.Equal(CacheOutcome.Current, Assert.Single(history.Apps).Outcome);
+
+        var emptyWithEvidence = await manager.CheckCacheStatusAsync(
+            cachedDepots,
+            appIds: new List<uint> { 222 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 222, Authority = CacheAuthority.Empty }
+            },
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+        Assert.Equal(CacheOutcome.Outdated, Assert.Single(emptyWithEvidence.Apps).Outcome);
+
+        var snapshotWithoutPairs = await manager.CheckCacheStatusAsync(
+            new List<CachedDepotInput>(),
+            appIds: new List<uint> { 222 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 222, Authority = CacheAuthority.Snapshot }
+            },
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+        Assert.Equal(CacheOutcome.Outdated, Assert.Single(snapshotWithoutPairs.Apps).Outcome);
     }
 
     [Theory]
@@ -1553,8 +1775,10 @@ public sealed class DaemonReliabilityTests
             .Returns(Task.FromResult(app));
         var pool = new CdnPool(console,
             new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var depotHandler = new DepotHandler(session, apps.Object, new ManifestHandler(console, pool, session));
+        depotHandler.SetCachedManifests(new[] { (depot.DepotId, depot.ManifestId!.Value) });
         var manager = new SteamManager(console, new DownloadArguments(), session,
-            cdnPool: pool, appInfoHandler: apps.Object);
+            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler);
         var currentManifest = depot.ManifestId!.Value;
         var manifests = reverse
             ? new[] { currentManifest + 2, currentManifest + 1 }
@@ -1645,6 +1869,185 @@ public sealed class DaemonReliabilityTests
     }
 
     [Fact]
+    public async Task CacheStatusVersionTwoReturnsEveryRequestedAppWithExactUnknownReasons()
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+
+        AppInfo CreateApp(uint appId)
+        {
+            session.LicenseManager._userLicenses.OwnedAppIds.Add(appId);
+            return new AppInfo(session, appId, new KeyValue
+            {
+                Children =
+                {
+                    new KeyValue("common")
+                    {
+                        Children =
+                        {
+                            new KeyValue("type", "game"),
+                            new KeyValue("name", $"App {appId}")
+                        }
+                    }
+                }
+            });
+        }
+
+        DepotInfo AddDepot(AppInfo app, uint depotId, ulong manifestId)
+        {
+            var depot = new DepotInfo(new KeyValue("0"), app.AppId)
+            {
+                DepotId = depotId,
+                ManifestId = manifestId
+            };
+            app.Depots.Add(depot);
+            session.LicenseManager._userLicenses.OwnedDepotIds.Add(depotId);
+            return depot;
+        }
+
+        var noContent = CreateApp(101);
+        var unsupported = CreateApp(102);
+        var unsupportedDepot = AddDepot(unsupported, 1002, 2002);
+        unsupportedDepot.SupportedOperatingSystems.Add(SteamPrefill.Models.Enums.OperatingSystem.Windows);
+        var missingManifest = CreateApp(103);
+        AddDepot(missingManifest, 1003, 0);
+        var inspectionFailure = CreateApp(104);
+        AddDepot(inspectionFailure, 1004, 2004);
+        var available = new List<AppInfo> { noContent, unsupported, missingManifest, inspectionFailure };
+        var byId = available.ToDictionary(app => app.AppId);
+
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(available));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns((uint appId, CancellationToken _) => appId == inspectionFailure.AppId
+                ? Task.FromException<AppInfo>(new InvalidOperationException("Injected inspection failure."))
+                : Task.FromResult(byId[appId]));
+
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var manager = new SteamManager(
+            console,
+            new DownloadArguments
+            {
+                OperatingSystems = new List<SteamPrefill.Models.Enums.OperatingSystem>
+                {
+                    SteamPrefill.Models.Enums.OperatingSystem.Linux
+                }
+            },
+            session,
+            cdnPool: pool,
+            appInfoHandler: apps.Object);
+        var requested = new List<uint> { 101, 102, 103, 104, 999 };
+        var result = await manager.CheckCacheStatusAsync(
+            new List<CachedDepotInput>(),
+            appIds: requested,
+            scope: requested.Select(appId => new CacheAppScope
+            {
+                AppId = appId,
+                Authority = CacheAuthority.Empty
+            }).ToList(),
+            expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+            version: 2);
+
+        Assert.Equal(requested, result.Apps.Select(status => status.AppId));
+        Assert.All(result.Apps, status =>
+        {
+            Assert.False(status.IsUpToDate);
+            Assert.Equal(CacheOutcome.Unknown, status.Outcome);
+            Assert.NotNull(status.Reason);
+            Assert.Equal(0, status.DownloadSize);
+        });
+        Assert.Equal(CacheReason.NoContent, result.Apps.Single(status => status.AppId == 101).Reason);
+        Assert.Equal(CacheReason.UnsupportedOs, result.Apps.Single(status => status.AppId == 102).Reason);
+        Assert.Equal(CacheReason.ManifestUnavailable, result.Apps.Single(status => status.AppId == 103).Reason);
+        Assert.Equal(CacheReason.InspectionFailed, result.Apps.Single(status => status.AppId == 104).Reason);
+        Assert.Equal(CacheReason.MissingApp, result.Apps.Single(status => status.AppId == 999).Reason);
+        Assert.Null(result.Message);
+
+        var legacy = await manager.CheckCacheStatusAsync(
+            new List<CachedDepotInput>(),
+            appIds: requested);
+        Assert.Empty(legacy.Apps);
+    }
+
+    [Fact]
+    public async Task CacheStatusReserveReturnsCompletedAndDeadlineRowsBeforeTransportCancellation()
+    {
+        var clock = new CacheStatusClock(new DateTimeOffset(2026, 9, 21, 0, 0, 0, TimeSpan.Zero));
+        var expiresAtUtc = clock.GetUtcNow().AddSeconds(10);
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.UnionWith(new uint[] { 201, 202 });
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(1202);
+
+        var completed = new AppInfo(session, 201, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        var blocked = new AppInfo(session, 202, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        blocked.Depots.Add(new DepotInfo(new KeyValue("0"), 202)
+        {
+            DepotId = 1202,
+            ManifestId = 2202
+        });
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { completed, blocked }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns(async (uint _, CancellationToken token) =>
+            {
+                entered.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                return blocked;
+            });
+
+        var manager = new SteamManager(
+            console,
+            new DownloadArguments(),
+            session,
+            cdnPool: new CdnPool(console, new ConcurrentStack<Server>()),
+            appInfoHandler: apps.Object,
+            clock: clock);
+        var inspection = manager.CheckCacheStatusAsync(
+            new List<CachedDepotInput>(),
+            appIds: new List<uint> { 201, 202 },
+            scope: new List<CacheAppScope>
+            {
+                new() { AppId = 201, Authority = CacheAuthority.Empty },
+                new() { AppId = 202, Authority = CacheAuthority.Empty }
+            },
+            expiresAtUtc: expiresAtUtc,
+            version: 2);
+
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        clock.Advance(TimeSpan.FromSeconds(8));
+        var result = await inspection.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Null(result.Message);
+        Assert.Equal(CacheReason.NoContent, result.Apps.Single(status => status.AppId == 201).Reason);
+        Assert.Equal(CacheReason.DeadlineReached, result.Apps.Single(status => status.AppId == 202).Reason);
+        Assert.Equal(expiresAtUtc - TimeSpan.FromSeconds(2), clock.GetUtcNow());
+    }
+
+    [Fact]
     public async Task UnresolvedLinkedDepotPreventsCurrentStatusAndSuccessfulCommit()
     {
         var console = new TestConsole();
@@ -1706,8 +2109,21 @@ public sealed class DaemonReliabilityTests
         try
         {
             Assert.False(Assert.Single(await manager.GetSelectedAppsStatusAsync([222], snapshot)).IsUpToDate);
-            Assert.False(Assert.Single((await manager.CheckCacheStatusAsync(
-                snapshot, appIds: new List<uint> { 222 })).Apps).IsUpToDate);
+            Assert.Empty((await manager.CheckCacheStatusAsync(
+                snapshot, appIds: new List<uint> { 222 })).Apps);
+            var versionTwo = await manager.CheckCacheStatusAsync(
+                snapshot,
+                appIds: new List<uint> { 222 },
+                scope: new List<CacheAppScope>
+                {
+                    new() { AppId = 222, Authority = CacheAuthority.Snapshot }
+                },
+                expiresAtUtc: DateTimeOffset.UtcNow.AddMinutes(5),
+                version: 2);
+            var versionTwoStatus = Assert.Single(versionTwo.Apps);
+            Assert.Equal(CacheOutcome.Unknown, versionTwoStatus.Outcome);
+            Assert.Equal(CacheReason.LinkedDepotUnavailable, versionTwoStatus.Reason);
+            Assert.Null(versionTwo.Message);
 
             await manager.DownloadMultipleAppsAsync(
                 false,

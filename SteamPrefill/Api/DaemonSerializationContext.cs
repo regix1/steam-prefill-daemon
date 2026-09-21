@@ -34,6 +34,8 @@ namespace SteamPrefill.Api;
 [JsonSerializable(typeof(CacheStatusResult))]
 [JsonSerializable(typeof(CachedDepotInput))]
 [JsonSerializable(typeof(List<CachedDepotInput>))]
+[JsonSerializable(typeof(CacheAppScope))]
+[JsonSerializable(typeof(List<CacheAppScope>))]
 // Socket event types
 [JsonSerializable(typeof(SocketEvent<CredentialChallenge>))]
 [JsonSerializable(typeof(SocketEvent<PrefillProgressUpdate>))]

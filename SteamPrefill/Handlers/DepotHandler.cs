@@ -84,10 +84,13 @@
         /// </summary>
         public bool AppIsUpToDate(List<DepotInfo> depots, IReadOnlyCollection<string> cachedDepots = null)
         {
+            if (depots.Count == 0 || depots.Any(depot => !depot.ManifestId.HasValue || depot.ManifestId.Value == 0))
+                return false;
+
             // A supplied manager snapshot replaces historical hints for this run without changing
             // another run's snapshot or the standalone client's completed-download history.
             if (cachedDepots != null)
-                return depots.Count > 0 && depots.All(depot => cachedDepots.Contains($"{depot.DepotId}:{depot.ManifestId}"));
+                return depots.All(depot => cachedDepots.Contains($"{depot.DepotId}:{depot.ManifestId}"));
             lock (_commit) return depots.All(e => _downloadedDepots.ContainsKey(e.DepotId)
                                    && _downloadedDepots[e.DepotId].Contains(e.ManifestId.Value));
         }

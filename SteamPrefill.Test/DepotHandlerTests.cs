@@ -218,9 +218,8 @@ namespace SteamPrefill.Test
         [Fact]
         public void EmptyDepotList_ReportsUpToDate()
         {
-            // All() over an empty list is true, so a list that emptied out while fetching manifests reports the app
-            // as up to date with nothing to download.  Every caller has to check for an empty list before trusting this.
-            Assert.True(_depotHandler.AppIsUpToDate(new List<DepotInfo>()));
+            // An empty required set cannot prove that the app's current content was downloaded.
+            Assert.False(_depotHandler.AppIsUpToDate(new List<DepotInfo>()));
         }
 
         [Fact]
