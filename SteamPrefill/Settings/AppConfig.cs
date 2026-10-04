@@ -53,6 +53,29 @@ namespace SteamPrefill.Settings
         /// </summary>
         public static readonly string SuccessfullyDownloadedDepotsPath = Path.Combine(ConfigDir, "successfullyDownloadedDepots.json");
 
+        public static readonly string IncrementalStatePath = Path.Combine(ConfigDir, "incremental");
+
+        public static string CacheGeneration => Environment.GetEnvironmentVariable("PREFILL_CACHE_GENERATION") ?? "default";
+
+        public static IncrementalPrefillMode IncrementalMode
+        {
+            get
+            {
+                // Preserve the official daemon's full-manifest behaviour unless an operator explicitly opts in.
+                // This makes a custom image safe to stage before its persistent baseline and invalidation policy exist.
+                var value = Environment.GetEnvironmentVariable("PREFILL_MODE") ?? "full";
+                return value.ToLowerInvariant() switch
+                {
+                    "incremental" => IncrementalPrefillMode.Incremental,
+                    "full" => IncrementalPrefillMode.Full,
+                    "repair" => IncrementalPrefillMode.Repair,
+                    "dry-run" => IncrementalPrefillMode.DryRun,
+                    "bootstrap" => IncrementalPrefillMode.Bootstrap,
+                    _ => throw new InvalidOperationException($"Unsupported PREFILL_MODE '{value}'. Expected incremental, full, repair, dry-run, or bootstrap.")
+                };
+            }
+        }
+
         /// <summary>
         /// Stores the user's current CellId, which corresponds to their region.
         /// </summary>

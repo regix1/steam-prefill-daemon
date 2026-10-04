@@ -9,6 +9,53 @@ namespace SteamPrefill.Test;
 public sealed class CacheCommitTests
 {
     [Fact]
+    public void IncrementalBaselineIsCommittedOnlyWithSuccessfulDepotHistory()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "steam-baseline-commit-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var successPath = Path.Combine(directory, "success.json");
+        var baselinePath = Path.Combine(directory, "incremental");
+        var store = new IncrementalBaselineStore(baselinePath, "one");
+        var handler = new DepotHandler(null!, null!, null!, successPath,
+            baselineStore: store, incrementalMode: IncrementalPrefillMode.Incremental);
+        var depot = new DepotInfo(new KeyValue("101"), 100) { ManifestId = 2 };
+        var manifest = CreateManifest(101, 2, ("chunk", 10));
+        try
+        {
+            handler.StagePendingBaseline(manifest);
+
+            Assert.True(handler.MarkDownloadAsSuccessful(new() { depot }, null, null));
+
+            Assert.Equal(0, handler.PendingBaselineCount);
+            Assert.Equal(2UL, store.Get(101)!.ManifestId);
+            Assert.True(handler.AppIsUpToDate(new() { depot }));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public void DiscardedIncrementalBaselineDoesNotAdvanceAfterFailure()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "steam-baseline-discard-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var store = new IncrementalBaselineStore(Path.Combine(directory, "incremental"), "one");
+        var handler = new DepotHandler(null!, null!, null!, Path.Combine(directory, "success.json"),
+            baselineStore: store, incrementalMode: IncrementalPrefillMode.Incremental);
+        var depot = new DepotInfo(new KeyValue("101"), 100) { ManifestId = 2 };
+        try
+        {
+            handler.StagePendingBaseline(CreateManifest(101, 2, ("chunk", 10)));
+
+            handler.DiscardPendingBaselines(new[] { depot });
+
+            Assert.Equal(0, handler.PendingBaselineCount);
+            Assert.Null(store.Get(101));
+            Assert.False(handler.AppIsUpToDate(new() { depot }));
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
     public void ManagerSnapshotReplacesHistoricalHintsWithoutChangingOtherRuns()
     {
         var path = Path.Combine(Path.GetTempPath(), "steam-snapshot-" + Guid.NewGuid().ToString("N"));
@@ -159,5 +206,17 @@ public sealed class CacheCommitTests
             Assert.Single(Directory.GetFiles(directory));
         }
         finally { Directory.Delete(directory, true); }
+    }
+
+    private static Manifest CreateManifest(uint depotId, ulong manifestId,
+        params (string Id, uint Length)[] chunks)
+    {
+        var manifest = (Manifest)Activator.CreateInstance(typeof(Manifest), nonPublic: true)!;
+        typeof(Manifest).GetProperty(nameof(Manifest.Id))!.SetValue(manifest, manifestId);
+        typeof(Manifest).GetProperty(nameof(Manifest.DepotId))!.SetValue(manifest, depotId);
+        var file = (FileData)Activator.CreateInstance(typeof(FileData), nonPublic: true)!;
+        file.Chunks.AddRange(chunks.Select(chunk => new ChunkData(chunk.Id, chunk.Length)));
+        manifest.Files.Add(file);
+        return manifest;
     }
 }
