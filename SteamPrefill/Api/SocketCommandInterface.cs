@@ -37,10 +37,12 @@ public sealed class SocketCommandInterface : IDisposable
     private Task _statusPublication = Task.CompletedTask;
     private bool _isLoggingIn;
     private bool _disposed;
-    private bool _restartRequired;
 
     // All generation changes and credential commits share the lifecycle gate.
     private long _loginGeneration;
+
+    // Why the daemon last signed out, kept while it stays signed out. Read and written under _lifecycle.
+    private string? _signOutCode;
 
 
     // Auto-login challenge storage
@@ -185,9 +187,8 @@ public sealed class SocketCommandInterface : IDisposable
             {
                 Id = request.Id,
                 Success = false,
-                Error = _restartRequired ? "A Steam request has not drained. Restart the daemon before signing in again." :
-                    ex is SteamConnectionException { Failure: not null } ? ex.Message : "The prefill daemon could not complete the request. Try again.",
-                ErrorCode = _restartRequired ? "game-details-unavailable" : (ex as SteamConnectionException)?.ErrorCode,
+                Error = ex is SteamConnectionException { Failure: not null } ? ex.Message : "The prefill daemon could not complete the request. Try again.",
+                ErrorCode = (ex as SteamConnectionException)?.ErrorCode,
                 RequiresLogin = (ex as SteamConnectionException)?.RequiresLogin == true,
                 CompletedAt = DateTime.UtcNow
             };
@@ -214,11 +215,6 @@ public sealed class SocketCommandInterface : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         _cts.Token.ThrowIfCancellationRequested();
         if (_prefillOperation.IsRunning) throw new InvalidOperationException("Active operations must drain before login.");
-        if (_restartRequired || _api?.RestartRequired == true || _api?.HasPendingRequests == true)
-        {
-            _restartRequired = true;
-            throw new InvalidOperationException("A Steam account request has not drained. Restart the daemon before signing in again.");
-        }
         var previous = _api;
         var previousLogin = _loginTask;
         var generation = ++_loginGeneration;
@@ -258,6 +254,8 @@ public sealed class SocketCommandInterface : IDisposable
                     cancellation.Token.ThrowIfCancellationRequested();
                     if (!api.IsInitialized) throw new SteamConnectionException(SteamFailure.AuthLost);
                     _isLoggingIn = false;
+                    // A later shutdown push must not repeat the reason for an earlier sign-out.
+                    _signOutCode = null;
                     _statusPublication = PublishStatusAsync(_statusPublication, "logged-in", "Authenticated and ready for commands");
                 }
             }
@@ -270,7 +268,11 @@ public sealed class SocketCommandInterface : IDisposable
                     {
                         _api = null;
                         if (_isLoggingIn)
-                            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", "Steam sign-in did not complete. Sign in again.");
+                        {
+                            _signOutCode = SignOutCodeAfterUnfinishedSignIn(ex);
+                            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login",
+                                "Steam sign-in did not complete. Sign in again.", _signOutCode);
+                        }
                         _isLoggingIn = false;
                     }
                 }
@@ -297,11 +299,37 @@ public sealed class SocketCommandInterface : IDisposable
             _isLoggingIn = false;
             _run?.SelectTerminal(OwnedOperationStatus.Failed, new SteamConnectionException(SteamFailure.AuthLost));
             foreach (var run in _runs.Values) run.Progress.TryChooseTerminal("failed", "auth-lost");
-            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login",
-                new SteamConnectionException(SteamFailure.AuthLost).Message);
+            var lost = new SteamConnectionException(SteamFailure.AuthLost);
+            // Only a dropped connection keeps the saved login usable without a person; a log-off
+            // (for example the account signing in elsewhere) is not signed in again.
+            _signOutCode = result is null || ConnectionWentAway(result.Value) ? lost.ErrorCode : null;
+            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", lost.Message, _signOutCode);
             _ = _prefillOperation.CancelAllAndWaitAsync();
         }
     }
+
+    // A sign-in that ends without signing in leaves the saved login usable unless it stopped at a
+    // credential prompt or Steam refused the credentials (a wrong password, a refused code, or a
+    // confirmation that never came), because a person is needed then. Any failure to reach Steam is
+    // reported like a dropped connection. Called under _lifecycle.
+    private string? SignOutCodeAfterUnfinishedSignIn(Exception? failure)
+    {
+        var steamRefused = failure switch
+        {
+            SteamKit2.Authentication.AuthenticationException refused => !ConnectionWentAway(refused.Result),
+            System.Security.Authentication.AuthenticationException => true,
+            _ => false
+        };
+        return steamRefused || _authProvider.CurrentChallengeId is not null
+            ? null
+            : new SteamConnectionException(SteamFailure.AuthLost).ErrorCode;
+    }
+
+    // Steam results that mean the connection or its server went away, as opposed to the account being
+    // signed out (SteamKit2 marks TryAnotherCM and ServiceUnavailable log-offs as a bad server).
+    private static bool ConnectionWentAway(EResult result) =>
+        result is EResult.TryAnotherCM or EResult.ServiceUnavailable or EResult.NoConnection
+            or EResult.Timeout or EResult.ConnectFailed or EResult.RemoteDisconnect;
 
     private async Task EndSessionAsync(bool erase, bool onlyLogin = false)
     {
@@ -325,15 +353,23 @@ public sealed class SocketCommandInterface : IDisposable
             foreach (var run in _runs.Values) run.Progress.TryChooseTerminal("cancelled");
             publication = _run?.Publication.Task ?? Task.CompletedTask;
             completion = _prefillOperation.CancelAllAndWaitAsync();
-            if (erase) EraseAccountStore(_progress);
-            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", "Login required");
+            if (erase)
+            {
+                EraseAccountStore(_progress);
+                _signOutCode = null;
+            }
+            else if (onlyLogin)
+            {
+                // The manager's cancel can arrive before the sign-in gives up by itself.
+                _signOutCode = SignOutCodeAfterUnfinishedSignIn(null);
+            }
+            _statusPublication = PublishStatusAsync(_statusPublication, "awaiting-login", "Login required", _signOutCode);
             _authProvider.CancelPendingRequest();
         }
         try { cancellation?.Cancel(); }
         catch (ObjectDisposedException) { /* Login already completed. */ }
         await completion;
         await publication;
-        lock (_lifecycle) _restartRequired |= api?.HasPendingRequests == true || api?.RestartRequired == true;
         if (api != null) DisposeOrphanedApi(api);
         if (login != null) await login;
         await _statusPublication;
@@ -675,10 +711,10 @@ public sealed class SocketCommandInterface : IDisposable
                 {
                     IsLoggedIn = ready,
                     IsInitialized = ready,
-                    RestartRequired = _restartRequired || _api?.RestartRequired == true,
                     AuthExpiryUtc = ready ? _api?.AuthExpiryUtc : null,
                     Username = ready ? _api?.Username : null
                     ,
+                    ErrorCode = ready ? null : _signOutCode,
                     ProtocolVersion = PrefillProtocol.Version,
                     Features = [.. PrefillProtocol.Features, "cacheStatusAppIds", "cacheStatusV2"],
                     DaemonInstanceId = _protocol.DaemonInstanceId,
@@ -1426,7 +1462,7 @@ public sealed class SocketCommandInterface : IDisposable
         }
     }
 
-    private async Task PublishStatusAsync(Task previous, string status, string message)
+    private async Task PublishStatusAsync(Task previous, string status, string message, string? errorCode = null)
     {
         var generation = _loginGeneration;
         await Task.Yield();
@@ -1436,12 +1472,12 @@ public sealed class SocketCommandInterface : IDisposable
         {
             if (generation != _loginGeneration || (status == "logged-in") != _isLoggedIn) return;
         }
-        await BroadcastStatusAsync(status, message);
+        await BroadcastStatusAsync(status, message, errorCode);
     }
 
-    private async Task BroadcastStatusAsync(string status, string message)
+    private async Task BroadcastStatusAsync(string status, string message, string? errorCode = null)
     {
-        var statusEvent = new AuthStateEvent(status, message);
+        var statusEvent = new AuthStateEvent(status, message, errorCode);
         await _socketServer.BroadcastAuthStateAsync(statusEvent);
     }
 

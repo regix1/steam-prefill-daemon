@@ -29,8 +29,6 @@
         public bool IsAuthenticated => _steam3.IsAuthenticated;
         internal string Username => _steam3.Username;
         internal DateTime? AuthExpiryUtc => _steam3.AuthExpiryUtc;
-        internal bool HasPendingRequests => _steam3.HasPendingRequests;
-        internal bool RestartRequired => _steam3.RequestsUnavailable.IsCompleted;
         public event Action<EResult?> AuthenticationLost
         {
             add => _steam3.AuthenticationLost += value;

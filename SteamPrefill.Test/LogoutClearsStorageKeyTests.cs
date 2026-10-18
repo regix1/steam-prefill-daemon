@@ -1,5 +1,7 @@
 using System.Reflection;
+using Spectre.Console.Testing;
 using SteamPrefill.Api;
+using SteamPrefill.Handlers.Steam;
 using SteamPrefill.Settings;
 using Xunit;
 
@@ -88,6 +90,37 @@ namespace SteamPrefill.Test
             Assert.False(File.Exists(_accountPath));
             // Before the fix storage.key survived logout, resurrecting the volume login on next start.
             Assert.False(File.Exists(_keyPath));
+        }
+
+        [Fact]
+        public async Task LoginIsAcceptedAfterLogoutDuringARequest()
+        {
+            using var session = new Steam3Session(new TestConsole());
+            DaemonReliabilityTests.PrivateField(session, "_isAuthenticated").SetValue(session, true);
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var response = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var request = session.RequestAsync(() =>
+            {
+                started.TrySetResult();
+                return response.Task;
+            });
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            using var commands = new SocketCommandInterface(
+                Path.Combine(Path.GetTempPath(), $"steam-logout-request-{Guid.NewGuid():N}.sock"));
+            using var api = DaemonReliabilityTests.CreateApiOverSession(session);
+            DaemonReliabilityTests.PrivateField(commands, "_api").SetValue(commands, api);
+            DaemonReliabilityTests.PrivateField(commands, "_isLoggingIn").SetValue(commands, true);
+
+            var logout = await ConcurrentPrefillTests.InvokeAsync(commands, new CommandRequest { Id = "logout-1", Type = "logout" });
+            Assert.True(logout.Success, logout.Error);
+            response.TrySetResult(1);
+            await request;
+
+            var login = await ConcurrentPrefillTests.InvokeAsync(commands, new CommandRequest { Id = "login-1", Type = "login" });
+
+            Assert.True(login.Success, login.Error);
+            Assert.Equal("Login started - awaiting credentials", login.Message);
         }
     }
 }

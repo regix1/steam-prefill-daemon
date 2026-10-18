@@ -311,7 +311,6 @@ namespace SteamPrefill.Api
     /// </summary>
     public class StatusData
     {
-        public bool RestartRequired { get; init; }
         public int ProtocolVersion { get; init; }
         public IReadOnlyList<string> Features { get; init; } = Array.Empty<string>();
         public string? DaemonInstanceId { get; init; }
@@ -335,6 +334,11 @@ namespace SteamPrefill.Api
         /// The logged-in Steam account username, or null when not available.
         /// </summary>
         public string? Username { get; init; }
+
+        /// <summary>
+        /// The code of the last sign-out while signed out (auth-lost after a dropped connection), or null.
+        /// </summary>
+        public string? ErrorCode { get; init; }
     }
 
     /// <summary>
@@ -505,10 +509,10 @@ namespace SteamPrefill.Api
     /// </summary>
     public class AuthStateEvent : SocketEvent<AuthStateData>
     {
-        public AuthStateEvent(string state, string? message = null)
+        public AuthStateEvent(string state, string? message = null, string? errorCode = null)
         {
             Type = "auth-state";
-            Data = new AuthStateData { State = state, Message = message };
+            Data = new AuthStateData { State = state, Message = message, ErrorCode = errorCode };
         }
     }
 
@@ -516,6 +520,7 @@ namespace SteamPrefill.Api
     {
         public string State { get; init; } = string.Empty;
         public string? Message { get; init; }
+        public string? ErrorCode { get; init; }
     }
 
     public enum SocketServerMode

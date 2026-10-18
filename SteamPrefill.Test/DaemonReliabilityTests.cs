@@ -2234,6 +2234,267 @@ public sealed class DaemonReliabilityTests
         }
     }
 
+    [Fact]
+    public async Task AuthenticationLost_PushCarriesTheAuthLostCode()
+    {
+        var port = GetFreeTcpPort();
+        using var commands = new SocketCommandInterface(port);
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(commands, "_api").SetValue(commands, api);
+        await commands.StartAsync();
+        using var client = await ConnectAndSyncAsync(port);
+        var stream = client.GetStream();
+
+        RaiseAuthenticationLost(commands, api, null);
+
+        var frame = await ReadAuthStateAsync(stream).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("auth-state", frame.Type);
+        Assert.Equal("awaiting-login", frame.Data!.State);
+        Assert.Equal("auth-lost", frame.Data.ErrorCode);
+    }
+
+    [Fact]
+    public async Task SignOutPushesOtherThanADrop_CarryNoErrorCode()
+    {
+        var port = GetFreeTcpPort();
+        using var commands = new SocketCommandInterface(port);
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(commands, "_api").SetValue(commands, api);
+        await commands.StartAsync();
+        using var client = await ConnectAndSyncAsync(port);
+        var stream = client.GetStream();
+
+        RaiseAuthenticationLost(commands, api, EResult.LoggedInElsewhere);
+        var logOff = await ReadAuthStateAsync(stream).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("awaiting-login", logOff.Data!.State);
+        Assert.Null(logOff.Data.ErrorCode);
+
+        await EndSessionAsync(commands, erase: false, onlyLogin: false);
+        var loginRequired = await ReadAuthStateAsync(stream).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal("Login required", loginRequired.Data!.Message);
+        Assert.Null(loginRequired.Data.ErrorCode);
+    }
+
+    [Theory]
+    [InlineData(EResult.TryAnotherCM)]
+    [InlineData(EResult.ServiceUnavailable)]
+    [InlineData(EResult.NoConnection)]
+    [InlineData(EResult.Timeout)]
+    [InlineData(EResult.ConnectFailed)]
+    [InlineData(EResult.RemoteDisconnect)]
+    public async Task LogOffThatMeansTheConnectionWentAway_CarriesTheDropCode(EResult result)
+    {
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(commands, "_api").SetValue(commands, api);
+        RaiseAuthenticationLost(commands, api, result);
+
+        var status = Assert.IsType<StatusData>((await InvokeAsync(commands,
+            new CommandRequest { Id = "status-1", Type = "status" })).Data);
+
+        Assert.Equal("auth-lost", status.ErrorCode);
+    }
+
+    [Fact]
+    public void TimeoutsThatNeedAPerson_AreNotPlainTimeoutExceptions()
+    {
+        var credentialWait = typeof(SocketAuthProvider)
+            .GetMethod("RequestSecureCredentialAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var accessToken = typeof(Steam3Session)
+            .GetMethod("GetAccessTokenAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+        Assert.Equal(0, CountConstructions(credentialWait, typeof(TimeoutException)));
+        Assert.Equal(1, CountConstructions(credentialWait, typeof(System.Security.Authentication.AuthenticationException)));
+        Assert.Equal(0, CountConstructions(accessToken, typeof(TimeoutException)));
+        Assert.Equal(2, CountConstructions(accessToken, typeof(System.Security.Authentication.AuthenticationException)));
+    }
+
+    // Counts `new <exceptionType>(...)` in an async method by scanning its state machine's IL, because the
+    // five-minute and three-minute waits that throw these cannot be reached in a test.
+    private static int CountConstructions(MethodInfo asyncMethod, Type exceptionType)
+    {
+        var stateMachine = asyncMethod.GetCustomAttribute<System.Runtime.CompilerServices.AsyncStateMachineAttribute>()!.StateMachineType;
+        var moveNext = stateMachine.GetMethod("MoveNext", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+        var il = moveNext.GetMethodBody()!.GetILAsByteArray()!;
+        var count = 0;
+        for (var index = 0; index + 4 < il.Length; index++)
+        {
+            if (il[index] != System.Reflection.Emit.OpCodes.Newobj.Value) continue;
+            try
+            {
+                var constructor = moveNext.Module.ResolveMethod(BitConverter.ToInt32(il, index + 1));
+                if (constructor?.DeclaringType == exceptionType) count++;
+            }
+            catch (Exception ex) when (ex is ArgumentException or BadImageFormatException)
+            {
+                // Operand bytes of another instruction that happen to equal the opcode.
+            }
+        }
+        return count;
+    }
+
+    [Fact]
+    public async Task StatusReply_CarriesTheDropCodeOnlyAfterADrop()
+    {
+        using var droppedCommands = new SocketCommandInterface(GetFreeTcpPort());
+        using var droppedApi = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(droppedCommands, "_api").SetValue(droppedCommands, droppedApi);
+        RaiseAuthenticationLost(droppedCommands, droppedApi, null);
+
+        var dropped = Assert.IsType<StatusData>((await InvokeAsync(droppedCommands,
+            new CommandRequest { Id = "status-1", Type = "status" })).Data);
+        Assert.Equal("auth-lost", dropped.ErrorCode);
+
+        using var loggedOffCommands = new SocketCommandInterface(GetFreeTcpPort());
+        using var loggedOffApi = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(loggedOffCommands, "_api").SetValue(loggedOffCommands, loggedOffApi);
+        RaiseAuthenticationLost(loggedOffCommands, loggedOffApi, EResult.LoggedInElsewhere);
+
+        var loggedOff = Assert.IsType<StatusData>((await InvokeAsync(loggedOffCommands,
+            new CommandRequest { Id = "status-2", Type = "status" })).Data);
+        Assert.Null(loggedOff.ErrorCode);
+    }
+
+    [Fact]
+    public async Task CancelingASignInWithNoPromptOpen_ReportsTheDropCode()
+    {
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        PrivateField(commands, "_isLoggingIn").SetValue(commands, true);
+
+        await EndSessionAsync(commands, erase: false, onlyLogin: true);
+
+        var status = Assert.IsType<StatusData>((await InvokeAsync(commands,
+            new CommandRequest { Id = "status-1", Type = "status" })).Data);
+        Assert.Equal("auth-lost", status.ErrorCode);
+    }
+
+    [Fact]
+    public async Task CancelingASignInAtACredentialPrompt_ClearsTheDropCode()
+    {
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(commands, "_api").SetValue(commands, api);
+        RaiseAuthenticationLost(commands, api, null);
+        var beforeCancel = Assert.IsType<StatusData>((await InvokeAsync(commands,
+            new CommandRequest { Id = "status-1", Type = "status" })).Data);
+        Assert.Equal("auth-lost", beforeCancel.ErrorCode);
+
+        PrivateField(commands, "_isLoggingIn").SetValue(commands, true);
+        var socketAuth = PrivateField(commands, "_authProvider").GetValue(commands)!;
+        PrivateField(socketAuth, "_currentChallengeId").SetValue(socketAuth, "challenge-1");
+
+        await EndSessionAsync(commands, erase: false, onlyLogin: true);
+
+        var status = Assert.IsType<StatusData>((await InvokeAsync(commands,
+            new CommandRequest { Id = "status-2", Type = "status" })).Data);
+        Assert.Null(status.ErrorCode);
+    }
+
+    [Fact]
+    public async Task FailedCredentialSignIn_ReportsNoSignOutCodeButAConnectionFailureDoes()
+    {
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        var helper = typeof(SocketCommandInterface)
+            .GetMethod("SignOutCodeAfterUnfinishedSignIn", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        string? CodeFor(Exception failure) => (string?)helper.Invoke(commands, new object?[] { failure });
+        var waitTimeout = await Assert.ThrowsAsync<TimeoutException>(() =>
+            new TaskCompletionSource().Task.WaitAsync(TimeSpan.FromMilliseconds(1)));
+
+        Assert.Null(CodeFor(new SteamKit2.Authentication.AuthenticationException("refused", EResult.InvalidPassword)));
+        Assert.Null(CodeFor(new System.Security.Authentication.AuthenticationException("Invalid username/password")));
+        Assert.Equal("auth-lost", CodeFor(new SteamKit2.Authentication.AuthenticationException("unavailable", EResult.ServiceUnavailable)));
+        Assert.Equal("auth-lost", CodeFor(waitTimeout));
+        Assert.Equal("auth-lost", CodeFor(new InvalidOperationException("The connection to Steam was lost.")));
+    }
+
+    [Fact]
+    public async Task LoginIsAcceptedAfterARequestTimedOut()
+    {
+        using var session = new Steam3Session(new TestConsole(), requestTimeout: TimeSpan.FromMilliseconds(1));
+        PrivateField(session, "_isAuthenticated").SetValue(session, true);
+        var response = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var request = session.RequestAsync(() => response.Task);
+        await session.RequestsUnavailable.WaitAsync(TimeSpan.FromSeconds(2));
+        response.TrySetResult(1);
+        await Assert.ThrowsAsync<SteamConnectionException>(() => request);
+
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        using var api = CreateApiOverSession(session);
+        PrivateField(commands, "_api").SetValue(commands, api);
+
+        var login = await InvokeAsync(commands, new CommandRequest { Id = "login-1", Type = "login" });
+
+        Assert.True(login.Success, login.Error);
+        Assert.Equal("Login started - awaiting credentials", login.Message);
+    }
+
+    [Fact]
+    public async Task LoginIsAcceptedAfterCancelingASignInDuringARequest()
+    {
+        using var session = new Steam3Session(new TestConsole());
+        PrivateField(session, "_isAuthenticated").SetValue(session, true);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var response = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var request = session.RequestAsync(() =>
+        {
+            started.TrySetResult();
+            return response.Task;
+        });
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        using var commands = new SocketCommandInterface(GetFreeTcpPort());
+        using var api = CreateApiOverSession(session);
+        PrivateField(commands, "_api").SetValue(commands, api);
+        PrivateField(commands, "_isLoggingIn").SetValue(commands, true);
+
+        var cancel = await InvokeAsync(commands, new CommandRequest { Id = "cancel-1", Type = "cancel-login" });
+        Assert.True(cancel.Success, cancel.Error);
+        response.TrySetResult(1);
+        await request;
+
+        var login = await InvokeAsync(commands, new CommandRequest { Id = "login-1", Type = "login" });
+
+        Assert.True(login.Success, login.Error);
+        Assert.Equal("Login started - awaiting credentials", login.Message);
+    }
+
+    internal static SteamPrefillApi CreateApiOverSession(Steam3Session session)
+    {
+        var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(api, "_steamManager").SetValue(api, new SteamManager(new TestConsole(), new DownloadArguments(), session));
+        return api;
+    }
+
+    internal static FieldInfo PrivateField(object target, string name) =>
+        target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+    private static void RaiseAuthenticationLost(SocketCommandInterface commands, SteamPrefillApi api, EResult? result)
+    {
+        var generation = (long)PrivateField(commands, "_loginGeneration").GetValue(commands)!;
+        typeof(SocketCommandInterface)
+            .GetMethod("HandleAuthenticationLost", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(commands, new object?[] { api, generation, result });
+    }
+
+    private static Task EndSessionAsync(SocketCommandInterface commands, bool erase, bool onlyLogin) =>
+        (Task)typeof(SocketCommandInterface)
+            .GetMethod("EndSessionAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(commands, new object[] { erase, onlyLogin })!;
+
+    // The reply proves the server registered this client, so a push sent afterward reaches it.
+    private static async Task<TcpClient> ConnectAndSyncAsync(int port)
+    {
+        var client = new TcpClient();
+        await client.ConnectAsync(IPAddress.Loopback, port);
+        var stream = client.GetStream();
+        await AuthenticateIfRequiredAsync(stream);
+        await WriteRequestAsync(stream, new CommandRequest { Id = "sync-1", Type = "status" });
+        var reply = await ReadResponseAsync(stream).WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(reply.Success);
+        Assert.Equal("sync-1", reply.Id);
+        return client;
+    }
+
     private static Task<CommandResponse> InvokeAsync(SocketCommandInterface commands, CommandRequest request) =>
         (Task<CommandResponse>)typeof(SocketCommandInterface)
             .GetMethod("HandleCommandAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
@@ -2373,13 +2634,24 @@ public sealed class DaemonReliabilityTests
 
     private static async Task<CommandResponse> ReadResponseAsync(NetworkStream stream)
     {
+        return JsonSerializer.Deserialize(await ReadFrameBytesAsync(stream), DaemonSerializationContext.Default.CommandResponse)
+            ?? throw new InvalidOperationException("The daemon returned an empty response.");
+    }
+
+    private static async Task<SocketEvent<AuthStateData>> ReadAuthStateAsync(NetworkStream stream)
+    {
+        return JsonSerializer.Deserialize(await ReadFrameBytesAsync(stream), DaemonSerializationContext.Default.SocketEventAuthStateData)
+            ?? throw new InvalidOperationException("The daemon sent an empty event.");
+    }
+
+    private static async Task<byte[]> ReadFrameBytesAsync(NetworkStream stream)
+    {
         var prefix = new byte[sizeof(int)];
         await stream.ReadExactlyAsync(prefix);
         var length = BinaryPrimitives.ReadInt32LittleEndian(prefix);
-        var payload = new byte[length];
-        await stream.ReadExactlyAsync(payload);
-        return JsonSerializer.Deserialize(payload, DaemonSerializationContext.Default.CommandResponse)
-            ?? throw new InvalidOperationException("The daemon returned an empty response.");
+        var frame = new byte[length];
+        await stream.ReadExactlyAsync(frame);
+        return frame;
     }
 
     private sealed class BlockingHttpHandler : HttpMessageHandler

@@ -29,6 +29,7 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
     // Store credentials securely in pinned memory
     private GCHandle _credentialHandle;
     private char[]? _pinnedCredential;
+    private readonly object _pinnedLock = new();
 
     public SocketAuthProvider(SocketServer socketServer, IPrefillProgress? progress = null)
     {
@@ -46,7 +47,9 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
     /// </summary>
     public bool ReceiveCredential(EncryptedCredentialResponse response)
     {
-        if (_pendingCredential == null || _currentChallengeId == null)
+        // Read once: a cancel-login on another thread can clear the field between the check and the use.
+        var pending = _pendingCredential;
+        if (pending == null || _currentChallengeId == null)
         {
             _progress.OnLog(LogLevel.Warning, "Received credential but no challenge is pending");
             return false;
@@ -59,7 +62,7 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
         }
 
         _progress.OnLog(LogLevel.Debug, "Credential received via socket");
-        _pendingCredential.TrySetResult(response);
+        pending.TrySetResult(response);
         return true;
     }
 
@@ -68,7 +71,9 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
         await _credentialLock.WaitAsync(cancellationToken);
         try
         {
-            _pendingCredential = new TaskCompletionSource<EncryptedCredentialResponse>();
+            // Kept in a local too: a cancel-login clears the field while the challenge is still being sent.
+            var pending = new TaskCompletionSource<EncryptedCredentialResponse>();
+            _pendingCredential = pending;
 
             // Create secure challenge using existing encryption infrastructure
             var challenge = SecureCredentialExchange.CreateChallenge(credentialType, email);
@@ -83,11 +88,11 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
             // Wait for credential with timeout
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-            using var reg = linkedCts.Token.Register(() => _pendingCredential.TrySetCanceled());
+            using var reg = linkedCts.Token.Register(() => pending.TrySetCanceled());
 
             try
             {
-                var encryptedResponse = await _pendingCredential.Task;
+                var encryptedResponse = await pending.Task;
 
                 // Decrypt the credential
                 var credential = SecureCredentialExchange.DecryptCredential(encryptedResponse);
@@ -105,7 +110,7 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested)
             {
-                throw new TimeoutException($"Timeout waiting for {credentialType} credential");
+                throw new AuthenticationException($"Timeout waiting for {credentialType} credential");
             }
         }
         finally
@@ -118,27 +123,35 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
 
     private void StoreSecurely(string credential)
     {
-        // Clear previous pinned credential
-        ClearPinnedCredential();
+        lock (_pinnedLock)
+        {
+            // Clear previous pinned credential
+            ClearPinnedCredential();
 
-        // Pin new credential in memory to prevent GC from moving it
-        _pinnedCredential = credential.ToCharArray();
-        _credentialHandle = GCHandle.Alloc(_pinnedCredential, GCHandleType.Pinned);
+            // Pin new credential in memory to prevent GC from moving it
+            _pinnedCredential = credential.ToCharArray();
+            _credentialHandle = GCHandle.Alloc(_pinnedCredential, GCHandleType.Pinned);
+        }
     }
 
+    // A logout clears the pinned credential on its own thread while a submitted one may be stored, so the
+    // clear and the store each run whole under one lock.
     private void ClearPinnedCredential()
     {
-        if (_pinnedCredential != null)
+        lock (_pinnedLock)
         {
-            // Zero out the memory
-            Array.Clear(_pinnedCredential, 0, _pinnedCredential.Length);
-
-            if (_credentialHandle.IsAllocated)
+            if (_pinnedCredential != null)
             {
-                _credentialHandle.Free();
-            }
+                // Zero out the memory
+                Array.Clear(_pinnedCredential, 0, _pinnedCredential.Length);
 
-            _pinnedCredential = null;
+                if (_credentialHandle.IsAllocated)
+                {
+                    _credentialHandle.Free();
+                }
+
+                _pinnedCredential = null;
+            }
         }
     }
 

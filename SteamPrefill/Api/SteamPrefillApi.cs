@@ -54,8 +54,6 @@ public sealed class SteamPrefillApi : IDisposable
     }
     internal string? Username => _steamManager?.Username;
     internal DateTime? AuthExpiryUtc => _steamManager?.AuthExpiryUtc;
-    internal bool HasPendingRequests => _steamManager?.HasPendingRequests == true;
-    internal bool RestartRequired => _steamManager?.RestartRequired == true;
 
     /// <summary>
     /// Initializes the API and logs into Steam.
