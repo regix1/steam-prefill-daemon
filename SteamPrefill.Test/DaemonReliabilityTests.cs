@@ -832,8 +832,10 @@ public sealed class DaemonReliabilityTests
     // therefore answered every retry, and every download, until the process restarted. A server that fails with
     // a server-side error is now dropped instead of returned, left out of the refill, and the retry reaches a
     // different one.
-    [Fact]
-    public async Task ManifestDownloadOnFailingCdn_RetriesOnADifferentServer()
+    [Theory]
+    [InlineData(HttpStatusCode.GatewayTimeout)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task ManifestDownloadOnFailingCdn_RetriesOnADifferentServer(HttpStatusCode status)
     {
         var console = new TestConsole();
         var serversUsed = new List<Server>();
@@ -852,8 +854,8 @@ public sealed class DaemonReliabilityTests
                 // A faulted task, not a synchronous throw: the real client is an async method, and the
                 // connection handling being tested only runs once the download task is awaited.
                 return Task.FromException<DepotManifest>(new SteamKitWebRequestException(
-                    "504 Gateway Timeout",
-                    new HttpResponseMessage(HttpStatusCode.GatewayTimeout)));
+                    $"{(int)status} {status}",
+                    new HttpResponseMessage(status)));
             });
         var depot = CreateUncachedDepot();
 

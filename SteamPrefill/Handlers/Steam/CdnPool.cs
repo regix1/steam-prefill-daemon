@@ -16,6 +16,11 @@ namespace SteamPrefill.Handlers.Steam
         private readonly object _sync = new();
         private Task _refill = Task.CompletedTask;
         private Task<Server[]> _serverRequest;
+        private readonly Func<uint, uint, string, Task<(string Token, DateTime Expiration)>> _requestCdnAuthTokenAsync;
+        private readonly TimeProvider _clock = TimeProvider.System;
+        private readonly Dictionary<(uint DepotId, string Host), (string Token, DateTime Expiration)> _authorizations = new();
+        private readonly Dictionary<(uint DepotId, string Host), Task<string>> _authorizationRequests = new();
+        private readonly object _authorizationSync = new();
 
         public ConcurrentStack<Server> AvailableServerEndpoints = new ConcurrentStack<Server>();
 
@@ -24,6 +29,13 @@ namespace SteamPrefill.Handlers.Steam
             _ansiConsole = ansiConsole;
             _requestServersAsync = async () =>
                 (await steamSession.RequestAsync(() => steamSession.SteamContent.GetServersForSteamPipe(), steamSession.AuthLostToken)).ToArray();
+            _requestCdnAuthTokenAsync = async (app, depot, host) =>
+            {
+                var auth = await steamSession.RequestAsync(
+                    () => steamSession.SteamContent.GetCDNAuthToken(app, depot, host), steamSession.AuthLostToken);
+                return auth.Result == EResult.OK && !string.IsNullOrWhiteSpace(auth.Token)
+                    ? (auth.Token, auth.Expiration) : (null, DateTime.UtcNow.AddMinutes(2));
+            };
         }
 
         /// <summary>
@@ -38,10 +50,71 @@ namespace SteamPrefill.Handlers.Steam
                 new InvalidOperationException("The benchmark CDN pool cannot request Steam servers."));
         }
 
-        internal CdnPool(IAnsiConsole ansiConsole, Func<Task<Server[]>> requestServersAsync)
+        internal CdnPool(IAnsiConsole ansiConsole, Func<Task<Server[]>> requestServersAsync,
+            Func<uint, uint, string, Task<(string Token, DateTime Expiration)>> requestCdnAuthTokenAsync = null,
+            TimeProvider clock = null)
         {
             _ansiConsole = ansiConsole;
             _requestServersAsync = requestServersAsync;
+            _requestCdnAuthTokenAsync = requestCdnAuthTokenAsync;
+            _clock = clock ?? TimeProvider.System;
+        }
+
+        public string GetCachedCdnAuthToken(uint depotId, Server server)
+        {
+            lock (_authorizationSync)
+                return _authorizations.TryGetValue((depotId, server.Host), out var value)
+                    && value.Expiration > _clock.GetUtcNow().UtcDateTime.AddMinutes(1) ? value.Token : null;
+        }
+
+        public Task<string> GetCdnAuthTokenAsync(uint appId, uint depotId, Server server, CancellationToken cancellationToken = default)
+            => GetCdnAuthTokenAsync(appId, depotId, server, null, cancellationToken);
+
+        internal async Task<string> GetCdnAuthTokenAsync(uint appId, uint depotId, Server server,
+            string rejectedToken, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_requestCdnAuthTokenAsync == null) return null;
+            var key = (depotId, server.Host);
+            Task<string> request;
+            TaskCompletionSource<string> completion = null;
+            lock (_authorizationSync)
+            {
+                if (_authorizations.TryGetValue(key, out var value)
+                    && value.Expiration > _clock.GetUtcNow().UtcDateTime.AddMinutes(string.IsNullOrWhiteSpace(value.Token) ? 0 : 1)
+                    // A late 403 must not replace a newer token fetched by another downloader.
+                    && (rejectedToken == null || value.Token != rejectedToken))
+                    return value.Token;
+                if (!_authorizationRequests.TryGetValue(key, out request))
+                {
+                    completion = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    request = completion.Task;
+                    _authorizationRequests.Add(key, request);
+                }
+            }
+            // One Steam request per host/depot, independent of any individual chunk's cancellation.
+            if (completion != null) _ = FetchAuthorizationAsync(appId, depotId, server.Host, completion);
+            return await request.WaitAsync(cancellationToken);
+        }
+
+        private async Task FetchAuthorizationAsync(uint appId, uint depotId, string host, TaskCompletionSource<string> completion)
+        {
+            var key = (depotId, host);
+            try
+            {
+                var value = await _requestCdnAuthTokenAsync(appId, depotId, host);
+                lock (_authorizationSync)
+                {
+                    _authorizations[key] = value;
+                    _authorizationRequests.Remove(key);
+                }
+                completion.TrySetResult(value.Expiration > _clock.GetUtcNow().UtcDateTime ? value.Token : null);
+            }
+            catch (Exception error)
+            {
+                lock (_authorizationSync) _authorizationRequests.Remove(key);
+                completion.TrySetException(error);
+            }
         }
 
         /// <summary>
@@ -223,6 +296,9 @@ namespace SteamPrefill.Handlers.Steam
             }
             await PopulateAvailableServersAsync(cancellationToken);
         }
+
+        public static bool IsForbidden(Exception exception)
+            => exception is HttpRequestException { StatusCode: HttpStatusCode.Forbidden };
 
         /// <summary>
         /// Whether a failed request says the server that answered it is unhealthy, rather than that the request
