@@ -333,6 +333,9 @@
             List<QueuedRequest> chunkDownloadQueue = null;
             List<DepotInfo> skippedDepots = null;
             var linkedDepotsResolved = false;
+            var incrementalMode = downloadArgs.Force
+                ? IncrementalPrefillMode.Full
+                : AppConfig.IncrementalMode;
             try
             {
                 // Filter depots based on specified language/OS/cpu architecture/etc
@@ -382,7 +385,9 @@
                     {
                         (chunkDownloadQueue, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
                             filteredDepots,
-                            cancellationToken);
+                            incrementalMode,
+                            stageBaseline: true,
+                            cancellationToken: cancellationToken);
                     });
             }
             finally { _preparation.Release(); }
@@ -447,6 +452,7 @@
                 // Notify app started so frontend can animate the cached game
                 _progress.OnAppStarted(cachedAppInfo);
                 _progress.OnAppCompleted(cachedAppInfo, AppDownloadResult.AlreadyUpToDate);
+                _depotHandler.DiscardPendingBaselines(filteredDepots);
                 return;
             }
 
@@ -467,52 +473,59 @@
 
             _ansiConsole.LogMarkupVerbose($"Downloading {Magenta(totalBytes.ToDecimalString())} from {LightYellow(chunkDownloadQueue.Count)} chunks");
 
-            if (AppConfig.SkipDownloads)
+            try
             {
-                _ansiConsole.MarkupLine("");
-                _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Skipped);
-                return;
-            }
-
-            var downloadSuccessful = await downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, downloadArgs,
-                appId: appInfo.AppId, appName: appInfo.Name, cancellationToken: cancellationToken);
-            _prefillSummaryResult.TotalBytesTransferred += run == null ? totalBytes : ByteSize.FromBytes(run.Bytes(appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
-            if (downloadSuccessful)
-            {
-                if (!linkedDepotsResolved || skippedDepots.Any())
+                if (AppConfig.SkipDownloads || incrementalMode is IncrementalPrefillMode.DryRun or IncrementalPrefillMode.Bootstrap)
                 {
-                    // Sibling depots were cached, but the app is still incomplete.
-                    _prefillSummaryResult.FailedApps++;
-                    _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Failed);
+                    _ansiConsole.MarkupLine("");
+                    _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Skipped);
+                    return;
+                }
+
+                var downloadSuccessful = await downloadHandler.DownloadQueuedChunksAsync(chunkDownloadQueue, downloadArgs,
+                    appId: appInfo.AppId, appName: appInfo.Name, cancellationToken: cancellationToken);
+                _prefillSummaryResult.TotalBytesTransferred += run == null ? totalBytes : ByteSize.FromBytes(run.Bytes(appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                if (downloadSuccessful)
+                {
+                    if (!linkedDepotsResolved || skippedDepots.Any())
+                    {
+                        // Sibling depots were cached, but the app is still incomplete.
+                        _prefillSummaryResult.FailedApps++;
+                        _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Failed);
+                    }
+                    else
+                    {
+                        var item = run == null ? null : new RunItemSnapshot
+                        {
+                            AppId = appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                            Name = appInfo.Name,
+                            State = "completed",
+                            Result = "success",
+                            TotalBytes = appDownloadInfo.TotalBytes,
+                            BytesTransferred = run.Bytes(appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                        };
+                        var committed = false;
+                        _steam3.WhileAuthenticated(() => committed = _depotHandler.MarkDownloadAsSuccessful(filteredDepots, run?.Progress, item), cancellationToken);
+                        if (!committed) return;
+                        _prefillSummaryResult.Updated++;
+                        if (run == null) _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
+
+                        // Logging some metrics about the download
+                        _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
+                        _ansiConsole.WriteLine();
+                    }
                 }
                 else
                 {
-                    var item = run == null ? null : new RunItemSnapshot
-                    {
-                        AppId = appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        Name = appInfo.Name,
-                        State = "completed",
-                        Result = "success",
-                        TotalBytes = appDownloadInfo.TotalBytes,
-                        BytesTransferred = run.Bytes(appInfo.AppId.ToString(System.Globalization.CultureInfo.InvariantCulture))
-                    };
-                    var committed = false;
-                    _steam3.WhileAuthenticated(() => committed = _depotHandler.MarkDownloadAsSuccessful(filteredDepots, run?.Progress, item), cancellationToken);
-                    if (!committed) return;
-                    _prefillSummaryResult.Updated++;
-                    if (run == null) _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Success);
-
-                    // Logging some metrics about the download
-                    _ansiConsole.LogMarkupLine($"Finished in {LightYellow(downloadTimer.FormatElapsedString())} - {Magenta(totalBytes.CalculateBitrate(downloadTimer))}");
-                    _ansiConsole.WriteLine();
+                    _prefillSummaryResult.FailedApps++;
+                    _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Failed);
                 }
+                downloadTimer.Stop();
             }
-            else
+            finally
             {
-                _prefillSummaryResult.FailedApps++;
-                _progress.OnAppCompleted(appDownloadInfo, AppDownloadResult.Failed);
+                _depotHandler.DiscardPendingBaselines(filteredDepots);
             }
-            downloadTimer.Stop();
         }
 
         #endregion
@@ -654,7 +667,7 @@
 
                         var (allChunksForApp, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
                             filteredDepots,
-                            loopToken);
+                            cancellationToken: loopToken);
                         // Every depot can be dropped while fetching manifests, and an empty list would otherwise
                         // report the app as up to date with nothing left to download
                         if (filteredDepots.Count == 0)
@@ -981,7 +994,7 @@
                             var depotsToDownload = filteredDepots.Where(d => outdatedDepotIds.Contains(d.DepotId)).ToList();
                             var (chunks, skippedDepots) = await _depotHandler.BuildChunkDownloadQueueAsync(
                                 depotsToDownload,
-                                loopToken);
+                                cancellationToken: loopToken);
                             downloadSize = chunks.Sum(e => e.CompressedLength);
 
                             // The depots stay listed as outdated, they just have no size to add, so say so rather than

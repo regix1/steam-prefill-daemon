@@ -19,7 +19,7 @@ bytes stream through the cache and are discarded.
 - **Cache warm before you install** — pre-download titles overnight, install instantly later.
 - **LAN speed for every machine after the first** — the second install of the same version is served from cache.
 - **No disk writes, no free space needed** — bytes stream through and are discarded, sparing your SSD.
-- **Incremental** — only new or changed content re-downloads on later runs; prefilled apps are tracked by version.
+- **Incremental** — optionally fetch only chunks introduced by a new depot manifest, while retaining full-prefill and repair modes.
 - **Account login** — sign in with your Steam account; supports Steam Guard and the Steam Guard Mobile Authenticator.
 - **Headless daemon** — driven by LANCache Manager or any socket client.
 
@@ -58,6 +58,61 @@ Owned DLC is included with the parent game. Manifests are requested under the
 DLC's own AppID unless Steam points the depot at a shared app. Depots with no
 downloadable content are skipped. If one depot fails, the rest of the game still
 prefills, and the app is not treated as up to date until every depot succeeds.
+
+## Chunk-level incremental prefill
+
+SteamPrefill normally downloads every chunk when a depot manifest changes. This
+is the safest behavior because a LANCache may evict content independently of
+SteamPrefill. Operators with persistent caches can opt into chunk-level
+incremental prefill to request only chunks that were not present in the last
+successfully completed manifest:
+
+```yaml
+environment:
+  PREFILL_MODE: incremental
+  PREFILL_CACHE_GENERATION: primary-cache-v1
+volumes:
+  - ./config:/app/Config
+```
+
+`/app/Config` must be persistent. The daemon stores one compact manifest per
+depot under `Config/incremental/depots`; no game payload is stored there. A new
+baseline is committed only after every queued chunk for the app has transferred
+successfully. Failed or cancelled runs leave the previous baseline intact.
+
+The available modes are:
+
+| `PREFILL_MODE` | Behavior |
+| --- | --- |
+| `full` | Download every chunk for a changed manifest. This is the default and preserves existing behavior. |
+| `incremental` | Compare the current and last successful manifests and request only newly introduced chunks. A depot without a baseline receives a full prefill. |
+| `repair` | Request every chunk regardless of the baseline, then replace the baseline after success. |
+| `dry-run` | Calculate and report the incremental plan without downloading or changing a baseline. |
+| `bootstrap` | Seed baselines from successful legacy history, recovering an older manifest when possible, without downloading content. |
+
+The existing `--force` option always selects full mode for that run. This makes
+it suitable for an immediate cache repair without changing container settings.
+
+### Safe rollout and maintenance
+
+1. Keep `PREFILL_MODE=full` for the first successful prefill, or use
+   `PREFILL_MODE=bootstrap` to migrate existing successful-history data without
+   a download. Bootstrap may need Steam to retain the historical manifest; if
+   it cannot recover one, it reports the full gap and does not invent a
+   baseline.
+2. Switch to `PREFILL_MODE=incremental` for scheduled update checks.
+3. Schedule an occasional `repair` or `--force` run to re-request content that
+   LANCache may have evicted. The appropriate interval depends on the cache's
+   retention and available storage.
+4. Change `PREFILL_CACHE_GENERATION` after clearing, replacing, or materially
+   migrating the LANCache. A generation mismatch invalidates all old baselines;
+   the next incremental run safely performs a full prefill per depot.
+
+Incremental state records what SteamPrefill successfully requested; it cannot
+prove that LANCache still retains every recorded chunk. Do not use incremental
+mode without a repair schedule and a cache-generation policy. To roll back,
+set `PREFILL_MODE=full`; the legacy success history remains compatible and no
+database migration is required.
 
 ## Requirements
 
