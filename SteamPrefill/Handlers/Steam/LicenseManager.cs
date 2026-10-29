@@ -49,7 +49,7 @@
         }
 
         [SuppressMessage("Naming", "VSTHRD200", Justification = "Retains the established method name.")]
-        public async Task LoadPackageInfo(IReadOnlyCollection<LicenseListCallback.License> licenseList)
+        public async Task LoadPackageInfo(IReadOnlyCollection<LicenseListCallback.License> licenseList, Func<bool> isCurrent)
         {
             var licenses = new UserLicenses();
             var purchaseTimes = new Dictionary<uint, DateTime>();
@@ -99,6 +99,7 @@
             {
                 lock (_sync)
                 {
+                    if (!isCurrent()) return;
                     _userLicenses = licenses;
                     _appPurchaseTimeLookup = purchaseTimes;
                 }

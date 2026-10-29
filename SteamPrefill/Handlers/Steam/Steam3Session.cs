@@ -74,6 +74,10 @@ namespace SteamPrefill.Handlers.Steam
         private TaskCompletionSource<bool> _connected = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private TaskCompletionSource<SteamUser.LoggedOnCallback> _loggedOn = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource<bool> _licenses = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Steam can send several license lists after logon and each one loads in the background, so
+        // only the most recent list may be stored; an older load that finishes later would replace the
+        // full library with a partial one.
+        private int _licenseListVersion;
         private readonly CancellationTokenSource _authLost = new();
         private readonly CancellationToken _authLostToken;
         private bool _isAuthenticated;
@@ -544,23 +548,26 @@ namespace SteamPrefill.Handlers.Steam
                 _licenses.TrySetException(new SteamLoginException("Unable to retrieve user licenses!"));
                 return;
             }
-            _ = LoadLicensesAsync(licenseList.LicenseList.ToArray());
+            var version = Interlocked.Increment(ref _licenseListVersion);
+            _ = LoadLicensesAsync(licenseList.LicenseList.ToArray(), version);
         }
 
-        private async Task LoadLicensesAsync(IReadOnlyCollection<LicenseListCallback.License> licenses)
+        private async Task LoadLicensesAsync(IReadOnlyCollection<LicenseListCallback.License> licenses, int version)
         {
+            bool IsCurrent() => Volatile.Read(ref _licenseListVersion) == version;
             try
             {
                 var timer = Stopwatch.StartNew();
-                await LicenseManager.LoadPackageInfo(licenses);
+                await LicenseManager.LoadPackageInfo(licenses, IsCurrent);
+                if (!IsCurrent()) return;
                 WhileAuthenticated(() => _licenses.TrySetResult(true), _authLostToken);
-                _ansiConsole.LogMarkupLine("Loaded account licenses", timer);
+                _ansiConsole.LogMarkupLine($"Loaded {licenses.Count} account licenses", timer);
             }
-            catch (OperationCanceledException) { _licenses.TrySetCanceled(); }
+            catch (OperationCanceledException) { if (IsCurrent()) _licenses.TrySetCanceled(); }
             catch (Exception exception)
             {
                 FileLogger.LogException("Unable to load account licenses", exception);
-                _licenses.TrySetException(exception);
+                if (IsCurrent()) _licenses.TrySetException(exception);
             }
         }
 
