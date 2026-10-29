@@ -157,10 +157,7 @@ namespace SteamPrefill.Handlers
                         {
                             url += "?nocache=1";
                         }
-                        using var requestMessage = new HttpRequestMessage(HttpMethod.Get, url);
-                        requestMessage.Headers.Host = cdnServer.Host;
-
-                        using var response = await _client.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, requestCt);
+                        using var response = await DownloadAuthorizedChunkAsync(url, appId, request.DepotId, cdnServer, requestCt);
                         response.EnsureSuccessStatusCode();
                         using Stream responseStream = await response.Content.ReadAsStreamAsync(requestCt);
 
@@ -230,7 +227,7 @@ namespace SteamPrefill.Handlers
 
                 //TODO In the scenario where a user still had all requests fail, potentially display a warning that there is an underlying issue
                 // A missing chunk is the same on every server, so only a failure that indicts this server drops it.
-                if (failedRequests.Any(e => CdnPool.IsServerFault(e.LastFailureReason)))
+                if (failedRequests.Any(e => CdnPool.IsServerFault(e.LastFailureReason) || CdnPool.IsForbidden(e.LastFailureReason)))
                 {
                     await _cdnPool.DiscardConnectionAsync(cdnServer, CancellationToken.None);
                 }
@@ -263,6 +260,30 @@ namespace SteamPrefill.Handlers
             }
 
             return failedRequests;
+        }
+
+        private async Task<HttpResponseMessage> DownloadAuthorizedChunkAsync(
+            string url, uint appId, uint depotId, Server server, CancellationToken cancellationToken)
+        {
+            var token = await _cdnPool.GetCdnAuthTokenAsync(appId, depotId, server, cancellationToken);
+            var response = await SendChunkRequestAsync(url, server, token, cancellationToken);
+            if (response.StatusCode != HttpStatusCode.Forbidden) return response;
+            response.Dispose();
+            token = await _cdnPool.GetCdnAuthTokenAsync(appId, depotId, server, token, cancellationToken);
+            if (string.IsNullOrWhiteSpace(token))
+                throw new HttpRequestException("CDN refused the chunk and no authorization was available.", null, HttpStatusCode.Forbidden);
+            // One same-edge retry per chunk; persistent refusals follow the existing bounded failure path.
+            return await SendChunkRequestAsync(url, server, token, cancellationToken);
+        }
+
+        private async Task<HttpResponseMessage> SendChunkRequestAsync(
+            string url, Server server, string token, CancellationToken cancellationToken)
+        {
+            if (!string.IsNullOrWhiteSpace(token))
+                url += (url.Contains('?') ? "&" : "?") + token.TrimStart('?', '&');
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Host = server.Host;
+            return await _client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         }
 
         public void Dispose()
