@@ -373,7 +373,7 @@ public sealed class SteamPrefillApi : IDisposable
         catch (Exception ex)
         {
             // Only the message is broadcast to the caller; the exception argument goes to the local log.
-            // Without the reason in the message the caller is told the prefill failed and nothing more. [29]
+            // Without the reason in the message the caller is told the prefill failed and nothing more.
             output.OnError("Prefill operation failed", ex);
             return new PrefillResult
             {
@@ -385,20 +385,6 @@ public sealed class SteamPrefillApi : IDisposable
                 TotalTime = timer.Elapsed
             };
         }
-    }
-
-    /// <summary>
-    /// Prefills specific apps by their IDs
-    /// </summary>
-    public async Task<PrefillResult> PrefillAppsAsync(
-        IEnumerable<uint> appIds,
-        bool force = false,
-        CancellationToken cancellationToken = default)
-    {
-        ThrowIfNotInitialized();
-        ThrowIfDisposed();
-
-        return await PrefillAsync(new PrefillOptions { Force = force }, cancellationToken, appIds: appIds.ToArray());
     }
 
     /// <summary>

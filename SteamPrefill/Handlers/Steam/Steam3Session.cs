@@ -79,7 +79,6 @@ namespace SteamPrefill.Handlers.Steam
         private bool _isAuthenticated;
         private bool _logonRequested;
         private bool _disposed;
-        internal bool HasPendingRequests { get { lock (_sessionLock) return !_account.IsCompleted; } }
         public bool IsAuthenticated { get { lock (_sessionLock) return _isAuthenticated; } }
         public CancellationToken AuthLostToken => _authLostToken;
         internal string Username => _userAccountStore.CurrentUsername;
@@ -317,7 +316,7 @@ namespace SteamPrefill.Handlers.Steam
                 _userAccountStore.AccessToken = pollResponse.RefreshToken;
                 _userAccountStore.Save();
             }
-            catch (AuthenticationException authEx) when (authEx.Message.Contains("Expired"))
+            catch (SteamKit2.Authentication.AuthenticationException authEx) when (authEx.Result == EResult.Expired)
             {
                 // Steam's authentication session timed out (~2 minutes for mobile confirmation)
                 throw new AuthenticationException("Authentication session expired. Please try again and confirm on your Steam Mobile App within 2 minutes, or use a 2FA code instead.");

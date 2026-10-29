@@ -126,86 +126,6 @@ public sealed class DaemonReliabilityTests
     }
 
     [Fact]
-    public async Task TerminalPublication_KeepsSuccessorAdmissionClosed()
-    {
-        using var session = new Steam3Session(new TestConsole());
-        typeof(Steam3Session).GetField("_isAuthenticated", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(session, true);
-        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
-        typeof(SteamPrefillApi).GetField("_steamManager", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api,
-            new SteamManager(new TestConsole(), new DownloadArguments(), session));
-        typeof(SteamPrefillApi).GetField("_isInitialized", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, true);
-        using var commands = new SocketCommandInterface(GetFreeTcpPort());
-        typeof(SocketCommandInterface).GetField("_api", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(commands, api);
-        using var release = new ManualResetEventSlim();
-        var publishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var progress = new SocketCommandInterface.SocketProgress(_ => { publishing.TrySetResult(); release.Wait(); }, operationId: "publishing-run");
-        var slot = typeof(SocketCommandInterface).GetField("_run", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        slot.SetValue(commands, progress);
-        var completion = (Task)typeof(SocketCommandInterface).GetMethod("CompletePrefillAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
-            .Invoke(commands, new object[] { progress, Task.FromResult(new OwnedOperationResult(OwnedOperationStatus.Completed)) })!;
-        try
-        {
-            await publishing.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            var response = await (Task<CommandResponse>)typeof(SocketCommandInterface).GetMethod("HandlePrefillAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
-                .Invoke(commands, new object[] { new CommandRequest { Id = "next-run", Type = "prefill" }, CancellationToken.None })!;
-            Assert.False(response.Success);
-            Assert.Same(progress, slot.GetValue(commands));
-            Assert.False(progress.Publication.Task.IsCompleted);
-        }
-        finally { release.Set(); await completion; }
-        Assert.Null(slot.GetValue(commands));
-        Assert.True(progress.Publication.Task.IsCompletedSuccessfully);
-    }
-
-    [Theory]
-    [InlineData(OwnedOperationStatus.Completed)]
-    [InlineData(OwnedOperationStatus.Cancelled)]
-    [InlineData(OwnedOperationStatus.Failed)]
-    public async Task TerminalSelection_IsStableAndProgressPrecedesTerminal(OwnedOperationStatus first)
-    {
-        var updates = new List<PrefillProgressUpdate>();
-        var progress = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "run-1");
-        progress.OnAppStarted(new AppDownloadInfo { AppId = 222, Name = "Game" });
-        var failure = new SteamConnectionException(SteamFailure.AuthLost, new AsyncJobFailedException());
-        progress.SelectTerminal(first, first == OwnedOperationStatus.Failed ? failure : null);
-        progress.SelectTerminal(OwnedOperationStatus.Failed, failure);
-        progress.OnAppStarted(new AppDownloadInfo { AppId = 333, Name = "Late" });
-        progress.OnPrefillCompleted(new PrefillSummary { TotalApps = 999 });
-        await progress.PublishTerminalAsync(new OwnedOperationResult(OwnedOperationStatus.Completed));
-        await progress.PublishTerminalAsync(new OwnedOperationResult(OwnedOperationStatus.Failed));
-        Assert.Equal(2, updates.Count);
-        Assert.Equal("downloading", updates[0].State);
-        Assert.Equal(first == OwnedOperationStatus.Completed ? "completed" : first == OwnedOperationStatus.Cancelled ? "cancelled" : "error", updates[1].State);
-        Assert.Equal(0, updates[1].TotalApps);
-        Assert.All(updates, update => Assert.Equal("run-1", update.OperationId));
-        if (first == OwnedOperationStatus.Failed)
-        {
-            Assert.True(updates[1].RequiresLogin);
-            Assert.Equal("auth-lost", updates[1].ErrorCode);
-        }
-    }
-
-    [Fact]
-    public async Task FailedResult_ProducesFailedOwnerAndPreservesOriginalException()
-    {
-        await using var owner = new OwnedOperationCoordinator();
-        var updates = new List<PrefillProgressUpdate>();
-        var progress = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "run-failed");
-        var error = new SteamConnectionException(SteamFailure.GameDetailsUnavailable, new AsyncJobFailedException());
-        await owner.StartAsync(token => SocketCommandInterface.RunPrefillOperationAsync(
-            (_, _) => Task.FromResult(new PrefillResult { Success = false, Exception = error }),
-            new PrefillOptions(), progress, token));
-        var result = await owner.WaitAsync();
-        Assert.Equal(OwnedOperationStatus.Failed, result.Status);
-        Assert.Same(error, result.Exception);
-        Assert.Empty(updates);
-        await progress.PublishTerminalAsync(result);
-        Assert.Single(updates);
-        Assert.Equal("game-details-unavailable", updates[0].ErrorCode);
-        Assert.False(updates[0].RequiresLogin);
-    }
-
-    [Fact]
     public void WireFields_AreOptionalAndNeverExposeException()
     {
         var result = new PrefillResult
@@ -448,10 +368,17 @@ public sealed class DaemonReliabilityTests
         typeof(SteamPrefillApi).GetField("_selectedAppsCache", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(api, new List<uint> { 222 });
         using var commands = new SocketCommandInterface(GetFreeTcpPort());
         typeof(SocketCommandInterface).GetField("_api", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(commands, api);
-        var updates = new List<PrefillProgressUpdate>();
-        var active = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "other-run");
-        var slot = typeof(SocketCommandInterface).GetField("_run", BindingFlags.Instance | BindingFlags.NonPublic)!;
-        slot.SetValue(commands, active);
+        var instance = Assert.IsType<StatusData>((await ConcurrentPrefillTests.InvokeAsync(commands, new CommandRequest { Id = "status-1", Type = "status" })).Data).DaemonInstanceId!;
+        var runId = Guid.NewGuid().ToString("D");
+        var published = new ConcurrentQueue<RunSnapshot>();
+        var options = new RunOptions { AppIds = ["222"], MaxConcurrency = 1 };
+        var progress = new RunProgress(runId, instance, options, (snapshot, _) => { published.Enqueue(snapshot); return Task.CompletedTask; });
+        var run = new PrefillRun(options, progress, (RequestBudget)PrivateField(commands, "_budget").GetValue(commands)!, (ItemClaims)PrivateField(commands, "_claims").GetValue(commands)!);
+        var owner = (OwnedOperationCoordinator)PrivateField(commands, "_prefillOperation").GetValue(commands)!;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Assert.True((await owner.StartAsync(runId, "fingerprint", progress, token => release.Task.WaitAsync(token))).Accepted);
+        ((Dictionary<string, PrefillRun>)PrivateField(commands, "_runs").GetValue(commands)!).Add(runId, run);
+        var runBefore = progress.Snapshot;
         try
         {
             var method = typeof(SocketCommandInterface).GetMethod("HandleCommandAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -467,10 +394,16 @@ public sealed class DaemonReliabilityTests
             Assert.Equal("game-details-unavailable", response.ErrorCode);
             Assert.False(response.RequiresLogin);
             Assert.Equal("Steam did not return game details. Try again.", response.Error);
-            Assert.Null(active.Terminal);
-            Assert.Empty(updates);
+            Assert.Null(progress.Terminal);
+            Assert.Equal(runBefore, progress.Snapshot);
+            Assert.Empty(published);
+            Assert.True(owner.IsRunning);
         }
-        finally { slot.SetValue(commands, null); }
+        finally
+        {
+            release.TrySetResult();
+            await owner.WaitAsync(runId).WaitAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     [Theory]
@@ -493,39 +426,6 @@ public sealed class DaemonReliabilityTests
         else Assert.Equal(SteamFailure.AuthLost, (await Assert.ThrowsAsync<SteamConnectionException>(() => query.WaitAsync(TimeSpan.FromSeconds(2)))).Failure);
         response.TrySetResult(null!);
         Assert.Empty(handler.LoadedAppInfos);
-    }
-
-    [Fact]
-    public async Task AuthLossDuringPrefill_WaitsForCleanupAndPublishesFailureOnce()
-    {
-        await using var owner = new OwnedOperationCoordinator();
-        var updates = new List<PrefillProgressUpdate>();
-        var progress = new SocketCommandInterface.SocketProgress(updates.Add, operationId: "lost-run");
-        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var cleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        await owner.StartAsync(token => SocketCommandInterface.RunPrefillOperationAsync(async (_, token) =>
-        {
-            started.TrySetResult();
-            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
-            finally { cleanup.TrySetResult(); await release.Task; }
-            return new PrefillResult { Success = true };
-        }, new PrefillOptions(), progress, token));
-        await started.Task;
-        var error = new SteamConnectionException(SteamFailure.AuthLost);
-        progress.SelectTerminal(OwnedOperationStatus.Failed, error);
-        var completion = owner.CancelAndWaitAsync();
-        await cleanup.Task;
-        Assert.False(completion.IsCompleted);
-        Assert.Empty(updates);
-        release.TrySetResult();
-        var result = await completion;
-        Assert.Equal(OwnedOperationStatus.Failed, result.Status);
-        Assert.Same(error, result.Exception);
-        await progress.PublishTerminalAsync(result);
-        Assert.Single(updates);
-        Assert.Equal("error", updates[0].State);
-        Assert.True(updates[0].RequiresLogin);
     }
 
     [Fact]
@@ -616,65 +516,6 @@ public sealed class DaemonReliabilityTests
         }
 
         await commandCancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
-    }
-
-    [Fact]
-    public async Task PrefillCancellation_WaitsForCleanup_EmitsOneTerminalState_AndAllowsRestart()
-    {
-        var updates = new List<PrefillProgressUpdate>();
-        var progress = new SocketCommandInterface.SocketProgress(updates.Add);
-        await using var coordinator = new OwnedOperationCoordinator();
-        var operationStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var cleanupStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var allowCleanup = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        await coordinator.StartAsync(
-            cancellationToken => SocketCommandInterface.RunPrefillOperationAsync(
-                async (_, token) =>
-                {
-                    operationStarted.TrySetResult();
-                    try
-                    {
-                        await Task.Delay(Timeout.InfiniteTimeSpan, token);
-                    }
-                    finally
-                    {
-                        cleanupStarted.TrySetResult();
-                        await allowCleanup.Task;
-                    }
-
-                    return new PrefillResult { Success = true };
-                },
-                new PrefillOptions(),
-                progress,
-                cancellationToken),
-            CancellationToken.None);
-
-        await operationStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-
-        var cancelTask = coordinator.CancelAndWaitAsync();
-        await cleanupStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.False(cancelTask.IsCompleted);
-
-        allowCleanup.TrySetResult();
-        var result = await cancelTask.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.Equal(OwnedOperationStatus.Cancelled, result.Status);
-        Assert.Empty(updates);
-        await progress.PublishTerminalAsync(result);
-        Assert.Single(updates, update => update.State == "cancelled");
-        Assert.DoesNotContain(updates, update => update.State is "completed" or "error");
-
-        progress = new SocketCommandInterface.SocketProgress(updates.Add);
-        await coordinator.StartAsync(
-            cancellationToken => SocketCommandInterface.RunPrefillOperationAsync(
-                (_, _) => Task.FromResult(new PrefillResult { Success = true }),
-                new PrefillOptions(),
-                progress,
-                cancellationToken),
-            CancellationToken.None);
-
-        var restartedResult = await coordinator.WaitAsync();
-        Assert.Equal(OwnedOperationStatus.Completed, restartedResult.Status);
     }
 
     [Fact]
@@ -2456,6 +2297,59 @@ public sealed class DaemonReliabilityTests
 
         Assert.True(login.Success, login.Error);
         Assert.Equal("Login started - awaiting credentials", login.Message);
+    }
+
+    // The expiry comes only from a live Steam sign-in session, so the sign-in code is read from its IL:
+    // the expiry test must read the Result that SteamKit sets, because its message text is not a contract.
+    [Fact]
+    public void ExpiredSteamSignIn_IsDetectedFromTheResultSteamKitSets()
+    {
+        var accessToken = typeof(Steam3Session)
+            .GetMethod("GetAccessTokenAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var stateMachine = accessToken.GetCustomAttribute<System.Runtime.CompilerServices.AsyncStateMachineAttribute>()!.StateMachineType;
+        var moveNext = stateMachine.GetMethod("MoveNext", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!;
+        var il = moveNext.GetMethodBody()!.GetILAsByteArray()!;
+        var readsResult = false;
+        for (var index = 0; index + 4 < il.Length; index++)
+        {
+            if (il[index] != System.Reflection.Emit.OpCodes.Callvirt.Value) continue;
+            try
+            {
+                var called = moveNext.Module.ResolveMethod(BitConverter.ToInt32(il, index + 1));
+                if (called?.DeclaringType == typeof(SteamKit2.Authentication.AuthenticationException) && called.Name == "get_Result") readsResult = true;
+            }
+            catch (Exception ex) when (ex is ArgumentException or BadImageFormatException)
+            {
+                // Operand bytes of another instruction that happen to equal the opcode.
+            }
+        }
+
+        Assert.True(readsResult);
+    }
+
+    [Fact]
+    public async Task StartingASignIn_ClearsTheSignOutCode()
+    {
+        using var commands = new SocketCommandInterface(0);
+        PrivateField(commands, "_signOutCode").SetValue(commands, "auth-lost");
+        var before = Assert.IsType<StatusData>((await ConcurrentPrefillTests.InvokeAsync(commands,
+            new CommandRequest { Id = "status-1", Type = "status" })).Data);
+        Assert.Equal("auth-lost", before.ErrorCode);
+
+        // The background sign-in waits for the sign-in before it, so it cannot fail and set a code of its own
+        // before the status read below.
+        var earlier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        PrivateField(commands, "_loginTask").SetValue(commands, earlier.Task);
+        try
+        {
+            var login = await ConcurrentPrefillTests.InvokeAsync(commands, new CommandRequest { Id = "login-1", Type = "login" });
+            Assert.True(login.Success, login.Error);
+
+            var during = Assert.IsType<StatusData>((await ConcurrentPrefillTests.InvokeAsync(commands,
+                new CommandRequest { Id = "status-2", Type = "status" })).Data);
+            Assert.Null(during.ErrorCode);
+        }
+        finally { earlier.TrySetResult(); }
     }
 
     internal static SteamPrefillApi CreateApiOverSession(Steam3Session session)

@@ -119,8 +119,8 @@ public sealed class ConcurrentPrefillTests
             var excess = await InvokeAsync(commands, new CommandRequest { Id = Guid.NewGuid().ToString("D"), Type = "prefill", Parameters = new(starts[0].Parameters!) });
             Assert.Equal("run-limit", excess.ErrorCode);
             Assert.True((await InvokeAsync(commands, starts[0])).Success);
-            var ambiguous = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill" });
-            Assert.Equal("ambiguous-operation", ambiguous.ErrorCode);
+            var withoutOperation = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill" });
+            Assert.Equal("operation-not-found", withoutOperation.ErrorCode);
             var wrongInstance = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill", Parameters = new() { ["operationId"] = ids[1], ["daemonInstanceId"] = "previous-instance" } });
             Assert.Equal("instance-changed", wrongInstance.ErrorCode);
             var unknown = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill", Parameters = new() { ["operationId"] = "unknown", ["daemonInstanceId"] = status.DaemonInstanceId! } });
@@ -254,12 +254,83 @@ public sealed class ConcurrentPrefillTests
         var response = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         var request = session.RequestAsync(() => response.Task);
         await session.RequestsUnavailable.WaitAsync(TimeSpan.FromSeconds(2));
-        Assert.True(session.HasPendingRequests);
         Assert.False(session.IsAuthenticated);
         await Assert.ThrowsAsync<SteamPrefill.Models.Exceptions.SteamConnectionException>(() => session.RequestAsync(() => Task.FromResult(2)));
         response.TrySetResult(1);
         await Assert.ThrowsAsync<SteamPrefill.Models.Exceptions.SteamConnectionException>(() => request);
         await Assert.ThrowsAsync<SteamPrefill.Models.Exceptions.SteamConnectionException>(() => session.RequestAsync(() => Task.FromResult(3)));
+    }
+
+    [Fact]
+    public async Task APrefillWithoutProtocolVersionIsRefusedAsOutdated()
+    {
+        using var commands = new SocketCommandInterface(0);
+        using var session = new Steam3Session(new TestConsole());
+        DaemonReliabilityTests.PrivateField(session, "_isAuthenticated").SetValue(session, true);
+        using var api = DaemonReliabilityTests.CreateApiOverSession(session);
+        DaemonReliabilityTests.PrivateField(api, "_isInitialized").SetValue(api, true);
+        DaemonReliabilityTests.PrivateField(commands, "_api").SetValue(commands, api);
+
+        var response = await InvokeAsync(commands, new CommandRequest { Id = "prefill-1", Type = "prefill" });
+
+        Assert.False(response.Success);
+        Assert.Equal("daemon-outdated", response.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ASecondStartIsRefusedWhileTheFirstRunsTerminalPublicationIsPending()
+    {
+        var previousLimit = Environment.GetEnvironmentVariable("PREFILL_MAX_RUNS");
+        Environment.SetEnvironmentVariable("PREFILL_MAX_RUNS", "1");
+        var publishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var session = new Steam3Session(new TestConsole());
+        DaemonReliabilityTests.PrivateField(session, "_isAuthenticated").SetValue(session, true);
+        using var api = DaemonReliabilityTests.CreateApiOverSession(session);
+        DaemonReliabilityTests.PrivateField(api, "_isInitialized").SetValue(api, true);
+        using var commands = new SocketCommandInterface(0);
+        DaemonReliabilityTests.PrivateField(commands, "_api").SetValue(commands, api);
+        try
+        {
+            var status = Assert.IsType<StatusData>((await InvokeAsync(commands, new CommandRequest { Type = "status" })).Data);
+            Assert.Equal(1, status.MaxConcurrentRuns);
+            var owner = (OwnedOperationCoordinator)DaemonReliabilityTests.PrivateField(commands, "_prefillOperation").GetValue(commands)!;
+            var firstId = Guid.NewGuid().ToString("D");
+            var first = new RunProgress(firstId, status.DaemonInstanceId!, new RunOptions { AppIds = ["2000"], MaxConcurrency = 1 },
+                async (snapshot, token) =>
+                {
+                    if (snapshot.State != "completed") return;
+                    publishing.TrySetResult();
+                    await release.Task.WaitAsync(token);
+                }, sendTimeout: TimeSpan.FromSeconds(30));
+            Assert.True((await owner.StartAsync(firstId, "fingerprint", first, _ => Task.CompletedTask)).Accepted);
+            await publishing.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var second = await InvokeAsync(commands, new CommandRequest
+            {
+                Id = Guid.NewGuid().ToString("D"),
+                Type = "prefill",
+                Parameters = new()
+                {
+                    ["protocolVersion"] = "2",
+                    ["daemonInstanceId"] = status.DaemonInstanceId!,
+                    ["appIds"] = "[2001]",
+                    ["force"] = "true",
+                    ["maxConcurrency"] = "1"
+                }
+            });
+            Assert.Equal("run-limit", second.ErrorCode);
+            Assert.True(owner.IsRunning);
+
+            release.TrySetResult();
+            await owner.WaitAsync(firstId).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.False(owner.IsRunning);
+        }
+        finally
+        {
+            release.TrySetResult();
+            Environment.SetEnvironmentVariable("PREFILL_MAX_RUNS", previousLimit);
+        }
     }
 
     internal static Task<CommandResponse> InvokeAsync(SocketCommandInterface commands, CommandRequest request) =>

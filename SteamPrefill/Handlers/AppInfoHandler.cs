@@ -137,7 +137,7 @@
 
             // A dropped Steam connection leaves these PICS jobs pending forever, so both are bounded the
             // same way the manifest request code is.  One catch covers both because nothing between them
-            // waits on Steam, and the framework's own timeout text does not say what failed. [30]
+            // waits on Steam, and the framework's own timeout text does not say what failed.
             AsyncJobMultiple<PICSProductInfoCallback>.ResultSet resultSet;
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _steam3Session.AuthLostToken);
             var stage = "access-tokens";
