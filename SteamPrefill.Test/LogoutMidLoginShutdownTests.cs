@@ -16,14 +16,14 @@ namespace SteamPrefill.Test
     public sealed class LogoutMidLoginShutdownTests
     {
         [Fact]
-        public async Task Shutdown_AfterCancelledMidInitialize_DoesNotThrow_AndStaysUninitialized()
+        public async Task Shutdown_AfterCanceledMidInitialize_DoesNotThrow_AndStaysUninitialized()
         {
             using var api = new SteamPrefillApi(new StaticAuthProvider("testuser", "testpass"));
             using var cts = new CancellationTokenSource();
             cts.Cancel();
 
             // InitializeAsync constructs SteamManager/Steam3Session synchronously before the first
-            // await, then throws immediately on the pre-cancelled token (ConfigureLoginDetailsAsync's
+            // await, then throws immediately on the pre-canceled token (ConfigureLoginDetailsAsync's
             // first line is ThrowIfCancellationRequested). This reproduces the exact
             // "_steamManager constructed, _isInitialized still false" shape left behind by a logout
             // that cancels an in-flight login task before it finishes connecting.

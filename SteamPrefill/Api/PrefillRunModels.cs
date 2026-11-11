@@ -214,7 +214,7 @@ namespace SteamPrefill.Api
         public DateTimeOffset? StartedAt { get; set; }
         public string? Reason { get; set; }
         public int SkippedApps { get; set; }
-        public int CancelledApps { get; set; }
+        public int CanceledApps { get; set; }
         public string? OperationId { get; set; }
         public string? ErrorCode { get; set; }
         public bool? RequiresLogin { get; set; }

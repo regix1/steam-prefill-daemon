@@ -434,6 +434,7 @@ public sealed class SocketServer : IAsyncDisposable
 
     private async Task SendEventToClientInternalAsync<T>(ConnectedClient client, T eventData, System.Text.Json.Serialization.Metadata.JsonTypeInfo<T> typeInfo, CancellationToken cancellationToken)
     {
+        if (!string.IsNullOrEmpty(_sharedSecret) && !client.IsAuthenticated) { return; }
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, client.CancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(4));
         cancellationToken = timeout.Token;

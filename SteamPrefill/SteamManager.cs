@@ -252,7 +252,7 @@
 
                     // Also report it through the progress channel. The two lines above reach the
                     // console and app.log only, so a caller driving this over the daemon socket saw
-                    // an app fail with no reason for it anywhere, and the run still summarised as a
+                    // an app fail with no reason for it anywhere, and the run still summarized as a
                     // completion. Named app and exception type, because "Skipping app..." on its own
                     // does not say which app or why.
                     _progress.OnLog(

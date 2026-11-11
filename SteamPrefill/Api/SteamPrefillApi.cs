@@ -104,7 +104,7 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _progress.OnLog(LogLevel.Info, "Steam initialization cancelled");
+            _progress.OnLog(LogLevel.Info, "Steam initialization canceled");
             throw;
         }
         catch (Exception ex)
@@ -141,7 +141,7 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _progress.OnLog(LogLevel.Info, "Fetching owned games cancelled");
+            _progress.OnLog(LogLevel.Info, "Fetching owned games canceled");
             throw;
         }
         catch (Exception ex)
@@ -212,7 +212,7 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _progress.OnLog(LogLevel.Info, "Selected apps status request cancelled");
+            _progress.OnLog(LogLevel.Info, "Selected apps status request canceled");
             throw;
         }
         catch (Exception ex)
@@ -253,7 +253,7 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            _progress.OnLog(LogLevel.Info, "Cache status request cancelled");
+            _progress.OnLog(LogLevel.Info, "Cache status request canceled");
             throw;
         }
         catch (Exception ex)
@@ -367,7 +367,7 @@ public sealed class SteamPrefillApi : IDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            output.OnLog(LogLevel.Info, "Prefill operation cancelled");
+            output.OnLog(LogLevel.Info, "Prefill operation canceled");
             throw;
         }
         catch (Exception ex)

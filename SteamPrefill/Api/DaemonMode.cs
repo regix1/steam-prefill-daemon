@@ -38,7 +38,7 @@ public static class DaemonMode
 
         Console.WriteLine("Daemon started. Waiting for connections...");
 
-        // Keep running until cancelled
+        // Keep running until canceled
         try
         {
             await Task.Delay(Timeout.Infinite, cancellationToken);

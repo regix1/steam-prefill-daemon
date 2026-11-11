@@ -402,7 +402,7 @@ public sealed class DaemonReliabilityTests
         finally
         {
             release.TrySetResult();
-            await owner.WaitAsync(runId).WaitAsync(TimeSpan.FromSeconds(5));
+            await owner.WaitAsync().WaitAsync(TimeSpan.FromSeconds(5));
         }
     }
 
@@ -480,7 +480,7 @@ public sealed class DaemonReliabilityTests
     public async Task ClientDisconnect_CancelsItsRunningCommand()
     {
         var commandStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var commandCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var commandCanceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var port = GetFreeTcpPort();
 
         await using var server = new SocketServer(port, bindAddress: IPAddress.Loopback)
@@ -497,7 +497,7 @@ public sealed class DaemonReliabilityTests
                 {
                     if (cancellationToken.IsCancellationRequested)
                     {
-                        commandCancelled.TrySetResult();
+                        commandCanceled.TrySetResult();
                     }
                 }
 
@@ -515,7 +515,7 @@ public sealed class DaemonReliabilityTests
             await commandStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
         }
 
-        await commandCancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await commandCanceled.Task.WaitAsync(TimeSpan.FromSeconds(2));
     }
 
     [Fact]

@@ -107,7 +107,7 @@ public sealed class ConcurrentPrefillTests
                 var duplicate = new CommandRequest { Id = Guid.NewGuid().ToString("D"), Type = "prefill", Parameters = new(starts[0].Parameters!) };
                 duplicate.Parameters["appIds"] = "[" + appId + "]";
                 Assert.True((await InvokeAsync(commands, duplicate)).Success);
-                await owner.WaitAsync(duplicate.Id).WaitAsync(TimeSpan.FromSeconds(5));
+                await WaitUntilAsync(() => owner.GetActiveOperations().All(run => run.OperationId != duplicate.Id));
                 Assert.Equal("skippedOverlap", owner.GetOperation(duplicate.Id)!.Reason);
                 Assert.Equal(1, sent[0]);
             }
@@ -126,17 +126,17 @@ public sealed class ConcurrentPrefillTests
             var unknown = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill", Parameters = new() { ["operationId"] = "unknown", ["daemonInstanceId"] = status.DaemonInstanceId! } });
             Assert.Equal("operation-not-found", unknown.ErrorCode);
             var cancel = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill", Parameters = new() { ["operationId"] = ids[0], ["daemonInstanceId"] = status.DaemonInstanceId! } });
-            Assert.Equal("cancelling", Assert.IsType<RunSnapshot>(cancel.Data).State);
-            await owner.WaitAsync(ids[0]).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("canceling", Assert.IsType<RunSnapshot>(cancel.Data).State);
+            await WaitUntilAsync(() => owner.GetActiveOperations().All(run => run.OperationId != ids[0]));
             Assert.Equal(1, owner.GetOperation(ids[0])!.BytesTransferred);
             var repeated = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill", Parameters = new() { ["operationId"] = ids[0], ["daemonInstanceId"] = status.DaemonInstanceId! } });
-            Assert.Equal("cancelled", Assert.IsType<RunSnapshot>(repeated.Data).State);
+            Assert.Equal("canceled", Assert.IsType<RunSnapshot>(repeated.Data).State);
             Assert.Equal(1, disposed[0]);
             Assert.Equal(0, disposed[1]);
             Assert.Equal(0, disposed[2]);
             release.TrySetResult();
-            await Task.WhenAll(ids.Select(id => owner.WaitAsync(id))).WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.Equal("cancelled", owner.GetOperation(ids[0])!.State);
+            await WaitUntilAsync(() => owner.GetActiveOperations().Count == 0);
+            Assert.Equal("canceled", owner.GetOperation(ids[0])!.State);
             foreach (var id in ids.Skip(1))
             {
                 var page = Assert.IsType<PrefillPage>((await InvokeAsync(commands, new CommandRequest { Type = "get-operation", Parameters = new() { ["operationId"] = id, ["daemonInstanceId"] = status.DaemonInstanceId! } })).Data);
@@ -160,7 +160,7 @@ public sealed class ConcurrentPrefillTests
                 }
             };
             Assert.True((await InvokeAsync(commands, refill)).Success);
-            await owner.WaitAsync(refill.Id).WaitAsync(TimeSpan.FromSeconds(5));
+            await owner.WaitAsync().WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(2, sent[2]);
             Assert.Equal(3, owner.GetOperation(refill.Id)!.BytesTransferred);
             Assert.Equal(1, owner.GetOperation(refill.Id)!.CompletedApps);
@@ -175,7 +175,7 @@ public sealed class ConcurrentPrefillTests
                 }
             };
             Assert.True((await InvokeAsync(commands, cached)).Success);
-            await owner.WaitAsync(cached.Id).WaitAsync(TimeSpan.FromSeconds(5));
+            await owner.WaitAsync().WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(2, sent[2]);
             Assert.Equal(0, owner.GetOperation(cached.Id)!.BytesTransferred);
             Assert.Equal(1, owner.GetOperation(cached.Id)!.CachedApps);
@@ -200,9 +200,9 @@ public sealed class ConcurrentPrefillTests
         await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await Assert.ThrowsAsync<TimeoutException>(() => first.WaitAsync(TimeSpan.Zero));
         using var cancellation = new CancellationTokenSource();
-        var cancelled = session.RequestAsync(() => Task.FromResult(-1), cancellation.Token);
+        var canceled = session.RequestAsync(() => Task.FromResult(-1), cancellation.Token);
         cancellation.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => cancelled);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => canceled);
         var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var second = session.RequestAsync(() => { secondEntered.TrySetResult(); return Task.FromResult(2); });
         Assert.False(secondEntered.Task.IsCompleted);
@@ -223,10 +223,10 @@ public sealed class ConcurrentPrefillTests
     [Theory]
     [InlineData("preparing")]
     [InlineData("downloading")]
-    [InlineData("cancelling")]
+    [InlineData("canceling")]
     [InlineData("completed")]
     [InlineData("failed")]
-    [InlineData("cancelled")]
+    [InlineData("canceled")]
     public void EveryProgressStatePreservesRootIdentity(string state)
     {
         var snapshot = new RunSnapshot
@@ -323,7 +323,7 @@ public sealed class ConcurrentPrefillTests
             Assert.True(owner.IsRunning);
 
             release.TrySetResult();
-            await owner.WaitAsync(firstId).WaitAsync(TimeSpan.FromSeconds(5));
+            await owner.WaitAsync().WaitAsync(TimeSpan.FromSeconds(5));
             Assert.False(owner.IsRunning);
         }
         finally
@@ -336,6 +336,15 @@ public sealed class ConcurrentPrefillTests
     internal static Task<CommandResponse> InvokeAsync(SocketCommandInterface commands, CommandRequest request) =>
         (Task<CommandResponse>)typeof(SocketCommandInterface).GetMethod("HandleCommandAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
             .Invoke(commands, new object[] { request, CancellationToken.None })!;
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (!condition())
+        {
+            await Task.Delay(10, timeout.Token);
+        }
+    }
 
     private sealed class BodyHandler(TaskCompletionSource[] entered, TaskCompletionSource release, int[] disposed, int[] sent) : HttpMessageHandler
     {

@@ -61,7 +61,7 @@ namespace SteamPrefill.Test
             using var cleared = new ManualResetEventSlim();
             progress.LogReceived += (_, message) =>
             {
-                if (message == "Pending credential request cancelled") cleared.Set();
+                if (message == "Pending credential request canceled") cleared.Set();
             };
             // The test holds the lock a credential store holds while it swaps the pinned credential.
             var pinned = typeof(SocketAuthProvider)

@@ -66,7 +66,7 @@ public sealed class CacheCommitTests
             var before = progress.Snapshot;
             if (ordering == "terminal")
             {
-                Assert.True(progress.TryChooseTerminal("cancelled"));
+                Assert.True(progress.TryChooseTerminal("canceled"));
                 var terminal = progress.Snapshot;
                 Assert.False(handler.MarkDownloadAsSuccessful(new() { first, second }, progress, item));
                 Assert.False(entered.Task.IsCompleted);
@@ -85,15 +85,15 @@ public sealed class CacheCommitTests
             {
                 var committing = Task.Run(() => handler.MarkDownloadAsSuccessful(new() { first, second }, progress, item));
                 await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-                var cancelling = Task.Run(() => progress.TryChooseTerminal("cancelled"));
+                var canceling = Task.Run(() => progress.TryChooseTerminal("canceled"));
                 release.Set();
                 Assert.True(await committing.WaitAsync(TimeSpan.FromSeconds(5)));
-                Assert.True(await cancelling.WaitAsync(TimeSpan.FromSeconds(5)));
+                Assert.True(await canceling.WaitAsync(TimeSpan.FromSeconds(5)));
                 await progress.CompleteAsync();
                 Assert.Equal(1, replaced);
                 Assert.True(handler.AppIsUpToDate(new() { first, second }));
                 Assert.True(new DepotHandler(null!, null!, null!, path).AppIsUpToDate(new() { first, second }));
-                Assert.Equal("cancelled", progress.Snapshot.State);
+                Assert.Equal("canceled", progress.Snapshot.State);
                 Assert.Equal(1, progress.Snapshot.CompletedApps);
                 Assert.Equal(3, progress.Snapshot.BytesTransferred);
                 Assert.Equal(before.Sequence + 2, progress.Snapshot.Sequence);

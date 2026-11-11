@@ -75,7 +75,7 @@ namespace SteamPrefill
             }
             catch (OperationCanceledException)
             {
-                // Expected when cancelled
+                // Expected when canceled
                 return 0;
             }
             catch (Exception e)

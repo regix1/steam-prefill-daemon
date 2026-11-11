@@ -197,7 +197,7 @@ namespace SteamPrefill.Test
                                {
                                    requestStarted.TrySetResult();
                                    await Task.Delay(Timeout.InfiniteTimeSpan, token);
-                                   throw new InvalidOperationException("The cancelled app-info request unexpectedly resumed.");
+                                   throw new InvalidOperationException("The canceled app-info request unexpectedly resumed.");
                                });
             using var cancellation = new CancellationTokenSource();
 

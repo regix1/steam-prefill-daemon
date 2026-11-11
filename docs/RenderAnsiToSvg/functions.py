@@ -106,8 +106,8 @@ def _doRichTerminalTheme(theme: str | None) -> TerminalTheme:
 		],
 	)
 
-def _hexToRGB(colourCode: str) -> tuple[int, int, int]:
-	return tuple(int(colourCode[i : i + 2], base=16) for i in (0, 2, 4))
+def _hexToRGB(colorCode: str) -> tuple[int, int, int]:
+	return tuple(int(colorCode[i : i + 2], base=16) for i in (0, 2, 4))
 
 def encode_file_to_base64(file_path):
 	with open(file_path, "rb") as file:

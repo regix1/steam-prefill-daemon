@@ -343,7 +343,7 @@ public sealed class SocketCommandInterface : IDisposable
             cancellation = _loginCts;
             _loginCts = null;
             login = _loginTask;
-            foreach (var run in _runs.Values) run.Progress.TryChooseTerminal("cancelled");
+            foreach (var run in _runs.Values) run.Progress.TryChooseTerminal("canceled");
             completion = _prefillOperation.CancelAllAndWaitAsync();
             if (erase)
             {
@@ -375,7 +375,7 @@ public sealed class SocketCommandInterface : IDisposable
     private async Task<CommandResponse> HandleCancelLoginAsync(CommandRequest request)
     {
         await EndSessionAsync(false, true);
-        return new CommandResponse { Id = request.Id, Success = true, Message = "Login cancelled", CompletedAt = DateTime.UtcNow };
+        return new CommandResponse { Id = request.Id, Success = true, Message = "Login canceled", CompletedAt = DateTime.UtcNow };
     }
 
     internal static DaemonCommandLane ClassifyCommand(string commandType)
@@ -933,7 +933,7 @@ public sealed class SocketCommandInterface : IDisposable
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
-                    progress.TryChooseTerminal("cancelled");
+                    progress.TryChooseTerminal("canceled");
                     throw;
                 }
                 catch (Exception exception)
@@ -990,7 +990,7 @@ public sealed class SocketCommandInterface : IDisposable
             Sequence = snapshot.Sequence,
             StartedAt = snapshot.StartedAt,
             UpdatedAt = snapshot.UpdatedAt.UtcDateTime,
-            State = snapshot.State is "completed" or "failed" or "cancelled" or "cancelling" ? snapshot.State :
+            State = snapshot.State is "completed" or "failed" or "canceled" or "canceling" ? snapshot.State :
                 item?.Result == "already_cached" ? "already_cached" : item?.Result != null ? "app_completed" : snapshot.State,
             CurrentAppId = item == null ? 0 : uint.Parse(item.AppId, System.Globalization.CultureInfo.InvariantCulture),
             CurrentAppName = item?.Name,
@@ -1004,7 +1004,7 @@ public sealed class SocketCommandInterface : IDisposable
             AlreadyUpToDate = snapshot.CachedApps,
             FailedApps = snapshot.FailedApps,
             SkippedApps = snapshot.SkippedApps,
-            CancelledApps = snapshot.CancelledApps,
+            CanceledApps = snapshot.CanceledApps,
             TotalTime = snapshot.UpdatedAt - snapshot.StartedAt,
             ErrorCode = snapshot.State == "failed" ? snapshot.Reason : null,
             RequiresLogin = snapshot.Reason == "auth-lost" ? true : null
