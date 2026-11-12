@@ -12,7 +12,7 @@ namespace SteamPrefill.Handlers
         private readonly IAnsiConsole _ansiConsole;
         private readonly CdnPool _cdnPool;
         private readonly Func<DepotInfo, Task<ulong>> _requestManifestCodeAsync;
-        private readonly Func<DepotInfo, ulong, Server, Task<DepotManifest>> _downloadManifestAsync;
+        private readonly Func<DepotInfo, ulong, Server, string, Task<DepotManifest>> _downloadManifestAsync;
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> ManifestLocks = new(StringComparer.Ordinal);
 
         private const int MaxRetries = 3;
@@ -27,12 +27,13 @@ namespace SteamPrefill.Handlers
                     depot.ManifestRequestAppId,
                     depot.ManifestId.Value,
                     "public"), steam3Session.AuthLostToken);
-            _downloadManifestAsync = (depot, manifestRequestCode, server) =>
+            _downloadManifestAsync = (depot, manifestRequestCode, server, token) =>
                 steam3Session.RequestAsync(() => steam3Session.CdnClient.DownloadManifestAsync(
                     depot.DepotId,
                     depot.ManifestId.Value,
                     manifestRequestCode,
-                    server), steam3Session.AuthLostToken);
+                    server,
+                    cdnAuthToken: token), steam3Session.AuthLostToken);
         }
 
         internal ManifestHandler(
@@ -40,6 +41,15 @@ namespace SteamPrefill.Handlers
             CdnPool cdnPool,
             Func<DepotInfo, Task<ulong>> requestManifestCodeAsync,
             Func<DepotInfo, ulong, Server, Task<DepotManifest>> downloadManifestAsync)
+            : this(ansiConsole, cdnPool, requestManifestCodeAsync, (depot, code, server, _) => downloadManifestAsync(depot, code, server))
+        {
+        }
+
+        internal ManifestHandler(
+            IAnsiConsole ansiConsole,
+            CdnPool cdnPool,
+            Func<DepotInfo, Task<ulong>> requestManifestCodeAsync,
+            Func<DepotInfo, ulong, Server, string, Task<DepotManifest>> downloadManifestAsync)
         {
             _ansiConsole = ansiConsole;
             _cdnPool = cdnPool;
@@ -190,10 +200,11 @@ namespace SteamPrefill.Handlers
                 if (run != null) permit = await run.Budget.AcquireAsync(run.OperationId, run.Options.MaxConcurrency, cancellationToken);
                 // Called inside the try so that a client which throws before returning its task still reaches
                 // the finally, and the connection is not lost with it.
-                downloadTask = _downloadManifestAsync(
+                downloadTask = DownloadAuthorizedManifestAsync(
                     depot,
                     manifestRequestCode.Code,
-                    server);
+                    server,
+                    cancellationToken);
                 run?.Track(downloadTask);
                 // Bounded so that a CDN edge which accepts the connection and then goes silent fails this
                 // attempt instead of stalling the whole prefill.  A TimeoutException is a server fault, so
@@ -212,11 +223,12 @@ namespace SteamPrefill.Handlers
                 ReturnConnectionAfterCompletion(downloadTask, server);
                 throw;
             }
-            // A server error or a timed out request is the server's fault, not the depot's.  Returning it here
+            // A server error or a timed out request is the server's fault, not the depot's. Returning it here
             // would put it straight back on top of the stack for the retry to take again, which is how a single
             // dead edge failed every download for the life of the process.  508 is left to the caller's infinite
             // loop check, as it means the network is misconfigured rather than the server being bad.
-            catch (Exception e) when (CdnPool.IsServerFault(e))
+            // A 403 is only a failover reason after CDN-specific authorization was attempted.
+            catch (Exception e) when (CdnPool.IsServerFault(e) || CdnPool.IsForbidden(e))
             {
                 returnConnectionImmediately = false;
                 if (downloadTask != null && !downloadTask.IsCompleted)
@@ -254,6 +266,21 @@ namespace SteamPrefill.Handlers
 
             protoManifest.SaveToFile(depot.ManifestFileName);
             return protoManifest;
+        }
+
+        private async Task<DepotManifest> DownloadAuthorizedManifestAsync(
+            DepotInfo depot, ulong code, Server server, CancellationToken cancellationToken)
+        {
+            var token = _cdnPool.GetCachedCdnAuthToken(depot.DepotId, server);
+            try { return await _downloadManifestAsync(depot, code, server, token); }
+            catch (Exception e) when (CdnPool.IsForbidden(e))
+            {
+                token = await _cdnPool.GetCdnAuthTokenAsync(depot.ManifestRequestAppId, depot.DepotId, server,
+                    token, cancellationToken);
+                if (string.IsNullOrWhiteSpace(token)) throw;
+                _ansiConsole.LogMarkupVerbose($"Retrying CDN {Cyan(server.Host)} with depot authorization");
+                return await _downloadManifestAsync(depot, code, server, token);
+            }
         }
 
         private void ReturnConnectionAfterCompletion(Task downloadTask, Server server)
