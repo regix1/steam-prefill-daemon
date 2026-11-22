@@ -119,6 +119,21 @@ public sealed class ConcurrentPrefillTests
             var excess = await InvokeAsync(commands, new CommandRequest { Id = Guid.NewGuid().ToString("D"), Type = "prefill", Parameters = new(starts[0].Parameters!) });
             Assert.Equal("run-limit", excess.ErrorCode);
             Assert.True((await InvokeAsync(commands, starts[0])).Success);
+            Assert.Contains("changeConcurrency", status.Features);
+            Assert.Contains("addressProbe", status.Features);
+            Assert.Equal(DaemonCommandLane.Control, SocketCommandInterface.ClassifyCommand("change-concurrency"));
+            var budget = (RequestBudget)typeof(SocketCommandInterface).GetField("_budget", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(commands)!;
+            var raised = await InvokeAsync(commands, new CommandRequest { Type = "change-concurrency", Parameters = new() { ["operationId"] = ids[1], ["daemonInstanceId"] = status.DaemonInstanceId!, ["maxConcurrency"] = "2" } });
+            Assert.True(raised.Success);
+            Assert.Equal(ids[1], Assert.IsType<RunSnapshot>(raised.Data).OperationId);
+            Assert.Equal(2, budget.LimitFor(ids[1]));
+            var changeUnknown = await InvokeAsync(commands, new CommandRequest { Type = "change-concurrency", Parameters = new() { ["operationId"] = "unknown", ["daemonInstanceId"] = status.DaemonInstanceId!, ["maxConcurrency"] = "2" } });
+            Assert.Equal("operation-not-found", changeUnknown.ErrorCode);
+            var changeWrongInstance = await InvokeAsync(commands, new CommandRequest { Type = "change-concurrency", Parameters = new() { ["operationId"] = ids[1], ["daemonInstanceId"] = "previous-instance", ["maxConcurrency"] = "2" } });
+            Assert.Equal("instance-changed", changeWrongInstance.ErrorCode);
+            var changeToZero = await InvokeAsync(commands, new CommandRequest { Type = "change-concurrency", Parameters = new() { ["operationId"] = ids[1], ["daemonInstanceId"] = status.DaemonInstanceId!, ["maxConcurrency"] = "0" } });
+            Assert.False(changeToZero.Success);
+            Assert.Equal(2, budget.LimitFor(ids[1]));
             var withoutOperation = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill" });
             Assert.Equal("operation-not-found", withoutOperation.ErrorCode);
             var wrongInstance = await InvokeAsync(commands, new CommandRequest { Type = "cancel-prefill", Parameters = new() { ["operationId"] = ids[1], ["daemonInstanceId"] = "previous-instance" } });
@@ -333,6 +348,63 @@ public sealed class ConcurrentPrefillTests
         }
     }
 
+    // A request's timeout used to start before it waited for its permit, so a run whose limit was lowered
+    // timed out requests that were only queued behind the smaller wave.
+    [Fact(Timeout = 60_000)]
+    public async Task ALoweredLimitTimesEachRequestFromItsPermit()
+    {
+        var failedRequests = await DownloadWithLimitLoweredFromEightToTwoAsync(HttpStatusCode.OK, TimeSpan.FromMilliseconds(500), 12);
+
+        Assert.Empty(failedRequests);
+    }
+
+    // The source-down threshold is two waves of the limit the run has now, not the one it started with.
+    [Fact(Timeout = 60_000)]
+    public async Task ALoweredLimitMovesTheSourceDownThreshold()
+    {
+        var exception = await Assert.ThrowsAsync<TimeoutException>(() =>
+            DownloadWithLimitLoweredFromEightToTwoAsync(HttpStatusCode.ServiceUnavailable, TimeSpan.Zero, 30));
+
+        Assert.Contains("The first 4 requests", exception.Message, StringComparison.Ordinal);
+    }
+
+    private static async Task<ConcurrentBag<QueuedRequest>> DownloadWithLimitLoweredFromEightToTwoAsync(
+        HttpStatusCode status, TimeSpan delay, int requests)
+    {
+        var console = new TestConsole();
+        // A failed request discards its server, so the pool needs a source to refill from.
+        var pool = new CdnPool(console, () => Task.FromResult(new[] { DaemonReliabilityTests.CreateCdnServer("cdn-0") }));
+        pool.AvailableServerEndpoints = new ConcurrentStack<Server>(new[] { DaemonReliabilityTests.CreateCdnServer("cdn-0") });
+        using var handler = new DownloadHandler(console, pool, new ChunkHandler(status, delay), "cache.invalid");
+        // Three times one request, so a request timed from the start of its wait expires behind the earlier waves.
+        typeof(DownloadHandler).GetField("_perRequestTimeout", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .SetValue(handler, TimeSpan.FromSeconds(1.5));
+        using var budget = new RequestBudget(128);
+        var options = new RunOptions { AppIds = ["1"], MaxConcurrency = 8 };
+        var run = new PrefillRun(options, new RunProgress(Guid.NewGuid().ToString("D"), "instance-1", options), budget, new ItemClaims());
+        budget.ChangeLimit(run.OperationId, 2);
+        PrefillRun.Current.Value = run;
+        var failedRequests = new ConcurrentBag<QueuedRequest>();
+        await console.Progress().StartAsync(async ctx =>
+        {
+            failedRequests = await handler.AttemptDownloadAsync(ctx, "Downloading..",
+                Enumerable.Range(0, requests).Select(_ => default(QueuedRequest)).ToList(), run.Arguments);
+        });
+        return failedRequests;
+    }
+
+    // The resolver caches its first answer for the whole process (LancacheIpResolver._detectedServer), so the
+    // address must be in place before any test resolves, and an IP literal skips DNS.  Nothing listens on port 80
+    // in the test container, so a run's start request fails at once, logs its warning and the run goes on.
+#pragma warning disable CA2255 // A test assembly has no entry point to set the address from.
+    [System.Runtime.CompilerServices.ModuleInitializer]
+#pragma warning restore CA2255
+    internal static void UseLoopbackCache()
+    {
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("LANCACHE_IP")))
+            Environment.SetEnvironmentVariable("LANCACHE_IP", "127.0.0.1");
+    }
+
     internal static Task<CommandResponse> InvokeAsync(SocketCommandInterface commands, CommandRequest request) =>
         (Task<CommandResponse>)typeof(SocketCommandInterface).GetMethod("HandleCommandAsync", BindingFlags.Instance | BindingFlags.NonPublic)!
             .Invoke(commands, new object[] { request, CancellationToken.None })!;
@@ -353,6 +425,16 @@ public sealed class ConcurrentPrefillTests
             var index = int.Parse(request.RequestUri!.Segments[2].Trim('/')) - 2000;
             Interlocked.Increment(ref sent[index]);
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(new BodyStream(entered[index], release, disposed, index)) });
+        }
+    }
+
+    // A cache stand-in that answers every chunk after a fixed delay with the status the test picks.
+    private sealed class ChunkHandler(HttpStatusCode status, TimeSpan delay) : HttpMessageHandler
+    {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            await Task.Delay(delay, cancellationToken);
+            return new HttpResponseMessage(status) { Content = new ByteArrayContent(new byte[3]) };
         }
     }
 

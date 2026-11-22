@@ -687,7 +687,8 @@
                         {
                             AppId = app.AppId,
                             Name = app.Name,
-                            DownloadSize = downloadSize,
+                            // The estimate leaves out what the run will skip.
+                            DownloadSize = isUpToDate ? 0 : downloadSize,
                             IsUpToDate = isUpToDate
                         });
                     }

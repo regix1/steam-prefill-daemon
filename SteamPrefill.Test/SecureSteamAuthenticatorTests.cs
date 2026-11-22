@@ -111,6 +111,9 @@ namespace SteamPrefill.Test
                 return Task.FromResult(TwoFactorCode);
             }
 
+            public IDisposable OnPhoneApprovalCode(Func<string, Task> sendCode)
+                => NoPhoneApprovalCode.Instance;
+
             public Task GetDeviceConfirmationAsync(CancellationToken cancellationToken = default)
             {
                 DeviceConfirmationCallCount++;

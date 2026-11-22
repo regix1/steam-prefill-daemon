@@ -1799,6 +1799,66 @@ public sealed class DaemonReliabilityTests
         }
     }
 
+    // The prefill page's estimate is the sum of these sizes, so an app the run will skip has to count as nothing.
+    [Fact]
+    public async Task SelectedStatusLeavesAnUpToDateAppOutOfTheDownloadSize()
+    {
+        var console = new TestConsole();
+        using var session = new Steam3Session(null);
+        PrivateField(session, "_isAuthenticated").SetValue(session, true);
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(222);
+        var depot = CreateUncachedDepot();
+        session.LicenseManager._userLicenses.OwnedAppIds.Add(depot.LicenseAppId);
+        session.LicenseManager._userLicenses.OwnedDepotIds.Add(depot.DepotId);
+        var manifest = (Manifest)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Manifest));
+        typeof(Manifest).GetProperty(nameof(Manifest.Files))!.SetValue(manifest, new List<FileData> { new(new DepotManifest.FileData { Chunks = new List<DepotManifest.ChunkData> { new() { ChunkID = new byte[20], CompressedLength = 3 } } }) });
+        typeof(Manifest).GetProperty(nameof(Manifest.DepotId))!.SetValue(manifest, depot.DepotId);
+        typeof(Manifest).GetProperty(nameof(Manifest.Id))!.SetValue(manifest, depot.ManifestId!.Value);
+        manifest.SaveToFile(depot.ManifestFileName);
+        var app = new AppInfo(session, 222, new KeyValue
+        {
+            Children = { new KeyValue("common") { Children = { new KeyValue("type", "game") } } }
+        });
+        app.Depots.Add(depot);
+        var apps = new Mock<AppInfoHandler>(console, session, session.LicenseManager);
+        apps.Setup(handler => handler.RetrieveAppMetadataAsync(
+                It.IsAny<List<uint>>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        apps.Setup(handler => handler.GetAvailableGamesByIdAsync(
+                It.IsAny<List<uint>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(new List<AppInfo> { app }));
+        apps.Setup(handler => handler.GetAppInfoAsync(It.IsAny<uint>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.FromResult(app));
+        var pool = new CdnPool(console,
+            new ConcurrentStack<Server>(Enumerable.Range(0, 5).Select(_ => new Server())));
+        var depotHandler = new DepotHandler(session, apps.Object, new ManifestHandler(console, pool, session));
+        using var api = new SteamPrefillApi(new StaticAuthProvider("test", "test"));
+        PrivateField(api, "_steamManager").SetValue(api, new SteamManager(console, new DownloadArguments(), session,
+            cdnPool: pool, appInfoHandler: apps.Object, depotHandler: depotHandler));
+        PrivateField(api, "_isInitialized").SetValue(api, true);
+        PrivateField(api, "_selectedAppsCache").SetValue(api, new List<uint> { 222 });
+
+        try
+        {
+            var missing = await api.GetSelectedAppsStatusAsync(new List<CachedDepotInput>());
+            Assert.False(Assert.Single(missing.Apps).IsUpToDate);
+            Assert.Equal(3L, missing.TotalDownloadSize);
+
+            var current = await api.GetSelectedAppsStatusAsync(new List<CachedDepotInput>
+            {
+                new() { AppId = 222, DepotId = depot.DepotId, ManifestId = depot.ManifestId.Value }
+            });
+            var status = Assert.Single(current.Apps);
+            Assert.True(status.IsUpToDate);
+            Assert.Equal(0L, status.DownloadSize);
+            Assert.Equal(0L, current.TotalDownloadSize);
+        }
+        finally
+        {
+            File.Delete(depot.ManifestFileName);
+        }
+    }
+
     [Fact]
     public async Task CacheStatusVersionTwoReturnsEveryRequestedAppWithExactUnknownReasons()
     {
@@ -2489,7 +2549,7 @@ public sealed class DaemonReliabilityTests
         }
     }
 
-    private static Server CreateCdnServer(string host)
+    internal static Server CreateCdnServer(string host)
     {
         var server = new Server();
         typeof(Server).GetProperty(nameof(Server.Host))!.SetValue(server, host);

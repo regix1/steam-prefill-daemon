@@ -423,7 +423,6 @@ namespace SteamPrefill.Api
         public uint AppId { get; init; }
         public string Name { get; init; } = string.Empty;
         public long TotalBytes { get; init; }
-        public int ChunkCount { get; init; }
 
         /// <summary>
         /// List of depots that were downloaded, with their manifest IDs.
@@ -465,7 +464,6 @@ namespace SteamPrefill.Api
         public int UpdatedApps { get; init; }
         public int AlreadyUpToDate { get; init; }
         public int FailedApps { get; init; }
-        public int UnownedApps { get; init; }
         public long TotalBytesTransferred { get; init; }
         public TimeSpan TotalTime { get; init; }
     }

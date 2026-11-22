@@ -8,6 +8,9 @@ namespace SteamPrefill.Handlers
     {
         private const int MaxDownloadRetries = 2;
 
+        // Per-request timeout to prevent indefinite hangs (2 minutes should be plenty for any chunk)
+        private readonly TimeSpan _perRequestTimeout = TimeSpan.FromMinutes(2);
+
         private readonly IAnsiConsole _ansiConsole;
         private readonly CdnPool _cdnPool;
         private readonly HttpClient _client;
@@ -119,39 +122,46 @@ namespace SteamPrefill.Handlers
             long lastProgressReportTicks = 0;
             var progressThrottle = TimeSpan.FromMilliseconds(500);
 
-            // Per-request timeout to prevent indefinite hangs (2 minutes should be plenty for any chunk)
-            var perRequestTimeout = TimeSpan.FromMinutes(2);
-
             // The per-request timeout bounds one chunk, but nothing bounded the walk itself, so a cache that
             // answers nothing costs that timeout on every request still queued.  A queue holds tens of thousands
             // of chunks, which turns into hours of silence.  Two full waves failing without a single byte arriving
             // is a source that is not serving, so the rest of the queue is abandoned instead of walked.  Two waves
             // rather than one, because a queue whose first wave fails and then recovers is a working download.
-            var failuresBeforeSourceIsDown = downloadArgs.MaxConcurrentRequests * 2;
             var succeededCount = 0;
+            // Holds 0 while the source serves, and the failure count that tripped the check once it does not.
             var sourceIsDown = 0;
+
+            // A run's limit can be raised while it downloads, so its workers are sized from the process ceiling
+            // and the budget's permits hold the run to its current limit.
+            var run = PrefillRun.Current.Value;
+            var workers = run == null ? downloadArgs.MaxConcurrentRequests : run.Budget.MaxConcurrentRequests;
 
             var cdnServer = _cdnPool.TakeConnection();
             try
             {
-                await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = downloadArgs.MaxConcurrentRequests, CancellationToken = cancellationToken }, body: async (request, ct) =>
+                await Parallel.ForEachAsync(requestsToDownload, new ParallelOptions { MaxDegreeOfParallelism = workers, CancellationToken = cancellationToken }, body: async (request, ct) =>
                 {
+                    // Every acquire of one run passes the run's start value; a changed limit is applied by the budget.
+                    using var permit = run == null ? null : await run.Budget.AcquireAsync(run.OperationId, downloadArgs.MaxConcurrentRequests, ct);
+                    // Checked after the permit, so requests that waited behind a failing wave are abandoned too.
                     if (Volatile.Read(ref sourceIsDown) != 0)
                     {
                         failedRequests.Add(request);
                         return;
                     }
 
-                    // Create a linked cancellation token with a per-request timeout
+                    // Two waves of the run's current limit, read while this request's permit keeps the run's queue in
+                    // the budget, so a limit changed mid-run moves the threshold with it.
+                    var failuresBeforeSourceIsDown = (run == null ? downloadArgs.MaxConcurrentRequests : run.Budget.LimitFor(run.OperationId)) * 2;
+
+                    // Created once the permit is held, so the timeout counts only the request and never the wait.
                     // This ensures that individual requests don't hang indefinitely even if the main token doesn't have a timeout
-                    using var requestTimeoutCts = new CancellationTokenSource(perRequestTimeout);
+                    using var requestTimeoutCts = new CancellationTokenSource(_perRequestTimeout);
                     using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, requestTimeoutCts.Token);
                     var requestCt = linkedCts.Token;
 
                     try
                     {
-                        var run = PrefillRun.Current.Value;
-                        using var permit = run == null ? null : await run.Budget.AcquireAsync(run.OperationId, downloadArgs.MaxConcurrentRequests, requestCt);
                         var url = $"http://{_lancacheAddress}/depot/{request.DepotId}/chunk/{request.ChunkId}";
                         if (forceRecache)
                         {
@@ -185,7 +195,7 @@ namespace SteamPrefill.Handlers
                     catch (OperationCanceledException) when (requestTimeoutCts.IsCancellationRequested)
                     {
                         // Per-request timeout - treat as a failure that can be retried
-                        request.LastFailureReason = new TimeoutException($"Request timed out after {perRequestTimeout.TotalSeconds} seconds");
+                        request.LastFailureReason = new TimeoutException($"Request timed out after {_perRequestTimeout.TotalSeconds} seconds");
                         failedRequests.Add(request);
                     }
                     catch (Exception e)
@@ -197,7 +207,7 @@ namespace SteamPrefill.Handlers
                     // working transfer can never trip it.
                     if (Volatile.Read(ref succeededCount) == 0 && failedRequests.Count >= failuresBeforeSourceIsDown)
                     {
-                        Volatile.Write(ref sourceIsDown, 1);
+                        Interlocked.CompareExchange(ref sourceIsDown, failuresBeforeSourceIsDown, 0);
                     }
 
                     progressTask.Increment(request.CompressedLength);
@@ -257,7 +267,7 @@ namespace SteamPrefill.Handlers
             if (Volatile.Read(ref sourceIsDown) != 0)
             {
                 throw new TimeoutException(
-                    $"Gave up downloading from {_lancacheAddress}.  The first {failuresBeforeSourceIsDown} requests for {cdnServer.Host} all failed " +
+                    $"Gave up downloading from {_lancacheAddress}.  The first {Volatile.Read(ref sourceIsDown)} requests for {cdnServer.Host} all failed " +
                     "and not one byte arrived, so the rest of the queue was abandoned rather than waiting on every remaining chunk.  " +
                     "Check that the cache is running and that it can reach the internet.");
             }

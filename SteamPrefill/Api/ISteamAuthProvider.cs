@@ -38,6 +38,14 @@ public interface ISteamAuthProvider
     Task GetDeviceConfirmationAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Registers how the sign-in takes a Steam Guard code while Steam waits for the phone approval. Once the device
+    /// confirmation is acknowledged, a provider that can ask for a code asks for one and hands it to
+    /// <paramref name="sendCode"/>, asking again while that throws a SteamKit2 <c>AuthenticationException</c> (a code Steam
+    /// refused). Disposing the registration ends the ask.
+    /// </summary>
+    IDisposable OnPhoneApprovalCode(Func<string, Task> sendCode);
+
+    /// <summary>
     /// Called when the auth token has expired and new credentials are needed.
     /// </summary>
     Task<string> GetNewPasswordAsync(string message, CancellationToken cancellationToken = default);
@@ -95,6 +103,9 @@ public class StaticAuthProvider : ISteamAuthProvider
     public Task GetDeviceConfirmationAsync(CancellationToken cancellationToken = default)
         => Task.CompletedTask; // Static provider can't prompt for device confirmation
 
+    public IDisposable OnPhoneApprovalCode(Func<string, Task> sendCode)
+        => NoPhoneApprovalCode.Instance; // Static provider has nobody to ask for a code
+
     public Task<string> GetNewPasswordAsync(string message, CancellationToken cancellationToken = default)
         => Task.FromResult(_password);
 
@@ -103,138 +114,17 @@ public class StaticAuthProvider : ISteamAuthProvider
 }
 
 /// <summary>
-/// Event-based auth provider that raises events when credentials are needed.
-/// Useful for web/UI scenarios where you need to prompt users asynchronously.
+/// The registration a provider that never asks for a code during the phone approval hands back: nothing to end.
 /// </summary>
-public class EventAuthProvider : ISteamAuthProvider
+public sealed class NoPhoneApprovalCode : IDisposable
 {
-    private TaskCompletionSource<string>? _pendingCredential;
-    private readonly SemaphoreSlim _lock = new(1, 1);
+    public static readonly NoPhoneApprovalCode Instance = new();
 
-    /// <summary>
-    /// Raised when username is needed
-    /// </summary>
-    public event EventHandler? UsernameRequired;
-
-    /// <summary>
-    /// Raised when password is needed
-    /// </summary>
-    public event EventHandler? PasswordRequired;
-
-    /// <summary>
-    /// Raised when Steam Guard (email) code is needed. Email address is in EventArgs.
-    /// </summary>
-    public event EventHandler<string>? SteamGuardRequired;
-
-    /// <summary>
-    /// Raised when 2FA code from mobile authenticator is needed
-    /// </summary>
-    public event EventHandler? TwoFactorRequired;
-
-    /// <summary>
-    /// Raised when device confirmation via Steam Mobile App is required
-    /// </summary>
-    public event EventHandler? DeviceConfirmationRequired;
-
-    /// <summary>
-    /// Call this to provide the requested credential
-    /// </summary>
-    public void ProvideCredential(string credential)
+    private NoPhoneApprovalCode()
     {
-        _pendingCredential?.TrySetResult(credential);
     }
 
-    /// <summary>
-    /// Call this to cancel the pending credential request
-    /// </summary>
-    public void CancelCredentialRequest()
+    public void Dispose()
     {
-        _pendingCredential?.TrySetCanceled();
     }
-
-    public async Task<string> GetUsernameAsync(CancellationToken cancellationToken = default)
-    {
-        await _lock.WaitAsync(cancellationToken);
-        try
-        {
-            _pendingCredential = new TaskCompletionSource<string>();
-            UsernameRequired?.Invoke(this, EventArgs.Empty);
-            using var reg = cancellationToken.Register(() => _pendingCredential.TrySetCanceled());
-            return await _pendingCredential.Task;
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
-
-    public async Task<string> GetPasswordAsync(CancellationToken cancellationToken = default)
-    {
-        await _lock.WaitAsync(cancellationToken);
-        try
-        {
-            _pendingCredential = new TaskCompletionSource<string>();
-            PasswordRequired?.Invoke(this, EventArgs.Empty);
-            using var reg = cancellationToken.Register(() => _pendingCredential.TrySetCanceled());
-            return await _pendingCredential.Task;
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
-
-    public async Task<string> GetSteamGuardCodeAsync(string email, CancellationToken cancellationToken = default)
-    {
-        await _lock.WaitAsync(cancellationToken);
-        try
-        {
-            _pendingCredential = new TaskCompletionSource<string>();
-            SteamGuardRequired?.Invoke(this, email);
-            using var reg = cancellationToken.Register(() => _pendingCredential.TrySetCanceled());
-            return await _pendingCredential.Task;
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
-
-    public async Task<string> GetTwoFactorCodeAsync(CancellationToken cancellationToken = default)
-    {
-        await _lock.WaitAsync(cancellationToken);
-        try
-        {
-            _pendingCredential = new TaskCompletionSource<string>();
-            TwoFactorRequired?.Invoke(this, EventArgs.Empty);
-            using var reg = cancellationToken.Register(() => _pendingCredential.TrySetCanceled());
-            return await _pendingCredential.Task;
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
-
-    public async Task GetDeviceConfirmationAsync(CancellationToken cancellationToken = default)
-    {
-        await _lock.WaitAsync(cancellationToken);
-        try
-        {
-            _pendingCredential = new TaskCompletionSource<string>();
-            DeviceConfirmationRequired?.Invoke(this, EventArgs.Empty);
-            using var reg = cancellationToken.Register(() => _pendingCredential.TrySetCanceled());
-            await _pendingCredential.Task; // Wait for acknowledgment
-        }
-        finally
-        {
-            _lock.Release();
-        }
-    }
-
-    public async Task<string> GetNewPasswordAsync(string message, CancellationToken cancellationToken = default)
-        => await GetPasswordAsync(cancellationToken);
-
-    public Task<string?> GetCachedPasswordAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult<string?>(null); // Event provider always prompts
 }

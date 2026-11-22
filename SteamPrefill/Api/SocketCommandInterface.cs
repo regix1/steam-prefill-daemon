@@ -56,6 +56,7 @@ public sealed class SocketCommandInterface : IDisposable
         "get-operation",
         "shutdown",
         "cancel-prefill",
+        "change-concurrency",
         "cancel-login",
         "provide-credential",
         "get-auto-login-challenge",
@@ -147,6 +148,7 @@ public sealed class SocketCommandInterface : IDisposable
                 "logout" => await HandleLogoutAsync(request, cancellationToken),
                 "cancel-login" => await HandleCancelLoginAsync(request),
                 "cancel-prefill" => await HandleCancelPrefillAsync(request, cancellationToken),
+                "change-concurrency" => await HandleChangeConcurrencyAsync(request, cancellationToken),
                 "provide-credential" => HandleProvideCredential(request),
                 "get-auto-login-challenge" => HandleGetAutoLoginChallenge(request),
                 "provide-auto-login" => await HandleProvideAutoLoginAsync(request, cancellationToken),
@@ -382,7 +384,7 @@ public sealed class SocketCommandInterface : IDisposable
     {
         return commandType.ToLowerInvariant() switch
         {
-            "cancel-login" or "cancel-prefill" or "provide-credential" or "status" or "get-operation" or "shutdown"
+            "cancel-login" or "cancel-prefill" or "change-concurrency" or "provide-credential" or "status" or "get-operation" or "shutdown"
                 => DaemonCommandLane.Control,
             "get-owned-games" or "get-selected-apps" or "get-cache-info" or
                 "get-selected-apps-status" or "check-cache-status"
@@ -400,6 +402,30 @@ public sealed class SocketCommandInterface : IDisposable
                 if (request.Parameters.GetValueOrDefault("daemonInstanceId") != _protocol.DaemonInstanceId)
                     return Task.FromResult(new CommandResponse { Id = request.Id, Success = false, Error = "instance-changed", ErrorCode = "instance-changed" });
                 var operation = _prefillOperation.Cancel(operationId, _protocol.DaemonInstanceId);
+                return Task.FromResult(new CommandResponse
+                {
+                    Id = request.Id,
+                    Success = operation != null,
+                    Data = operation,
+                    Error = operation == null ? "operation-not-found" : null,
+                    ErrorCode = operation == null ? "operation-not-found" : null
+                });
+            }
+        }
+        return Task.FromResult(new CommandResponse { Id = request.Id, Success = false, Error = "operation-not-found", ErrorCode = "operation-not-found" });
+    }
+
+    private Task<CommandResponse> HandleChangeConcurrencyAsync(CommandRequest request, CancellationToken cancellationToken)
+    {
+        if (request.Parameters?.TryGetValue("operationId", out var operationId) == true)
+        {
+            lock (_lifecycle)
+            {
+                if (request.Parameters.GetValueOrDefault("daemonInstanceId") != _protocol.DaemonInstanceId)
+                    return Task.FromResult(new CommandResponse { Id = request.Id, Success = false, Error = "instance-changed", ErrorCode = "instance-changed" });
+                // A missing, non-integer or out-of-range limit throws, and the command's catch refuses it.
+                var limit = PrefillProtocol.ParseRequestLimit(request.Parameters.GetValueOrDefault("maxConcurrency"));
+                var operation = _prefillOperation.ChangeConcurrency(operationId, _protocol.DaemonInstanceId, limit, _budget);
                 return Task.FromResult(new CommandResponse
                 {
                     Id = request.Id,
@@ -695,7 +721,7 @@ public sealed class SocketCommandInterface : IDisposable
                     ,
                     ErrorCode = ready ? null : _signOutCode,
                     ProtocolVersion = PrefillProtocol.Version,
-                    Features = [.. PrefillProtocol.Features, "cacheStatusAppIds", "cacheStatusV2"],
+                    Features = [.. PrefillProtocol.Features, "cacheStatusAppIds", "cacheStatusV2", "addressProbe", "phoneApprovalCode"],
                     DaemonInstanceId = _protocol.DaemonInstanceId,
                     MaxConcurrentRuns = _protocol.MaxConcurrentRuns,
                     MaxConcurrentRequests = _protocol.MaxConcurrentRequests,
@@ -922,6 +948,11 @@ public sealed class SocketCommandInterface : IDisposable
                 PrefillRun.Current.Value = run;
                 try
                 {
+                    // The manager records the address the cache logs for this request as the run's prefill address,
+                    // which works in every network setup without the manager knowing which.  The console is the one
+                    // the run's downloads resolve the cache through.
+                    await LancacheIpResolver.SendRunProbeAsync(new ApiConsoleAdapter(_authProvider, _progress),
+                        AppConfig.SteamTriggerDomain, run.OperationId, token);
                     var result = await api.PrefillAsync(options, token, sink);
                     if (!result.Success)
                     {

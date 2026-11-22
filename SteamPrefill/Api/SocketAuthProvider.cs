@@ -24,6 +24,7 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
     private readonly SemaphoreSlim _credentialLock = new(1, 1);
     private TaskCompletionSource<EncryptedCredentialResponse>? _pendingCredential;
     private string? _currentChallengeId;
+    private PhoneApprovalCodeAsk? _phoneApprovalCode;
     private bool _disposed;
 
     // Store credentials securely in pinned memory
@@ -171,6 +172,82 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
     {
         // Send a device-confirmation challenge to notify the client to check their Steam app
         await RequestSecureCredentialAsync("device-confirmation", null, cancellationToken);
+        // Steam also takes a code while it waits for the phone, so the client is asked for one beside the wait.
+        _phoneApprovalCode?.Start();
+    }
+
+    public IDisposable OnPhoneApprovalCode(Func<string, Task> sendCode)
+    {
+        var registration = new PhoneApprovalCodeAsk(this, sendCode);
+        _phoneApprovalCode = registration;
+        return registration;
+    }
+
+    /// <summary>
+    /// Asks the client for a code while Steam waits for the phone approval and hands it to the sign-in, asking again for
+    /// each code Steam refuses. Disposing it ends the ask and waits for it, so the credential lock it holds is free for
+    /// the next request.
+    /// </summary>
+    private sealed class PhoneApprovalCodeAsk(SocketAuthProvider auth, Func<string, Task> sendCode) : IDisposable
+    {
+        private readonly object _lock = new();
+        private readonly CancellationTokenSource _ended = new();
+        private Task? _asking;
+        private bool _disposed;
+
+        public void Start()
+        {
+            lock (_lock)
+            {
+                if (_disposed || _asking != null) return;
+                _asking = AskAsync(_ended.Token);
+            }
+        }
+
+        private async Task AskAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                while (true)
+                {
+                    var code = await auth.GetTwoFactorCodeAsync(cancellationToken);
+                    try
+                    {
+                        await sendCode(code);
+                        return;
+                    }
+                    catch (SteamKit2.Authentication.AuthenticationException)
+                    {
+                        auth._progress.OnLog(LogLevel.Info, "Steam did not accept the code typed during the phone approval; asking again");
+                    }
+                }
+            }
+            // The sign-in ended (this registration's dispose, or a cancel-login clearing the pending request).
+            catch (OperationCanceledException)
+            {
+            }
+            // The five-minute wait for the code ran out, or the code could not be decrypted (RequestSecureCredentialAsync),
+            // or Steam failed the send's job: the phone approval goes on without a code.
+            catch (Exception ex) when (ex is AuthenticationException or InvalidOperationException or SteamKit2.AsyncJobFailedException)
+            {
+                auth._progress.OnLog(LogLevel.Warning, $"Stopped asking for a code during the phone approval: {ex.Message}");
+            }
+        }
+
+        public void Dispose()
+        {
+            Task? asking;
+            lock (_lock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _ended.Cancel();
+                asking = _asking;
+            }
+            asking?.GetAwaiter().GetResult();
+            _ended.Dispose();
+            if (ReferenceEquals(auth._phoneApprovalCode, this)) auth._phoneApprovalCode = null;
+        }
     }
 
     public Task<string> GetNewPasswordAsync(string message, CancellationToken cancellationToken = default)
@@ -208,6 +285,8 @@ public sealed class SocketAuthProvider : ISteamAuthProvider, IDisposable
         if (_disposed) return;
 
         ClearPinnedCredential();
+        // Ends a code ask still running, which holds the credential lock disposed next.
+        _phoneApprovalCode?.Dispose();
         _credentialLock.Dispose();
         _pendingCredential?.TrySetCanceled();
         _disposed = true;

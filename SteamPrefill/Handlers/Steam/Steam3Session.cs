@@ -146,14 +146,12 @@ namespace SteamPrefill.Handlers.Steam
             _callbackManager.Subscribe<SteamClient.ConnectedCallback>(e =>
             {
                 _isConnecting = false;
-                _disconnected = false;
                 _connected.TrySetResult(true);
             });
             // If a connection attempt fails in any way, SteamKit2 notifies of the failure with a "disconnect"
             _callbackManager.Subscribe<SteamClient.DisconnectedCallback>(e =>
             {
                 _isConnecting = false;
-                _disconnected = true;
                 _connected.TrySetResult(false);
                 InvalidateAuthentication(null);
                 _loggedOn.TrySetException(new SteamConnectionException(SteamFailure.AuthLost));
@@ -313,6 +311,10 @@ namespace SteamPrefill.Handlers.Steam
             // Also add a 3-minute timeout as a safety measure for device confirmation
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
             using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+            // While Steam waits for the phone approval it also takes a Steam Guard code into this session; the next poll
+            // then returns the tokens. Ends with the poll, so no code is asked for once the sign-in is over.
+            using var phoneApprovalCode = _authProvider?.OnPhoneApprovalCode(
+                code => authSession.SendSteamGuardCodeAsync(code, EAuthSessionGuardType.k_EAuthSessionGuardType_DeviceCode));
 
             try
             {
@@ -494,15 +496,6 @@ namespace SteamPrefill.Handlers.Steam
             return true;
         }
 
-        private bool _disconnected = true;
-
-        /// <summary>
-        /// True once a logged in session has lost its connection to Steam.  <see cref="_disconnected"/> also reads
-        /// true before the first connection is ever made, so the logon result is what separates a session that
-        /// dropped from one that has not logged in yet.
-        /// </summary>
-        public bool IsDisconnected => _disconnected && _loggedOnCallbackResult != null;
-
         public void Disconnect()
         {
             if (_disposed) return;
@@ -511,7 +504,6 @@ namespace SteamPrefill.Handlers.Steam
             _pumpCts.Cancel();
             _steamClient.Disconnect();
             if (Task.CurrentId != _pump.Id) _pump.GetAwaiter().GetResult();
-            _disconnected = true;
             _isConnecting = false;
             _connected.TrySetCanceled();
             _loggedOn.TrySetCanceled();
