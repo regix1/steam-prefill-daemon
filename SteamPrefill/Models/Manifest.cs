@@ -98,6 +98,12 @@ namespace SteamPrefill.Models
             CompressedLength = sourceChunk.CompressedLength;
         }
 
+        internal ChunkData(string chunkId, uint compressedLength)
+        {
+            ChunkId = chunkId;
+            CompressedLength = compressedLength;
+        }
+
         public override string ToString()
         {
             return $"{ChunkId} - {CompressedLength}";

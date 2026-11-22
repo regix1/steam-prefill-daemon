@@ -14,20 +14,28 @@
         private readonly object _commit = new();
         private readonly string _successPath;
         private readonly Action<string, string> _replace;
+        private readonly IncrementalBaselineStore _baselineStore;
+        private readonly IncrementalPrefillMode _incrementalMode;
+        private readonly ConcurrentDictionary<(uint DepotId, ulong ManifestId), Manifest> _pendingBaselines = new();
+        private IAnsiConsole _ansiConsole;
 
         public DepotHandler(IAnsiConsole ansiConsole, Steam3Session steam3Session, AppInfoHandler appInfoHandler, CdnPool cdnPool)
             : this(steam3Session, appInfoHandler, new ManifestHandler(ansiConsole, cdnPool, steam3Session))
         {
+            _ansiConsole = ansiConsole;
         }
 
         internal DepotHandler(Steam3Session steam3Session, AppInfoHandler appInfoHandler, ManifestHandler manifestHandler,
-            string successPath = null, Action<string, string> replace = null)
+            string successPath = null, Action<string, string> replace = null,
+            IncrementalBaselineStore baselineStore = null, IncrementalPrefillMode? incrementalMode = null)
         {
             _steam3Session = steam3Session;
             _appInfoHandler = appInfoHandler;
             _manifestHandler = manifestHandler;
             _successPath = successPath ?? AppConfig.SuccessfullyDownloadedDepotsPath;
             _replace = replace ?? ((source, destination) => File.Move(source, destination, true));
+            _baselineStore = baselineStore ?? new IncrementalBaselineStore();
+            _incrementalMode = incrementalMode ?? AppConfig.IncrementalMode;
 
             if (File.Exists(_successPath))
             {
@@ -67,8 +75,17 @@
                     }
                     Action commit = () =>
                     {
+                        var manifests = depots
+                            .Select(depot => _pendingBaselines.GetValueOrDefault((depot.DepotId, depot.ManifestId.Value)))
+                            .Where(manifest => manifest != null)
+                            .ToList();
+                        if (manifests.Count > 0 && manifests.Count != depots.Count)
+                            throw new InvalidOperationException("Cannot commit an incremental baseline before every depot manifest has been prepared.");
+                        if (manifests.Count > 0) _baselineStore.Commit(manifests);
                         _replace(temporary, _successPath);
                         _downloadedDepots = merged;
+                        foreach (var depot in depots)
+                            _pendingBaselines.TryRemove((depot.DepotId, depot.ManifestId.Value), out _);
                     };
                     if (progress != null) return progress.TryCommitItem(item, commit);
                     commit();
@@ -134,6 +151,8 @@
                     File.Delete(_successPath);
                 }
                 _downloadedDepots.Clear();
+                _pendingBaselines.Clear();
+                _baselineStore.Clear();
                 return count;
             }
         }
@@ -234,6 +253,8 @@
         /// <returns></returns>
         public async Task<(List<QueuedRequest> Chunks, List<DepotInfo> SkippedDepots)> BuildChunkDownloadQueueAsync(
             List<DepotInfo> depots,
+            IncrementalPrefillMode? mode = null,
+            bool stageBaseline = false,
             CancellationToken cancellationToken = default)
         {
             var (depotManifests, skippedDepots) = await _manifestHandler.GetAllManifestsAsync(depots, cancellationToken);
@@ -243,12 +264,35 @@
             foreach (var depotManifest in depotManifests)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                // A depot will contain multiple files, that are broken up into 1MB chunks
-                var dedupedChunks = depotManifest.Files
-                                                 .SelectMany(e => e.Chunks)
-                                                 // Steam appears to do block level deduplication, so it is possible for multiple files to have the same chunk id
-                                                 .DistinctBy(e => e.ChunkId)
-                                                 .ToList();
+                var baseline = _baselineStore.Get(depotManifest.DepotId);
+                var effectiveMode = mode ?? _incrementalMode;
+                if (stageBaseline && effectiveMode is (IncrementalPrefillMode.Incremental
+                    or IncrementalPrefillMode.Full
+                    or IncrementalPrefillMode.Repair))
+                {
+                    StagePendingBaseline(depotManifest);
+                }
+                var legacySuccess = ManifestIsInSuccessfulHistory(depotManifest.DepotId, depotManifest.Id);
+                if (stageBaseline && effectiveMode == IncrementalPrefillMode.Bootstrap
+                    && !legacySuccess && baseline == null)
+                {
+                    baseline = await RecoverHistoricalBaselineAsync(depotManifest.DepotId, depots, cancellationToken);
+                }
+                var (dedupedChunks, stats) = IncrementalChunkPlanner.Plan(
+                    depotManifest, baseline, effectiveMode, legacySuccess);
+                if (stageBaseline && effectiveMode == IncrementalPrefillMode.Bootstrap && legacySuccess)
+                {
+                    _baselineStore.Commit(new[] { depotManifest });
+                }
+                if (stats.SkippedChunks > 0)
+                {
+                    var queuedSize = ByteSize.FromBytes(stats.QueuedBytes);
+                    var skippedSize = ByteSize.FromBytes(stats.SkippedBytes);
+                    _ansiConsole?.LogMarkupVerbose(
+                        $"Depot {LightYellow(depotManifest.DepotId)} incremental plan: "
+                        + $"queued {Magenta(queuedSize.ToDecimalString())} from {dedupedChunks.Count} chunks; "
+                        + $"avoided {Magenta(skippedSize.ToDecimalString())} from {stats.SkippedChunks} existing chunks");
+                }
 
                 foreach (ChunkData chunk in dedupedChunks)
                 {
@@ -257,6 +301,54 @@
                 }
             }
             return (chunkQueue, skippedDepots);
+        }
+
+        /// <summary>
+        /// Drops manifests prepared for an app that did not complete. A baseline must only be
+        /// persisted after every queued chunk has been transferred successfully.
+        /// </summary>
+        internal void DiscardPendingBaselines(IEnumerable<DepotInfo> depots)
+        {
+            foreach (var depot in depots.Where(depot => depot.ManifestId.HasValue))
+                _pendingBaselines.TryRemove((depot.DepotId, depot.ManifestId!.Value), out _);
+        }
+
+        internal void StagePendingBaseline(Manifest manifest)
+            => _pendingBaselines[(manifest.DepotId, manifest.Id)] = manifest;
+
+        internal int PendingBaselineCount => _pendingBaselines.Count;
+
+        internal bool ManifestIsInSuccessfulHistory(uint depotId, ulong manifestId)
+        {
+            lock (_commit)
+                return _downloadedDepots.TryGetValue(depotId, out var manifests) && manifests.Contains(manifestId);
+        }
+
+        private async Task<IncrementalDepotBaseline> RecoverHistoricalBaselineAsync(
+            uint depotId, List<DepotInfo> currentDepots, CancellationToken cancellationToken)
+        {
+            ulong[] candidates;
+            lock (_commit)
+                candidates = _downloadedDepots.GetValueOrDefault(depotId)?.OrderByDescending(id => id).ToArray()
+                    ?? Array.Empty<ulong>();
+            var current = currentDepots.FirstOrDefault(depot => depot.DepotId == depotId);
+            if (current == null) return null;
+            foreach (var manifestId in candidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var historicalDepot = new DepotInfo(current) { ManifestId = manifestId };
+                var request = new List<DepotInfo> { historicalDepot };
+                var (manifests, skipped) = await _manifestHandler.GetAllManifestsAsync(request, cancellationToken);
+                var historical = manifests.SingleOrDefault();
+                if (historical == null || skipped.Count > 0) continue;
+                _baselineStore.Commit(new[] { historical });
+                _ansiConsole?.LogMarkupVerbose(
+                    $"Recovered historical manifest {LightYellow(manifestId)} for depot {LightYellow(depotId)}");
+                return _baselineStore.Get(depotId);
+            }
+            _ansiConsole?.LogMarkupVerbose(
+                $"No historical manifest could be recovered for changed depot {LightYellow(depotId)}");
+            return null;
         }
     }
 }
